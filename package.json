@@ -1,0 +1,56 @@
+{
+  "name": "chatgpt-control",
+  "version": "0.1.0",
+  "description": "Typed ChatGPT web control for coding agents: independent second-model review, durable conversations, and image iteration through the Chrome you are already signed into",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/wolfiesch/chatgpt-control",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wolfiesch/chatgpt-control.git"
+  },
+  "keywords": [
+    "chatgpt",
+    "openai",
+    "agent-tools",
+    "coding-agent",
+    "chrome",
+    "browser-automation",
+    "second-opinion",
+    "oh-my-pi",
+    "omp",
+    "pi-extension",
+    "pi-coding-agent",
+    "claude-code",
+    "codex"
+  ],
+  "files": [
+    "src",
+    "skills",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.52"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  }
+}
