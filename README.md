@@ -1,201 +1,133 @@
 # GPT-Control
 
-A small cross-model review broker for coding agents.
+GPT-Control is a local broker that lets Codex use ChatGPT Pro as a bounded worker while Codex remains the orchestrator. It also supports independent review and chat through trusted transports.
 
-GPT-Control lets one agent request, track, and verify an independent review from another model. Every submission receives a real `run_id`; every provider lineage receives a separate `conversation_id`. Reviews return structured findings, attachment hashes, and a provenance receipt.
+Version 0.2.1 is intended for a **local beta on non-sensitive repositories**. It is not self-certified for production or high-sensitivity data.
 
-An unofficial, community-maintained project. It is not affiliated with OpenAI.
+## 0.2.1 hardening
 
-## Current status
+The broker now:
 
-Experimental. The local contracts are tested, and Chrome Bridge plus Codex are exercised through private live checks. Browser markup can change, provider availability can change, and provider output remains advisory.
+- snapshots approved attachment bytes into private broker-owned files and exposes only those snapshots;
+- keeps workspace, sensitive-file, paid-request, endpoint, and focus authority outside model-call arguments;
+- verifies the live ChatGPT composer selection before each Chrome submission;
+- requires a stable final assistant turn, not thinking labels, partial tool summaries, or answering states;
+- recovers the same owned ChatGPT conversation without blindly resending a prompt;
+- stores observed model and provider provenance separately from requested values;
+- uses strict IDs, symlink-safe confinement, ownership-aware locks, and monotonic terminal states;
+- exposes durable MCP tasks for up to three Pro workers, with a one-response fallback when tasks are unavailable.
 
-## Why this exists
+See [SECURITY.md](SECURITY.md), [MIGRATION.md](MIGRATION.md), and [docs/CODEX_SUBAGENTS.md](docs/CODEX_SUBAGENTS.md).
 
-The valuable part of a second opinion is the review protocol:
+## Architecture
 
-- Send only an explicit, bounded file set.
-- Know which exact submission a result belongs to.
-- Continue the right provider conversation without conflating it with a run.
-- Receive findings with file and line evidence.
-- Record prompt, attachment, and result hashes.
-- Keep provider transport details behind one small tool surface.
+Codex owns planning, repository authority, and final decisions. GPT-Control owns only bounded provider interaction:
 
-## Tools
-
-| Tool | Capability | Approval |
-| --- | --- | --- |
-| `gpt_consult` | Structured independent review with findings, manifest, and receipt | write |
-| `gpt_chat` | Start or continue a provider conversation | write |
-| `gpt_run` | Status, wait, or result for one exact run | read |
-| `gpt_run_cancel` | Cancel an active in-process run | write |
-| `gpt_conversation_close` | Close local conversation state and owned browser tabs | write |
-| `gpt_image` | Chrome Bridge image generation and iteration | write |
-| `gpt_diagnose` | Transport readiness and focus-safety state | read |
-
-The same core tools are available through the bundled MCP server.
-
-## Transports
-
-| Transport | Use | Focus behavior | Confirmation |
-| --- | --- | --- | --- |
-| `chrome_bridge` | Signed-in ChatGPT, conversations, images | Inactive task-owned tab | None |
-| `codex` | Official Codex SDK, structured review, conversations | No browser | None after Codex authentication |
-| `responses` | Official Responses API, structured review, conversations | No browser | `api_confirmed=true` |
-| `oracle_browser` | Explicit legacy browser fallback | May take focus | `allow_focus_steal=true` |
-| `oracle_api` | Explicit legacy API fallback | No browser | `api_confirmed=true` |
-
-Default routing is focus-safe:
-
-1. Use Chrome Bridge when it is installed and ready.
-2. If Chrome Bridge is installed but leased or unavailable, return a retryable error. GPT-Control does not launch Oracle.
-3. If Chrome Bridge is not installed, use Codex when available.
-4. Oracle browser mode is never selected automatically.
-
-## Conversation and run model
-
-```text
-Conversation
-  conversation_id
-  provider
-  provider conversation/thread/session id
-  workspace root
-
-Run
-  run_id
-  conversation_id
-  prompt hash
-  attachment manifest
-  status
-  exact provider result id
-  result hash
-  receipt
-```
-
-Pass `conversation_id` to `gpt_chat` or `gpt_consult` for a follow-up. Pass `run_id` to `gpt_run` for status, wait, or result. Per-conversation locking prevents two submissions from interleaving.
-
-Records live under `~/.gpt-control/` by default. Override the root with `GPT_CONTROL_HOME`.
-
-## Attachment boundary
-
-By default, attachments must be regular files under the current workspace after symlink resolution. GPT-Control:
-
-- resolves every path with `realpath()`;
-- rejects directories and special files;
-- caps file count and aggregate bytes;
-- blocks obvious credential and private-key paths;
-- hashes every file with SHA-256;
-- returns the exact transmission manifest.
-
-Outside-workspace and sensitive-file transmission require separate explicit flags.
-
-## What leaves your machine
-
-Prompts and approved attachments are sent to the selected provider. Chrome Bridge uploads files to the signed-in browser session. Codex reads the approved local paths in a read-only sandbox. Responses sends file content in the API request.
-
-Closing a GPT-Control conversation closes local state and wrapper-owned browser tabs. It does not delete provider-side conversations, history, memories, or uploaded files.
-
-## Structured review output
-
-`gpt_consult` returns this contract:
-
-```json
-{
-  "verdict": "request_changes",
-  "summary": "The migration is not rollback-safe.",
-  "findings": [
-    {
-      "severity": "high",
-      "claim": "The old schema version is discarded before mutation.",
-      "evidence": {
-        "file": "src/migrate.ts",
-        "lineStart": 81,
-        "lineEnd": 104
-      },
-      "confidence": 0.92,
-      "remediation": "Persist the old schema version before mutation."
-    }
-  ],
-  "openQuestions": []
-}
-```
-
-Each result also includes a receipt with provider, model, timestamps, provider identifiers, prompt hash, attachment hashes, and result hash.
+1. Trusted operator policy fixes roots, allowed transports/models, endpoint, attachment exceptions, diagnostics, paid confirmation, and concurrency.
+2. Attachments are snapshotted once. Original workspace or parent directories are not granted as attachment authority.
+3. A Pro worker gets one owned disposable ChatGPT tab. GPT-Control waits through the first-tab navigation race, verifies the actual composer says `Pro`, fills the prompt, verifies `Pro` again, and sends once.
+4. Durable state tracks submission state, tab/session identity, real ChatGPT conversation URL when proved, recovery attempts, and terminal state.
+5. Completion requires a newer stable assistant turn with no answering, thinking, stop, tool-running, Retry, Continue, interruption, or error state.
+6. Task state/results persist across reconnects. Restart recovery re-observes the existing conversation and never replays an ambiguous in-flight request.
 
 ## Install
 
-### Oh My Pi
+Bun is required.
 
-```sh
-omp install github:wolfiesch/gpt-control
-```
-
-### Pi
-
-```sh
-git clone https://github.com/wolfiesch/gpt-control.git
-cd gpt-control && bun install
-ln -s "$PWD/src/index.ts" ~/.pi/agent/extensions/gpt-control.ts
-```
-
-### MCP
-
-```json
-{
-  "mcpServers": {
-    "gpt-control": {
-      "command": "bun",
-      "args": ["/path/to/gpt-control/src/mcp.ts"]
-    }
-  }
-}
-```
-
-### Chrome Bridge
-
-```sh
-git clone https://github.com/wolfiesch/chrome-bridge.git
-cd chrome-bridge && ./setup.sh
-chrome-bridge ready
-```
-
-### Official transports
-
-```sh
-npm i -g @openai/codex
-codex login
-```
-
-For Responses, provide `OPENAI_API_KEY` through your normal secret-injection path and pass `api_confirmed=true` on each paid request.
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `GPT_CONTROL_HOME` | Local conversations, runs, locks, and generated artifacts |
-| `GPT_CONTROL_BRIDGE` | Full Chrome Bridge client command |
-| `CHROME_BRIDGE_HOME` | Chrome Bridge checkout containing `test_client.py` |
-| `GPT_CONTROL_ORACLE` | Full Oracle CLI command |
-| `GPT_CONTROL_PYTHON` | Python used to run the bridge client |
-| `GPT_CONTROL_POLL_MS` | Browser answer poll interval, default 2000 |
-| `GPT_CONTROL_PROBE_MS` | Bridge readiness budget, default 10000 |
-| `GPT_CONTROL_RESPONSES_MODEL` | Responses model, default `gpt-5.6` |
-
-## Credits
-
-- [Oracle](https://github.com/steipete/oracle) by Peter Steinberger is the explicit legacy fallback.
-- [Kyle McCleary](https://github.com/kmccleary3301) shared the Oracle fork and browser/image workflow that prompted the first version of this wrapper.
-- [Chrome Bridge](https://github.com/wolfiesch/chrome-bridge) provides the focus-safe signed-in browser transport.
-- The official Codex and Responses adapters use OpenAI's published SDKs.
-
-## Development
-
-```sh
-bun install
+```bash
+bun install --frozen-lockfile
 bun run check
 bun test
 ```
 
-## License
+The Codex plugin package includes `.codex-plugin/plugin.json`, `.mcp.json`, `agents/openai.yaml`, `skills/gpt-control/SKILL.md`, and `bin/gpt-control-mcp`.
 
-MIT
+Manual stdio registration is also supported:
+
+```bash
+codex mcp add gpt-control -- /absolute/path/to/gpt-control/bin/gpt-control-mcp
+```
+
+The wrapper resolves its repository root and prefers `GPT_CONTROL_BUN`, system Bun, or a local Bun binary. On hosts without Bun it uses the pinned `npx --yes bun@1.4.0` compatibility fallback; operators who prohibit registry-backed launchers should install an approved Bun executable and set `GPT_CONTROL_BUN`.
+
+## Trusted operator configuration
+
+Tool input can narrow behavior but cannot widen these boundaries.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `GPT_CONTROL_HOME` | Records, locks, tasks, snapshots, output | `~/.gpt-control` |
+| `GPT_CONTROL_WORKSPACE_ROOT` | Workspace attachment boundary | current directory |
+| `GPT_CONTROL_SNAPSHOT_ROOT` | Private snapshot root | `$GPT_CONTROL_HOME/snapshots` |
+| `GPT_CONTROL_OUTPUT_ROOT` | Confined generated-output root | `$GPT_CONTROL_HOME/generated` |
+| `GPT_CONTROL_ALLOWED_TRANSPORTS` | Trusted transport allowlist | `chrome_bridge,codex` |
+| `GPT_CONTROL_ALLOWED_MODELS` | Allowed non-Chrome models | unset |
+| `GPT_CONTROL_PROVIDER_MODEL` | Trusted default non-Chrome provider model | provider-specific default |
+| `GPT_CONTROL_BUN` | Trusted Bun executable for the plugin launcher | discovery/pinned npx fallback |
+| `GPT_CONTROL_MAX_PRO_WORKERS` | Fair Pro-worker limit, integer 1-3 | `3` |
+| `GPT_CONTROL_ALLOW_OUTSIDE_WORKSPACE` | Permit outside-workspace snapshots | disabled |
+| `GPT_CONTROL_ALLOW_SENSITIVE_FILES` | Permit conservative secret matches | disabled |
+| `GPT_CONTROL_OPENAI_BASE_URL` | Trusted alternate Responses endpoint | official endpoint |
+| `GPT_CONTROL_ALLOW_ALTERNATE_OPENAI_ENDPOINT` | Permit alternate endpoint | disabled |
+| `GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS` | Permit active probes | disabled |
+| `GPT_CONTROL_BRIDGE` | Trusted Chrome Bridge command | discovery |
+| `GPT_CONTROL_BRIDGE_CLIENT_SCRIPT` | Trusted Bridge `test_client.py` | discovery |
+| `GPT_CONTROL_PYTHON` | Trusted Python for private Bridge RPC | discovery |
+
+Inherited `OPENAI_BASE_URL` is ignored. An alternate endpoint requires both trusted endpoint variables and is recorded in receipts.
+
+The stock CLI/MCP server has no interactive paid-confirmation broker. Responses calls fail closed unless an embedding supplies a fresh trusted `confirmPaidRequest` callback for every request, including follow-ups.
+
+## Codex-facing tools
+
+### Pro workers
+
+- `gpt_subagent_run`: task-based start-and-complete. Requires `prompt` and a caller-stable `idempotency_key`; accepts `files` and `timeout_ms`.
+- `gpt_subagent_get`: durable lookup by exactly one `run_id` or `task_id` after reconnect/recovery.
+- `gpt_subagent_cancel`: independent cancellation by exactly one `run_id` or `task_id`.
+- `gpt_subagent_list`: bounded active-run overview; not a polling requirement.
+
+A task-aware client receives task status/progress and one terminal result. A client without MCP task support receives one long-running response at terminal state. Codex should not send "are you done?" prompts or repeatedly call status while a task result is pending.
+
+### Review and utilities
+
+- `gpt_consult`: structured independent review with validated file/line evidence.
+- `gpt_chat`: one provider conversation turn.
+- `gpt_image`: owned-tab image generation with policy-confined output.
+- `gpt_run` / `gpt_run_cancel`: exact durable lookup/wait and monotonic cancellation.
+- `gpt_conversation_close`: local owned-session cleanup; provider history is not deleted.
+- `gpt_diagnose`: passive discovery only; executes no discovered Bridge, Oracle, Codex, or model program.
+- `gpt_diagnose_active`: explicit active smoke test, only under trusted policy.
+
+## Truthful provenance
+
+Chrome receipts distinguish `requestedModel`, `observedModel`, `modelVerified`, `modelEvidenceKind`, and `modelVerifiedAt`. Account plan labels such as `Miles Pro`, wordmarks, profile text, prompt content, and requested values are never model evidence.
+
+Local Bridge session IDs and DOM turn counts are explicitly local/synthetic. Only a proved ChatGPT conversation URL/ID is provider conversation provenance.
+
+## Attachments and completion
+
+Each attachment is opened with no-follow semantics, verified as a regular file, snapshotted once, hashed from transmitted bytes, and line-counted. Symlink/replacement races fail closed. Codex receives only the snapshot directory in a read-only sandbox.
+
+Sensitive-file detection intentionally favors false positives and covers `.env*`, `.npmrc`, `.netrc`, Git/cloud credentials, SSH keys, Docker auth, service-account material, and similar stores. Only trusted policy can override it.
+
+A Chrome run becomes `completed` only from a stable newer assistant turn. Timeout, interruption, network error, Retry, Continue generating, or exhausted recovery becomes `needs_user`/`failed` and cannot later be overwritten.
+
+Recovery is bounded: re-observe, reload the same owned tab, restore the exact known conversation URL if ChatGPT lands on Home, re-read turns, and use explicit live Retry/Continue controls only when applicable. It never blindly resends the original prompt or creates a duplicate recovery conversation.
+
+## Verification
+
+```bash
+bun install --frozen-lockfile
+bun run check
+bun run test:security
+bun run test:chrome
+bun run test:subagents
+bun test
+```
+
+See [docs/MANUAL_CHROME_VALIDATION.md](docs/MANUAL_CHROME_VALIDATION.md).
+
+## Codex callback boundary
+
+The installed MCP SDK and Codex runtime expose task status/progress and task get/result/cancel protocol support. GPT-Control does **not** claim that a notification injects a new model-visible chat message or wakes a dormant Codex thread; that was not proved end to end. The strongest supported no-poll mechanism is a task-based or long-running tool call that returns once at terminal state, backed by durable recovery lookup.

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gpt-control": {
+      "type": "stdio",
+      "command": "./bin/gpt-control-mcp",
+      "args": []
+    }
+  }
+}

@@ -1,0 +1,8 @@
+display_name: GPT-Control
+tagline: Bounded ChatGPT Pro workers for Codex
+short_description: Run up to three durable, independently owned ChatGPT Pro workers without model-visible polling.
+long_description: >-
+  GPT-Control keeps Codex in charge while a bounded local broker opens owned
+  ChatGPT tabs, verifies the live Pro composer selection, submits each prompt
+  once, monitors stable completion, and returns one completion or blocker result.
+  Durable task records support cancellation, reconnect, and restart recovery.

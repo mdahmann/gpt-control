@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.1 - 2026-08-21
+
+### Security
+
+- Move workspace, sensitive-file, paid-request, focus, endpoint, output, active-diagnostic, and concurrency authority into trusted operator policy.
+- Snapshot approved regular-file bytes once into private broker-owned storage; reject symlinks, replacement races, secret stores, and unverifiable finding locations.
+- Expose only immutable snapshots to Codex and Chrome providers; never grant original workspace or parent directories as attachment authority.
+- Confine public IDs, records, locks, tasks, state home, artifacts, and outputs after resolution.
+- Replace age-only lock deletion with owner-token/PID/heartbeat locking and explicit dead-owner recovery.
+- Make run/task terminal states monotonic and cancellation race-safe.
+- Pin Responses to the official endpoint by default and require fresh trusted confirmation for every paid request and follow-up.
+- Keep prompt bodies and attachment paths out of child-process argv; disable Oracle execution whose CLI contract cannot meet that boundary.
+
+### Chrome Bridge
+
+- Wait for an owned first tab to reach ChatGPT and a usable composer before origin-gated actions.
+- Add typed `chatgpt_model: "pro"` selection with actual composer selector selection/read-back and immediate pre-send re-verification.
+- Record requested and observed model separately, with real ChatGPT conversation URL provenance distinct from local/synthetic Bridge identity.
+- Require a newer stable final assistant turn with no active answering, thinking, stop, tool-running, Retry, Continue, interruption, or error state.
+- Add bounded same-conversation recovery without duplicate prompt submission or duplicate conversations.
+
+### Codex Pro workers
+
+- Add task-based `gpt_subagent_run` plus durable get/cancel/list tools.
+- Support three fair durable concurrent workers across broker processes with independent tabs, runs, locks, cancellation, idempotency, restart/reconnect recovery, and exactly-once terminal results.
+- Persist MCP task state/results through a disk-backed task store and emit advisory task/progress notifications.
+- Fall back to one long-running terminal tool response when MCP task support is unavailable.
+- Package GPT-Control as a Codex plugin with manifest, MCP registration, agent metadata, launcher, and skill instructions.
+- Document that task notifications are not claimed to wake a dormant Codex chat; pending task/long-running calls are the no-poll mechanism.
+
+### Contract
+
+- Restore MCP `gpt_image` parity.
+- Split passive `gpt_diagnose` from trusted-policy-gated `gpt_diagnose_active`.
+- Add storage schema 2, migration guidance, threat model, and manual Chrome validation.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

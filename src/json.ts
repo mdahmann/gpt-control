@@ -34,37 +34,51 @@ export function readArray(source: unknown, key: string): unknown[] | undefined {
 }
 
 /**
- * Parses one CLI invocation.
- *
- * Chrome Bridge reports failure three ways: a non-zero exit code, a
- * `success: false` envelope, and a `success: true` envelope wrapping a
- * `result.success: false` with the real reason in `result.err`. Missing the
- * third form makes a failed page action look like a successful one, so all
- * three become thrown errors here.
+ * Parses one CLI invocation. A non-zero or killed process is always a failure,
+ * even when stdout contains valid JSON or a superficially successful envelope.
  */
 export function parseCommandJson(result: ExecResult, operation: string): Record<string, unknown> {
 	const stdout = result.stdout.trim();
-	if (result.code !== 0 && stdout === "") {
+	let parsed: unknown;
+	if (stdout !== "") {
+		try {
+			parsed = JSON.parse(stdout);
+		} catch {
+			if (result.code !== 0 || result.killed) {
+				throw new Error(result.stderr.trim() || `${operation} exited ${result.code}`);
+			}
+			throw new Error(`${operation} returned invalid JSON: ${stdout.slice(0, 400)}`);
+		}
+	}
+
+	if (result.code !== 0 || result.killed) {
+		if (isRecord(parsed)) {
+			const detail = failureDetail(parsed) ?? (result.stderr.trim() || `${operation} exited ${result.code}`);
+			throw new BridgeCommandError(detail, parsed, readString(parsed, "confirmationToken"));
+		}
 		throw new Error(result.stderr.trim() || `${operation} exited ${result.code}`);
 	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(stdout);
-	} catch {
-		if (result.code !== 0) throw new Error(result.stderr.trim() || `${operation} exited ${result.code}`);
-		throw new Error(`${operation} returned invalid JSON: ${stdout.slice(0, 400)}`);
+	if (!isRecord(parsed)) {
+		if (stdout === "") throw new Error(`${operation} returned an empty response`);
+		throw new Error(`${operation} returned a non-object payload`);
 	}
-	if (!isRecord(parsed)) throw new Error(`${operation} returned a non-object payload`);
 	if (parsed.success === false) {
-		const detail = readString(parsed, "error") ?? readString(parsed, "reason") ?? `${operation} failed`;
-		throw new BridgeCommandError(detail, parsed, readString(parsed, "confirmationToken"));
+		throw new BridgeCommandError(failureDetail(parsed) ?? `${operation} failed`, parsed, readString(parsed, "confirmationToken"));
 	}
 	const inner = readRecord(parsed, "result");
 	if (inner?.success === false) {
-		const detail = readString(inner, "err") ?? readString(inner, "error") ?? `${operation} failed`;
-		throw new BridgeCommandError(detail, parsed, readString(parsed, "confirmationToken"));
+		throw new BridgeCommandError(failureDetail(parsed) ?? `${operation} failed`, parsed, readString(parsed, "confirmationToken"));
 	}
 	return parsed;
+}
+
+function failureDetail(parsed: Record<string, unknown>): string | undefined {
+	const inner = readRecord(parsed, "result");
+	return readString(inner, "err")
+		?? readString(inner, "error")
+		?? readString(inner, "reason")
+		?? readString(parsed, "error")
+		?? readString(parsed, "reason");
 }
 
 /** Carries the raw payload so callers can react to policy gates without reparsing. */

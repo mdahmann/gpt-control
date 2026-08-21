@@ -1,3 +1,6 @@
 node_modules/
+dist/
+.devspace/
+.gpt-control/
 *.log
 .DS_Store

@@ -1,13 +1,13 @@
 {
   "name": "gpt-control",
-  "version": "0.2.0",
-  "description": "A trustworthy cross-model review broker for coding agents: real runs, structured findings, attachment receipts, and Chrome Bridge, Codex, or Responses transports",
+  "version": "0.2.1",
+  "description": "A hardened local broker for bounded ChatGPT Pro workers and independent model review from Codex",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://github.com/wolfiesch/gpt-control",
+  "homepage": "https://github.com/mdahmann/gpt-control",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wolfiesch/gpt-control.git"
+    "url": "git+https://github.com/mdahmann/gpt-control.git"
   },
   "keywords": [
     "gpt-control",
@@ -24,18 +24,29 @@
     "codex"
   ],
   "files": [
+    ".codex-plugin",
+    ".mcp.json",
+    "agents",
+    "bin",
+    "docs",
     "src",
     "skills",
     "README.md",
+    "SECURITY.md",
+    "MIGRATION.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "bin": {
-    "gpt-control-mcp": "./src/mcp.ts"
+    "gpt-control-mcp": "./bin/gpt-control-mcp"
   },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test",
+    "test:security": "bun test parsing.test.ts transport.test.ts index.test.ts",
+    "test:chrome": "bun test chrome.test.ts",
+    "test:subagents": "bun test subagent.test.ts",
+    "test:all": "bun test",
     "mcp": "bun src/mcp.ts"
   },
   "omp": {

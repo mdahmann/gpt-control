@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+
+if [ -n "${GPT_CONTROL_BUN:-}" ]; then
+  if [ ! -x "$GPT_CONTROL_BUN" ]; then
+    printf 'Trusted GPT_CONTROL_BUN is not executable: %s\n' "$GPT_CONTROL_BUN" >&2
+    exit 126
+  fi
+  exec "$GPT_CONTROL_BUN" "$ROOT/src/mcp.ts"
+fi
+
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$ROOT/src/mcp.ts"
+fi
+
+if [ -x "$ROOT/node_modules/.bin/bun" ]; then
+  exec "$ROOT/node_modules/.bin/bun" "$ROOT/src/mcp.ts"
+fi
+
+if command -v npx >/dev/null 2>&1; then
+  # Pinned compatibility fallback for Codex plugin hosts without a system Bun.
+  # Operators who disallow registry-backed launchers should install Bun or set
+  # GPT_CONTROL_BUN to an approved local executable.
+  exec npx --yes bun@1.4.0 "$ROOT/src/mcp.ts"
+fi
+
+printf '%s\n' 'GPT-Control requires Bun, a trusted GPT_CONTROL_BUN path, or npx for the pinned bun@1.4.0 fallback.' >&2
+exit 127

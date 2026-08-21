@@ -1,0 +1,6 @@
+{
+  "$schema": "https://developers.openai.com/codex/schemas/plugin.schema.json",
+  "name": "gpt-control",
+  "version": "0.2.1",
+  "description": "Run up to three bounded ChatGPT Pro workers from Codex with durable tasks, truthful provenance, and local security boundaries."
+}

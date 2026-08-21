@@ -37,6 +37,7 @@ export function resetCapabilityCache(): void {
 	inFlight = undefined;
 }
 
+/** Active transport readiness, used only by run execution or explicit smoke tests. */
 export async function resolveCapabilities(
 	exec: Exec,
 	env: NodeJS.ProcessEnv = process.env,
@@ -65,7 +66,7 @@ async function probeCapabilities(exec: Exec, env: NodeJS.ProcessEnv, signal?: Ab
 		oracleLauncher ? probeOracle(exec, oracleLauncher, signal).catch(() => undefined) : undefined,
 		codexPath
 			? runLauncher(exec, { command: codexPath, args: [], origin: "codex on PATH" }, ["--version"], { signal, timeout: 10_000 })
-				.then((result) => result.code === 0 ? result.stdout.trim() : undefined)
+				.then((result) => result.code === 0 && !result.killed ? result.stdout.trim() : undefined)
 				.catch(() => undefined)
 			: undefined,
 	]);
@@ -88,16 +89,12 @@ export class NoTransportError extends Error {
 
 export interface RouteOptions {
 	transport?: TransportChoice;
-	apiConfirmed?: boolean;
-	allowFocusSteal?: boolean;
 }
 
 /**
- * Chooses a transport without surprising the user.
- *
- * A temporarily leased or sleeping Chrome Bridge is not permission to launch a
- * foreground browser. Oracle browser mode is reachable only by explicitly
- * naming it and acknowledging focus stealing.
+ * Selects only a technically available route. Authority is enforced separately
+ * by trusted OperatorPolicy. Oracle is deliberately unavailable because its
+ * legacy CLI exposes prompt and attachment data through argv.
  */
 export function selectRoute(capabilities: Capabilities, options: RouteOptions = {}): Route {
 	const requested = options.transport;
@@ -110,21 +107,13 @@ export function selectRoute(capabilities: Capabilities, options: RouteOptions = 
 		return { kind: "codex" };
 	}
 	if (requested === "responses") {
-		if (!options.apiConfirmed) throw new NoTransportError("Responses API is paid. Re-run with api_confirmed=true.");
 		if (!capabilities.responses) throw new NoTransportError("Responses API requested, but OPENAI_API_KEY is not available to this process.");
 		return { kind: "responses" };
 	}
-	if (requested === "oracle_browser") {
-		if (!options.allowFocusSteal) {
-			throw new NoTransportError("Oracle browser mode can foreground its own Chrome. Re-run with allow_focus_steal=true to choose it explicitly.");
-		}
-		if (!capabilities.oracle) throw new NoTransportError("Oracle browser mode requested, but the Oracle CLI is unavailable.");
-		return { kind: "oracle_browser", launcher: capabilities.oracle.launcher };
-	}
-	if (requested === "oracle_api") {
-		if (!options.apiConfirmed) throw new NoTransportError("Oracle API mode is paid. Re-run with api_confirmed=true.");
-		if (!capabilities.oracle) throw new NoTransportError("Oracle API mode requested, but the Oracle CLI is unavailable.");
-		return { kind: "oracle_api", launcher: capabilities.oracle.launcher };
+	if (requested === "oracle_browser" || requested === "oracle_api") {
+		throw new NoTransportError(
+			"Oracle transport is disabled by the hardened broker because the current Oracle CLI puts prompt or attachment data in child-process argv.",
+		);
 	}
 
 	if (capabilities.bridge) return { kind: "chrome_bridge", launcher: capabilities.bridge.launcher };
@@ -142,24 +131,30 @@ export function setupGuidance(capabilities: Capabilities): string {
 	const lines = ["No GPT-Control transport is available.", ""];
 	lines.push("Preferred browser path: Chrome Bridge opens an inactive tab without taking focus.", `  ${BRIDGE_REPO}`);
 	if (!capabilities.codex) lines.push("Official local path: install and authenticate the Codex CLI (`npm i -g @openai/codex`).");
-	lines.push("Paid API path: set OPENAI_API_KEY and pass transport=responses plus api_confirmed=true.");
-	lines.push("Oracle browser mode is never selected automatically because it can take focus.");
+	lines.push("Paid Responses API is explicit-only and requires a fresh trusted operator confirmation for every request.");
+	lines.push("Oracle is disabled until it provides a non-argv request transport.");
 	return lines.join("\n");
 }
 
 export function describeCapabilities(capabilities: Capabilities): Record<string, unknown> {
 	return {
+		mode: "active_smoke_test",
 		preferred: capabilities.bridge ? "chrome_bridge" : capabilities.bridgeOffline ? "chrome_bridge_unavailable" : capabilities.codex ? "codex" : "none",
 		chromeBridge: capabilities.bridge
-			? { available: true, origin: capabilities.bridge.launcher.origin, endpoint: capabilities.bridge.probe.endpoint }
+			? {
+				available: true,
+				origin: capabilities.bridge.launcher.origin,
+				endpoint: capabilities.bridge.probe.endpoint,
+				privateRequestTransport: Boolean(capabilities.bridge.launcher.privateRpc),
+			}
 			: capabilities.bridgeOffline
 				? { available: false, installed: true, origin: capabilities.bridgeOffline.launcher.origin, reason: capabilities.bridgeOffline.probe.reason }
 				: { available: false, installed: false, install: BRIDGE_REPO },
 		codex: capabilities.codex ?? { available: false, install: "npm i -g @openai/codex" },
 		responses: capabilities.responses ?? { available: false, reason: "OPENAI_API_KEY unavailable" },
 		oracle: capabilities.oracle
-			? { available: true, explicitOnly: true, version: capabilities.oracle.version }
-			: { available: false, explicitOnly: true },
-		focusSafety: "Oracle browser mode requires allow_focus_steal=true and is never a fallback.",
+			? { installed: true, executionEnabled: false, version: capabilities.oracle.version }
+			: { installed: false, executionEnabled: false },
+		focusSafety: "No transport is permitted to foreground a browser during automatic execution.",
 	};
 }
