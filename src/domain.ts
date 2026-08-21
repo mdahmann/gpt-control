@@ -1,20 +1,33 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.3.0";
-export const STORAGE_VERSION = 2;
+export const PACKAGE_VERSION = "0.3.1";
+export const STORAGE_VERSION = 3;
 
-export type Provider = "browser" | "oracle_browser" | "oracle_api";
+export type Provider = "browser";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "needs_user";
-export type RunKind = "consult" | "chat" | "image";
+export type RunKind = "consult" | "chat" | "image" | "subagent";
+export type SubmissionState = "not_submitted" | "submitting" | "submitted" | "not_applicable";
 export type Verdict = "approve" | "request_changes" | "inconclusive";
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
+export type ChatGptModel = "pro";
+export type ModelEvidenceKind = "composer_selector" | "provider_response" | "provider_sdk";
+export type BrowserPageId = string | number;
+
+export interface ConnectorIntent {
+	names: string[];
+	mode: "prefer" | "require";
+}
 
 export interface AttachmentReceipt {
+	/** Immutable broker-owned snapshot transmitted to the provider. */
 	path: string;
+	/** Stable display name used in prompts and structured findings. */
 	relativePath: string;
 	size: number;
 	sha256: string;
+	/** Byte-derived physical line count used to validate structured evidence. */
+	lineCount?: number;
 }
 
 export interface AttachmentManifest {
@@ -22,6 +35,9 @@ export interface AttachmentManifest {
 	files: AttachmentReceipt[];
 	totalBytes: number;
 	sha256: string;
+	/** Private broker-owned directory containing only immutable snapshots. */
+	snapshotRoot?: string;
+	snapshotId?: string;
 }
 
 export interface FindingLocation {
@@ -45,10 +61,34 @@ export interface ReviewReport {
 	openQuestions: string[];
 }
 
+export interface RecoveryAttempt {
+	at: string;
+	action: "reobserve" | "reload" | "restore_conversation_url" | "retry" | "continue" | "stop";
+	reason: string;
+	outcome: "recovered" | "still_active" | "failed" | "not_applicable";
+	detail?: string;
+}
+
+export interface RunDiagnostics {
+	recoveryAttempts?: RecoveryAttempt[];
+	terminalReason?: string;
+	localAssistantTurnCount?: number;
+	lastObservedUrl?: string;
+	lastObservedUiState?: string;
+}
+
 export interface ReviewReceipt {
 	provider: Provider;
+	/** Legacy-compatible observed model field. Never populated from a request alone. */
 	model?: string;
+	requestedModel?: string;
+	observedModel?: string;
+	modelVerified?: boolean;
+	modelEvidenceKind?: ModelEvidenceKind;
+	modelVerifiedAt?: string;
+	browserDriverId?: string;
 	transportVersion?: string;
+	providerEndpoint?: string;
 	promptSha256: string;
 	attachments: AttachmentReceipt[];
 	resultSha256?: string;
@@ -56,8 +96,13 @@ export interface ReviewReceipt {
 	completedAt?: string;
 	conversationId: string;
 	runId: string;
+	/** Real provider identity only; local driver/session ids have separate fields. */
 	providerConversationId?: string;
+	providerConversationUrl?: string;
 	providerRunId?: string;
+	localBrowserSessionId?: string;
+	localAssistantTurnCount?: number;
+	recoveryAttempts?: RecoveryAttempt[];
 }
 
 export interface ConversationRecord {
@@ -65,10 +110,15 @@ export interface ConversationRecord {
 	id: string;
 	provider: Provider;
 	providerConversationId?: string;
+	providerConversationUrl?: string;
+	/** Exact local browser-driver identity and ownership tuple. */
 	browserDriverId?: string;
 	browserSessionId?: string;
-	browserPageId?: string | number;
+	browserSessionName?: string;
+	browserPageId?: BrowserPageId;
+	browserAssistantTurnCount?: number;
 	workspaceRoot: string;
+	policyFingerprint?: string;
 	createdAt: string;
 	updatedAt: string;
 	closedAt?: string;
@@ -79,16 +129,27 @@ export interface RunRecord {
 	id: string;
 	conversationId: string;
 	kind: RunKind;
+	connectorIntent?: ConnectorIntent;
 	status: RunStatus;
+	executionReady: boolean;
 	promptSha256: string;
 	attachmentManifest: AttachmentManifest;
 	baselineMessageCount?: number;
+	submissionState?: SubmissionState;
+	requestedChatGptModel?: ChatGptModel;
+	timeoutMs?: number;
+	deadlineAt?: string;
+	idempotencyKeyHash?: string;
+	idempotencyRequestHash?: string;
+	mcpTaskId?: string;
+	cancellationRequestedAt?: string;
 	providerRunId?: string;
 	resultMessageId?: string;
 	resultText?: string;
 	result?: ReviewReport;
 	artifactUrls?: string[];
 	artifactPaths?: string[];
+	diagnostics?: RunDiagnostics;
 	receipt: ReviewReceipt;
 	error?: string;
 	createdAt: string;
@@ -131,7 +192,11 @@ export const REVIEW_OUTPUT_SCHEMA = {
 	},
 } as const;
 
-export function opaqueId(prefix: "conv" | "run"): string {
+export const CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
+export const RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
+export const TASK_ID_PATTERN = /^task_[a-f0-9]{32}$/;
+
+export function opaqueId(prefix: "conv" | "run" | "task"): string {
 	return `${prefix}_${randomUUID().replaceAll("-", "")}`;
 }
 

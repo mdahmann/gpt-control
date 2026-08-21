@@ -1,29 +1,44 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
+	CHATGPT_ORIGIN,
 	attachFiles,
-	captureScreenshot,
+	captureOwnedScreenshot,
+	clickRecoveryControl,
+	clickSend,
 	closeSession,
 	createSession,
-	openChat,
-	readAssistantSnapshot,
+	fillPrompt,
+	navigateSession,
+	providerConversationIdentity,
+	readChatPageObservation,
+	reloadPage,
+	selectAndVerifyChatGptModel,
 	setSessionState,
 	showSession,
-	submitPrompt,
 	tabIdFromSession,
 	tabUrl,
+	verifyChatGptModelBeforeSend,
+	openChat,
 	type AssistantSnapshot,
+	type ChatPageObservation,
+	type ModelVerification,
 } from "./chatgpt";
+import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
 import { probeBridge, resolveBridgeLauncher, splitCommandLine, type Launcher } from "./transport";
 import type { Exec } from "./types";
 
-export const BROWSER_DRIVER_PROTOCOL_VERSION = 1;
+export const BROWSER_DRIVER_PROTOCOL_VERSION = 2;
 export type DriverPageId = string | number;
 export type DriverSessionState = "working" | "needs_user" | "completed";
+export type DriverRecoveryAction = "reload" | "continue" | "retry" | "stop";
 
 export interface DriverProbe {
 	ready: boolean;
 	driver: string;
+	secureInput: boolean;
+	protocolVersion: typeof BROWSER_DRIVER_PROTOCOL_VERSION;
 	reason?: string;
 }
 
@@ -39,59 +54,361 @@ export interface WebChatDriver {
 	probe(signal?: AbortSignal): Promise<DriverProbe>;
 	create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession>;
 	show(sessionId: string, signal?: AbortSignal): Promise<DriverSession>;
+	navigate(session: DriverSession, url: string, signal?: AbortSignal): Promise<DriverSession>;
 	upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void>;
-	submit(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
-	snapshot(session: DriverSession, signal?: AbortSignal): Promise<AssistantSnapshot>;
+	fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
+	selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
+	verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
+	send(session: DriverSession, signal?: AbortSignal): Promise<void>;
+	observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation>;
+	recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void>;
 	setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void>;
 	close(sessionId: string, signal?: AbortSignal): Promise<void>;
 	screenshot(session: DriverSession, outputPath: string, signal?: AbortSignal): Promise<string | undefined>;
 }
 
-export async function waitForNewDriverSnapshot(
+export interface DriverCompletionOutcome {
+	terminalStatus: "completed" | "needs_user";
+	reason?: string;
+	snapshot?: AssistantSnapshot;
+	providerConversationId?: string;
+	providerConversationUrl?: string;
+	recoveryAttempts: RecoveryAttempt[];
+	lastObservedUrl?: string;
+	lastObservedUiState?: string;
+}
+
+export interface ExpectedDriverSession {
+	sessionId: string;
+	pageId: DriverPageId;
+	name: string;
+}
+
+export async function assertExactDriverSession(
 	driver: WebChatDriver,
-	session: DriverSession,
-	options: { baselineCount: number; timeoutMs: number; intervalMs?: number; stableRounds?: number; signal?: AbortSignal },
-): Promise<{ settled: boolean; snapshot?: AssistantSnapshot }> {
+	expected: ExpectedDriverSession,
+	signal?: AbortSignal,
+): Promise<DriverSession> {
+	const current = await driver.show(expected.sessionId, signal);
+	if (current.sessionId !== expected.sessionId) throw new Error("Browser driver returned a different session id.");
+	if (String(current.pageId) !== String(expected.pageId)) {
+		throw new Error(`Browser session ${expected.sessionId} no longer owns the recorded page.`);
+	}
+	if (current.name !== expected.name) {
+		throw new Error(`Refused renamed or foreign browser session ${expected.sessionId}.`);
+	}
+	assertChatGptUrl(current.url, true);
+	return current;
+}
+
+export async function waitForDriverReady(
+	driver: WebChatDriver,
+	expected: ExpectedDriverSession,
+	options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<{ session: DriverSession; observation: ChatPageObservation }> {
+	const deadline = Date.now() + (options.timeoutMs ?? 60_000);
+	let last = "the driver did not expose a ready composer";
+	for (let attempt = 0; Date.now() < deadline; attempt += 1) {
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("Browser readiness wait was cancelled.");
+		try {
+			const session = await assertExactDriverSession(driver, expected, options.signal);
+			if (isTransientUrl(session.url)) {
+				last = `owned page is still committing (${session.url})`;
+			} else {
+				const observation = await driver.observe(session, options.signal);
+				if (observation.composerReady) return { session, observation };
+				last = `ChatGPT loaded at ${session.url}, but its composer is not ready (${observation.stateSummary})`;
+			}
+		} catch (error) {
+			const message = errorMessage(error);
+			if (!isTransientDriverError(message)) throw error;
+			last = message;
+		}
+		await abortableSleep(Math.min(browserPollIntervalMs(), 250 * 2 ** attempt, 2_000), options.signal);
+	}
+	throw new Error(`The owned ChatGPT page did not become ready before the bounded timeout. Last observation: ${last}. No prompt was sent.`);
+}
+
+export async function waitForCompletedDriverTurn(
+	driver: WebChatDriver,
+	expected: ExpectedDriverSession,
+	options: {
+		baselineCount: number;
+		timeoutMs: number;
+		conversationUrl?: string;
+		intervalMs?: number;
+		stableRounds?: number;
+		maxRecoveryCycles?: number;
+		signal?: AbortSignal;
+		onConversationIdentity?: (identity: { id: string; url: string }) => Promise<void>;
+	},
+): Promise<DriverCompletionOutcome> {
 	const intervalMs = options.intervalMs ?? browserPollIntervalMs();
 	const stableRounds = options.stableRounds ?? 3;
+	const maxRecoveryCycles = options.maxRecoveryCycles ?? 3;
 	const deadline = Date.now() + options.timeoutMs;
-	let latest: AssistantSnapshot | undefined;
+	const recoveryAttempts: RecoveryAttempt[] = [];
+	const suppliedIdentity = options.conversationUrl ? providerConversationIdentity(options.conversationUrl) : undefined;
+	if (options.conversationUrl && !suppliedIdentity) {
+		throw new Error(`Refused unprovable ChatGPT conversation URL: ${options.conversationUrl}`);
+	}
+	let exactUrl = suppliedIdentity?.url;
+	let conversationId = suppliedIdentity?.id;
+	let identityPersisted = Boolean(suppliedIdentity);
 	let previous: string | undefined;
 	let steady = 0;
-	let blank = 0;
+	let latest: AssistantSnapshot | undefined;
+	let lastObservedUrl: string | undefined;
+	let lastObservedUiState: string | undefined;
+	let recoveryCycles = 0;
+
 	while (Date.now() < deadline) {
-		await new Promise((done) => setTimeout(done, intervalMs));
-		if (options.signal?.aborted) break;
-		const snapshot = await driver.snapshot(session, options.signal);
-		if (snapshot.count <= options.baselineCount) {
+		await abortableSleep(intervalMs, options.signal);
+		let session = await assertExactDriverSession(driver, expected, options.signal);
+		lastObservedUrl = session.url;
+		const currentIdentity = providerConversationIdentity(session.url);
+
+		if (exactUrl) {
+			if (!currentIdentity || currentIdentity.url !== exactUrl) {
+				const restored = await restoreExactDriverConversation(driver, expected, session, exactUrl, options.baselineCount, options.signal);
+				recoveryAttempts.push({
+					at: nowIso(), action: "restore_conversation_url",
+					reason: currentIdentity
+						? `Owned page drifted to a different ChatGPT conversation (${currentIdentity.id}).`
+						: `Owned page lost its exact ChatGPT conversation URL (${session.url}).`,
+					outcome: restored.ok ? "recovered" : "failed",
+					detail: restored.detail,
+				});
+				if (!restored.ok) {
+					return needsUser(restored.detail, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+				}
+				session = restored.session;
+				lastObservedUrl = session.url;
+			}
+		} else if (currentIdentity) {
+			exactUrl = currentIdentity.url;
+			conversationId = currentIdentity.id;
+			if (!identityPersisted && !options.onConversationIdentity) identityPersisted = true;
+			if (!identityPersisted && options.onConversationIdentity) {
+				try {
+					await options.onConversationIdentity(currentIdentity);
+					identityPersisted = true;
+				} catch (error) {
+					return needsUser(
+						`The exact provider conversation was discovered but could not be durably recorded: ${errorMessage(error)}`,
+						latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+					);
+				}
+			}
+		}
+
+		let observation = await driver.observe(session, options.signal);
+		lastObservedUiState = observation.stateSummary;
+		if (observation.snapshot.count > options.baselineCount) latest = observation.snapshot;
+
+		if (requiresRecovery(observation) && recoveryCycles < maxRecoveryCycles) {
+			const recovered = await recoverSameDriverConversation(driver, expected, session, observation, {
+				exactUrl,
+				baselineCount: options.baselineCount,
+				cycle: recoveryCycles,
+				signal: options.signal,
+				attempts: recoveryAttempts,
+			});
+			recoveryCycles += 1;
+			if (!recovered.ok) {
+				return needsUser(recovered.reason, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+			}
+			session = recovered.session;
+			observation = recovered.observation;
+			lastObservedUrl = session.url;
+			lastObservedUiState = observation.stateSummary;
+			if (observation.snapshot.count > options.baselineCount) latest = observation.snapshot;
+		}
+
+		if (requiresRecovery(observation) && recoveryCycles >= maxRecoveryCycles) {
+			return needsUser(
+				exactNeedsUserReason(observation, "Recovery budget exhausted"),
+				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+			);
+		}
+		if (observation.snapshot.count <= options.baselineCount) {
 			steady = 0;
 			previous = undefined;
 			continue;
 		}
-		latest = snapshot;
-		const fingerprint = `${snapshot.text}\u0000${snapshot.imageUrls.join(",")}`;
-		if (fingerprint === "\u0000") {
-			blank += 1;
+		latest = observation.snapshot;
+		const finalCandidate = ((observation.snapshot.hasMarkdown && observation.snapshot.text.trim() !== "")
+			|| observation.snapshot.imageUrls.length > 0)
+			&& Boolean(exactUrl && conversationId && identityPersisted);
+		if (!finalCandidate || observation.answering || observation.thinking || observation.toolRunning
+			|| observation.errorMessage || observation.retryAvailable || observation.continueAvailable) {
 			steady = 0;
 			previous = undefined;
-			if (blank >= stableRounds * 2) break;
 			continue;
 		}
-		blank = 0;
+		const fingerprint = `${observation.snapshot.count}\u0000${observation.snapshot.messageId ?? ""}\u0000${observation.snapshot.text}\u0000${observation.snapshot.imageUrls.join(",")}`;
 		if (fingerprint === previous) {
 			steady += 1;
-			if (steady >= stableRounds) return { settled: true, snapshot };
+			if (steady >= stableRounds) {
+				return {
+					terminalStatus: "completed",
+					snapshot: observation.snapshot,
+					providerConversationId: conversationId,
+					providerConversationUrl: exactUrl,
+					recoveryAttempts,
+					lastObservedUrl,
+					lastObservedUiState,
+				};
+			}
 		} else {
 			steady = 0;
 			previous = fingerprint;
 		}
 	}
-	return { settled: false, snapshot: latest };
+
+	const reason = latest
+		? `Timed out before the exact ChatGPT conversation proved the new assistant turn was final. Last UI state: ${lastObservedUiState ?? "unknown"}.`
+		: `No new assistant turn appeared before the timeout. Last UI state: ${lastObservedUiState ?? "unknown"}.`;
+	return needsUser(reason, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+}
+
+async function restoreExactDriverConversation(
+	driver: WebChatDriver,
+	expected: ExpectedDriverSession,
+	session: DriverSession,
+	exactUrl: string,
+	baselineCount: number,
+	signal?: AbortSignal,
+): Promise<{ ok: true; session: DriverSession; detail: string } | { ok: false; detail: string }> {
+	try {
+		const navigated = await driver.navigate(session, exactUrl, signal);
+		if (String(navigated.pageId) !== String(expected.pageId) || navigated.sessionId !== expected.sessionId || navigated.name !== expected.name) {
+			return { ok: false, detail: "Exact-conversation recovery attempted to replace or rename the owned page." };
+		}
+		const restored = await assertExactDriverSession(driver, expected, signal);
+		const identity = providerConversationIdentity(restored.url);
+		if (!identity || identity.url !== exactUrl) return { ok: false, detail: `Driver did not restore ${exactUrl}; observed ${restored.url}.` };
+		const observation = await driver.observe(restored, signal);
+		if (observation.snapshot.count < baselineCount) {
+			return { ok: false, detail: `The exact conversation rendered ${observation.snapshot.count} assistant turns, below the durable baseline ${baselineCount}. No prompt was resent.` };
+		}
+		return { ok: true, session: restored, detail: exactUrl };
+	} catch (error) {
+		return { ok: false, detail: `Could not restore the exact conversation without creating a new page: ${errorMessage(error)}` };
+	}
+}
+
+async function recoverSameDriverConversation(
+	driver: WebChatDriver,
+	expected: ExpectedDriverSession,
+	session: DriverSession,
+	initial: ChatPageObservation,
+	options: {
+		exactUrl?: string;
+		baselineCount: number;
+		cycle: number;
+		signal?: AbortSignal;
+		attempts: RecoveryAttempt[];
+	},
+): Promise<{ ok: true; session: DriverSession; observation: ChatPageObservation } | { ok: false; reason: string }> {
+	const reason = exactNeedsUserReason(initial, "Observed recoverable ChatGPT state");
+	await abortableSleep(Math.min(browserPollIntervalMs(), 250 * 2 ** options.cycle, 2_000), options.signal);
+	let observation = await driver.observe(session, options.signal);
+	options.attempts.push({
+		at: nowIso(), action: "reobserve", reason,
+		outcome: requiresRecovery(observation) ? "still_active" : "recovered",
+		detail: observation.stateSummary,
+	});
+	if (!requiresRecovery(observation)) return { ok: true, session, observation };
+
+	try {
+		await driver.recover(session, "reload", options.signal);
+		options.attempts.push({ at: nowIso(), action: "reload", reason, outcome: "still_active" });
+	} catch (error) {
+		options.attempts.push({ at: nowIso(), action: "reload", reason, outcome: "failed", detail: errorMessage(error) });
+	}
+
+	let current: DriverSession;
+	try {
+		current = await assertExactDriverSession(driver, expected, options.signal);
+	} catch (error) {
+		return { ok: false, reason: `Owned browser identity was lost during recovery: ${errorMessage(error)}` };
+	}
+	if (options.exactUrl) {
+		const identity = providerConversationIdentity(current.url);
+		if (!identity || identity.url !== options.exactUrl) {
+			const restored = await restoreExactDriverConversation(driver, expected, current, options.exactUrl, options.baselineCount, options.signal);
+			options.attempts.push({
+				at: nowIso(), action: "restore_conversation_url", reason,
+				outcome: restored.ok ? "recovered" : "failed",
+				detail: restored.detail,
+			});
+			if (!restored.ok) return { ok: false, reason: restored.detail };
+			current = restored.session;
+		}
+	}
+
+	await abortableSleep(Math.min(browserPollIntervalMs(), 250), options.signal);
+	observation = await driver.observe(current, options.signal);
+	if (!requiresRecovery(observation)) {
+		const last = options.attempts.at(-1);
+		if (last) last.outcome = "recovered";
+		return { ok: true, session: current, observation };
+	}
+
+	const action: DriverRecoveryAction | undefined = observation.continueAvailable
+		? "continue"
+		: observation.retryAvailable
+			? "retry"
+			: undefined;
+	if (action) {
+		try {
+			await driver.recover(current, action, options.signal);
+			options.attempts.push({ at: nowIso(), action, reason, outcome: "still_active" });
+		} catch (error) {
+			options.attempts.push({ at: nowIso(), action, reason, outcome: "failed", detail: errorMessage(error) });
+		}
+	}
+	await abortableSleep(Math.min(browserPollIntervalMs(), 250), options.signal);
+	observation = await driver.observe(current, options.signal);
+	return { ok: true, session: current, observation };
+}
+
+function needsUser(
+	reason: string,
+	snapshot: AssistantSnapshot | undefined,
+	providerConversationId: string | undefined,
+	providerConversationUrl: string | undefined,
+	recoveryAttempts: RecoveryAttempt[],
+	lastObservedUrl?: string,
+	lastObservedUiState?: string,
+): DriverCompletionOutcome {
+	return {
+		terminalStatus: "needs_user",
+		reason,
+		snapshot,
+		providerConversationId,
+		providerConversationUrl,
+		recoveryAttempts,
+		lastObservedUrl,
+		lastObservedUiState,
+	};
+}
+
+function requiresRecovery(observation: ChatPageObservation): boolean {
+	return Boolean(observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+}
+
+function exactNeedsUserReason(observation: ChatPageObservation, prefix: string): string {
+	if (observation.errorMessage) return `${prefix}: ${observation.errorMessage}`;
+	if (observation.continueAvailable) return `${prefix}: ChatGPT requires Continue generating.`;
+	if (observation.retryAvailable) return `${prefix}: ChatGPT exposes Retry for the current turn.`;
+	return `${prefix}: ${observation.stateSummary}`;
 }
 
 export function browserPollIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
 	const raw = Number(env.GPT_CONTROL_POLL_MS);
-	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
+	return Number.isFinite(raw) && raw > 0 ? raw : 2_000;
 }
 
 export interface ResolvedBrowserDriver {
@@ -108,46 +425,52 @@ export async function resolveBrowserDriver(
 	const external = env.GPT_CONTROL_BROWSER_DRIVER?.trim();
 	if (external) {
 		const parts = splitCommandLine(external);
-		if (parts.length === 0) return { probe: { ready: false, driver: "external", reason: "GPT_CONTROL_BROWSER_DRIVER is empty" }, source: "GPT_CONTROL_BROWSER_DRIVER" };
+		if (parts.length === 0) {
+			return { probe: offlineProbe("external", "GPT_CONTROL_BROWSER_DRIVER is empty"), source: "GPT_CONTROL_BROWSER_DRIVER" };
+		}
 		const driver = new ExternalCommandBrowserDriver(parts[0], parts.slice(1));
-		const probe = await driver.probe(signal).catch((error): DriverProbe => ({ ready: false, driver: driver.id, reason: message(error) }));
-		return { driver: probe.ready ? driver : undefined, probe, source: "GPT_CONTROL_BROWSER_DRIVER" };
+		const probe = await driver.probe(signal).catch((error): DriverProbe => offlineProbe(driver.id, errorMessage(error)));
+		return { driver: probe.ready && probe.secureInput ? driver : undefined, probe, source: "GPT_CONTROL_BROWSER_DRIVER" };
 	}
 	const launcher = resolveBridgeLauncher(env);
 	if (launcher) {
 		const driver = new ChromeBridgeBrowserDriver(exec, launcher);
-		const probe = await driver.probe(signal).catch((error): DriverProbe => ({ ready: false, driver: driver.id, reason: message(error) }));
-		return { driver: probe.ready ? driver : undefined, probe, source: launcher.origin };
+		const probe = await driver.probe(signal).catch((error): DriverProbe => offlineProbe(driver.id, errorMessage(error)));
+		return { driver: probe.ready && probe.secureInput ? driver : undefined, probe, source: launcher.origin };
 	}
 	return {
-		probe: {
-			ready: false,
-			driver: "none",
-			reason: "No browser driver configured. Set GPT_CONTROL_BROWSER_DRIVER or install an adapter such as Chrome Bridge.",
-		},
+		probe: offlineProbe("none", "No browser driver configured. Set GPT_CONTROL_BROWSER_DRIVER or install an adapter such as Chrome Bridge."),
 		source: "none",
 	};
 }
 
 export class ChromeBridgeBrowserDriver implements WebChatDriver {
-	readonly id = "chrome-bridge";
-	private readonly exec: Exec;
-	private readonly launcher: Launcher;
-
-	constructor(exec: Exec, launcher: Launcher) {
-		this.exec = exec;
-		this.launcher = launcher;
-	}
+	readonly id = "chrome-bridge/private-rpc-v2";
+	constructor(private readonly exec: Exec, private readonly launcher: Launcher) {}
 
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
 		const result = await probeBridge(this.exec, this.launcher, signal);
-		return { ready: result.ready, driver: this.id, reason: result.reason };
+		const secureInput = Boolean(this.launcher.privateRpc);
+		return {
+			ready: result.ready && secureInput,
+			driver: this.id,
+			secureInput,
+			protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION,
+			reason: !secureInput
+				? "Chrome Bridge is reachable, but its private request-file RPC adapter is unavailable; prompt submission is disabled."
+				: result.reason,
+		};
 	}
 
 	async create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession> {
 		const sessionId = await createSession(this.exec, this.launcher, name, signal);
 		const pageId = await openChat(this.exec, this.launcher, sessionId, url, signal);
-		return { sessionId, pageId, name, url };
+		const created = await this.show(sessionId, signal);
+		if (created.name !== name || String(created.pageId) !== String(pageId)) {
+			await closeSession(this.exec, this.launcher, sessionId, signal).catch(() => undefined);
+			throw new Error("Chrome Bridge did not preserve the newly-created exact session/page identity.");
+		}
+		return created;
 	}
 
 	async show(sessionId: string, signal?: AbortSignal): Promise<DriverSession> {
@@ -158,16 +481,43 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		return { sessionId, pageId, name: typeof session.name === "string" ? session.name : "", url: url ?? "" };
 	}
 
+	async navigate(session: DriverSession, url: string, signal?: AbortSignal): Promise<DriverSession> {
+		assertChatGptUrl(url, false);
+		const pageId = await navigateSession(this.exec, this.launcher, session.sessionId, url, signal);
+		if (pageId !== undefined && String(pageId) !== String(session.pageId)) {
+			throw new Error("Chrome Bridge navigation attempted to replace the owned page.");
+		}
+		return this.show(session.sessionId, signal);
+	}
+
 	async upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void> {
 		await attachFiles(this.exec, this.launcher, numericPageId(session.pageId), files, signal);
 	}
 
-	async submit(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
-		await submitPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal);
+	async fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
+		await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal);
 	}
 
-	async snapshot(session: DriverSession, signal?: AbortSignal): Promise<AssistantSnapshot> {
-		return readAssistantSnapshot(this.exec, this.launcher, numericPageId(session.pageId), signal);
+	async selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+		return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+	}
+
+	async verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+		return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+	}
+
+	async send(session: DriverSession, signal?: AbortSignal): Promise<void> {
+		await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal);
+	}
+
+	async observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation> {
+		return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
+	}
+
+	async recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void> {
+		const pageId = numericPageId(session.pageId);
+		if (action === "reload") return reloadPage(this.exec, this.launcher, pageId, signal);
+		return clickRecoveryControl(this.exec, this.launcher, pageId, action, signal);
 	}
 
 	async setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void> {
@@ -179,32 +529,82 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async screenshot(session: DriverSession, outputPath: string, signal?: AbortSignal): Promise<string | undefined> {
-		return captureScreenshot(this.exec, this.launcher, numericPageId(session.pageId), outputPath, signal);
+		return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal);
 	}
 }
 
-const SessionSchema = z.object({ sessionId: z.string().min(1), pageId: z.union([z.string(), z.number()]), name: z.string(), url: z.string() });
-const SnapshotSchema = z.object({ count: z.number().int().nonnegative(), text: z.string(), imageUrls: z.array(z.string()) });
-const ProbeSchema = z.object({ ready: z.boolean(), driver: z.string(), reason: z.string().optional() });
+const DriverIdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
+const SessionSchema = z.object({
+	sessionId: z.string().min(1),
+	pageId: z.union([z.string(), z.number()]),
+	name: z.string(),
+	url: z.string(),
+}).strict();
+const SnapshotSchema = z.object({
+	count: z.number().int().nonnegative(),
+	text: z.string(),
+	imageUrls: z.array(z.string()),
+	hasMarkdown: z.boolean(),
+	messageId: z.string().optional(),
+}).strict();
+const ObservationSchema = z.object({
+	snapshot: SnapshotSchema,
+	composerReady: z.boolean(),
+	answering: z.boolean(),
+	thinking: z.boolean(),
+	toolRunning: z.boolean(),
+	retryAvailable: z.boolean(),
+	continueAvailable: z.boolean(),
+	errorMessage: z.string().optional(),
+	stateSummary: z.string(),
+}).strict();
+const ModelVerificationSchema = z.object({
+	requestedModel: z.string().min(1),
+	observedModel: z.string().min(1),
+	modelVerified: z.literal(true),
+	modelEvidenceKind: z.literal("composer_selector"),
+	modelVerifiedAt: z.string().min(1),
+}).strict();
+const ProbeSchema = z.object({
+	ready: z.boolean(),
+	driver: DriverIdSchema,
+	secureInput: z.boolean(),
+	protocolVersion: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
+	reason: z.string().optional(),
+}).strict();
 const EnvelopeSchema = z.object({
 	version: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
 	ok: z.boolean(),
 	result: z.unknown().optional(),
 	error: z.string().optional(),
-});
+}).strict();
 
 export class ExternalCommandBrowserDriver implements WebChatDriver {
-	readonly id = "external-command";
 	private readonly command: string;
 	private readonly args: string[];
+	private readonly fallbackId: string;
+	private resolvedId?: string;
 
 	constructor(command: string, args: string[] = []) {
 		this.command = command;
-		this.args = args;
+		this.args = [...args];
+		this.fallbackId = `external-command/${createHash("sha256").update(JSON.stringify([command, args])).digest("hex").slice(0, 16)}`;
+	}
+
+	get id(): string {
+		return this.resolvedId ?? this.fallbackId;
 	}
 
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
-		return ProbeSchema.parse(await this.call("probe", {}, signal));
+		const result = ProbeSchema.parse(await this.call("probe", {}, signal));
+		if (this.resolvedId && result.driver !== this.resolvedId) {
+			throw new Error(`Browser driver identity changed from ${this.resolvedId} to ${result.driver}.`);
+		}
+		this.resolvedId = result.driver;
+		if (result.ready && !result.secureInput) {
+			return { ...result, ready: false, reason: result.reason ?? "Protocol-v2 driver did not attest secure stdin input." };
+		}
+		return result;
 	}
 
 	async create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession> {
@@ -215,16 +615,36 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 		return SessionSchema.parse(await this.call("show", { sessionId }, signal));
 	}
 
+	async navigate(session: DriverSession, url: string, signal?: AbortSignal): Promise<DriverSession> {
+		return SessionSchema.parse(await this.call("navigate", { session, url }, signal));
+	}
+
 	async upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void> {
 		await this.call("upload", { session, files }, signal);
 	}
 
-	async submit(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
-		await this.call("submit", { session, prompt }, signal);
+	async fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
+		await this.call("fill", { session, prompt }, signal);
 	}
 
-	async snapshot(session: DriverSession, signal?: AbortSignal): Promise<AssistantSnapshot> {
-		return SnapshotSchema.parse(await this.call("snapshot", { session }, signal));
+	async selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+		return ModelVerificationSchema.parse(await this.call("select_model", { session, model }, signal));
+	}
+
+	async verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+		return ModelVerificationSchema.parse(await this.call("verify_model", { session, model }, signal));
+	}
+
+	async send(session: DriverSession, signal?: AbortSignal): Promise<void> {
+		await this.call("send", { session }, signal);
+	}
+
+	async observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation> {
+		return ObservationSchema.parse(await this.call("observe", { session }, signal));
+	}
+
+	async recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void> {
+		await this.call("recover", { session, action }, signal);
 	}
 
 	async setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void> {
@@ -255,35 +675,76 @@ async function invokeJsonCommand(
 	request: string,
 	signal?: AbortSignal,
 ): Promise<unknown> {
+	const limit = 16 * 1024 * 1024;
+	if (Buffer.byteLength(request, "utf8") > limit) throw new Error("Browser driver request exceeded 16 MiB.");
 	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], signal });
+		let settled = false;
+		const finish = (work: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			work();
+		};
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(command, args, {
+				stdio: ["pipe", "pipe", "pipe"],
+				signal,
+				env: sanitizedDriverEnv(process.env),
+			});
+		} catch (error) {
+			reject(error);
+			return;
+		}
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
 		let stdoutBytes = 0;
 		let stderrBytes = 0;
-		const limit = 16 * 1024 * 1024;
-		child.stdout.on("data", (chunk: Buffer) => {
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish(() => reject(new Error("Browser driver command exceeded its 180-second bound.")));
+		}, 180_000);
+		timer.unref();
+		child.stdout!.on("data", (chunk: Buffer) => {
 			stdoutBytes += chunk.length;
-			if (stdoutBytes > limit) child.kill();
+			if (stdoutBytes > limit) child.kill("SIGKILL");
 			else stdout.push(chunk);
 		});
-		child.stderr.on("data", (chunk: Buffer) => {
+		child.stderr!.on("data", (chunk: Buffer) => {
 			stderrBytes += chunk.length;
 			if (stderrBytes <= limit) stderr.push(chunk);
 		});
-		child.on("error", reject);
-		child.on("close", (code) => {
+		child.stdin!.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code !== "EPIPE") finish(() => reject(error));
+		});
+		child.on("error", (error) => finish(() => reject(error)));
+		child.on("close", (code) => finish(() => {
 			if (stdoutBytes > limit) return reject(new Error("Browser driver response exceeded 16 MiB."));
 			const output = Buffer.concat(stdout).toString("utf8").trim();
 			if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code}.`));
+			if (output === "") return reject(new Error("Browser driver returned no JSON."));
 			try {
 				resolve(JSON.parse(output));
 			} catch {
 				reject(new Error(`Browser driver returned invalid JSON: ${output.slice(0, 400)}`));
 			}
-		});
-		child.stdin.end(`${request}\n`);
+		}));
+		child.stdin!.end(`${request}\n`);
 	});
+}
+
+function sanitizedDriverEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const safe = new Set(["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+	const output: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) continue;
+		if (safe.has(key) || key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_")) output[key] = value;
+	}
+	return output;
+}
+
+function offlineProbe(driver: string, reason: string): DriverProbe {
+	return { ready: false, driver, secureInput: false, protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION, reason };
 }
 
 function numericPageId(value: DriverPageId): number {
@@ -291,6 +752,36 @@ function numericPageId(value: DriverPageId): number {
 	return value;
 }
 
-function message(error: unknown): string {
+function assertChatGptUrl(raw: string, allowTransient: boolean): void {
+	if (allowTransient && isTransientUrl(raw)) return;
+	let url: URL;
+	try { url = new URL(raw); } catch { throw new Error(`Owned page returned an invalid URL: ${raw}`); }
+	if (url.origin !== CHATGPT_ORIGIN) throw new Error(`Refused browser page outside ${CHATGPT_ORIGIN}: ${raw}`);
+}
+
+function isTransientUrl(raw: string): boolean {
+	return raw === "" || raw === "about:blank" || raw === "chrome://newtab" || raw === "chrome://newtab/";
+}
+
+function isTransientDriverError(message: string): boolean {
+	return /not ready|still committing|composer is not ready|detached|no such (?:tab|page)|target closed|url unavailable/i.test(message);
+}
+
+function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Operation was cancelled."));
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal?.reason ?? new Error("Operation was cancelled."));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
