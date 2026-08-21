@@ -1,27 +1,26 @@
 {
-  "name": "chatgpt-control",
-  "version": "0.1.1",
-  "description": "Typed ChatGPT web control for coding agents: independent second-model review, durable conversations, and image iteration through the Chrome you are already signed into",
+  "name": "gpt-control",
+  "version": "0.2.0",
+  "description": "A trustworthy cross-model review broker for coding agents: real runs, structured findings, attachment receipts, and Chrome Bridge, Codex, or Responses transports",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://github.com/wolfiesch/chatgpt-control",
+  "homepage": "https://github.com/wolfiesch/gpt-control",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wolfiesch/chatgpt-control.git"
+    "url": "git+https://github.com/wolfiesch/gpt-control.git"
   },
   "keywords": [
-    "chatgpt",
+    "gpt-control",
+    "model-review",
+    "cross-model",
     "openai",
     "agent-tools",
     "coding-agent",
-    "chrome",
     "browser-automation",
-    "second-opinion",
     "oh-my-pi",
     "omp",
     "pi-extension",
     "pi-coding-agent",
-    "claude-code",
     "codex"
   ],
   "files": [
@@ -31,9 +30,13 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "bin": {
+    "gpt-control-mcp": "./src/mcp.ts"
+  },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "mcp": "bun src/mcp.ts"
   },
   "omp": {
     "extensions": [
@@ -46,7 +49,12 @@
     ]
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.52"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@openai/codex-sdk": "^0.149.0",
+    "@sinclair/typebox": "^0.34.52",
+    "node-html-parser": "^9.0.1",
+    "openai": "^7.5.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

@@ -69,7 +69,7 @@ function launcherFromCommandLine(value: string, origin: string): Launcher | unde
 }
 
 function resolvePython(env: NodeJS.ProcessEnv): string | undefined {
-	const explicit = env.CHATGPT_CONTROL_PYTHON;
+	const explicit = env.GPT_CONTROL_PYTHON;
 	if (explicit && isExecutable(explicit)) return explicit;
 	return findOnPath("python3", env) ?? findOnPath("python", env);
 }
@@ -83,9 +83,9 @@ function resolvePython(env: NodeJS.ProcessEnv): string | undefined {
  * so the repository form has to be a first-class path rather than a fallback.
  */
 export function resolveBridgeLauncher(env: NodeJS.ProcessEnv = process.env): Launcher | undefined {
-	const explicit = env.CHATGPT_CONTROL_BRIDGE;
+	const explicit = env.GPT_CONTROL_BRIDGE;
 	if (explicit) {
-		const launcher = launcherFromCommandLine(explicit, "CHATGPT_CONTROL_BRIDGE");
+		const launcher = launcherFromCommandLine(explicit, "GPT_CONTROL_BRIDGE");
 		if (launcher) return launcher;
 	}
 
@@ -118,9 +118,9 @@ export function resolveBridgeLauncher(env: NodeJS.ProcessEnv = process.env): Lau
  * tool call is slow and silently version-drifting.
  */
 export function resolveOracleLauncher(env: NodeJS.ProcessEnv = process.env): Launcher | undefined {
-	const explicit = env.CHATGPT_CONTROL_ORACLE;
+	const explicit = env.GPT_CONTROL_ORACLE;
 	if (explicit) {
-		const launcher = launcherFromCommandLine(explicit, "CHATGPT_CONTROL_ORACLE");
+		const launcher = launcherFromCommandLine(explicit, "GPT_CONTROL_ORACLE");
 		if (launcher) return launcher;
 	}
 	const onPath = findOnPath("oracle", env);
@@ -149,7 +149,7 @@ export function runLauncher(
  * 2s on a healthy install, and a tight budget reports a live bridge as absent.
  */
 export function probeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-	const raw = Number(env.CHATGPT_CONTROL_PROBE_MS);
+	const raw = Number(env.GPT_CONTROL_PROBE_MS);
 	return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
 }
 

@@ -1,3 +1,5 @@
+import { parse } from "node-html-parser";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,6 +31,14 @@ export interface ChatSession {
 export interface AssistantTurn {
 	text: string;
 	imageUrls: string[];
+}
+
+/**
+ * The last assistant turn plus how many exist, so a caller can tell a fresh
+ * answer from the one that was already on the page.
+ */
+export interface AssistantSnapshot extends AssistantTurn {
+	count: number;
 }
 
 /** Raised when Chrome Bridge policy blocks an action; carries the fix. */
@@ -217,16 +227,8 @@ export async function submitPrompt(
 	});
 }
 
-export async function pageText(
-	exec: Exec,
-	launcher: Launcher,
-	tabId: number,
-	maxChars: number,
-	signal?: AbortSignal,
-): Promise<string> {
-	const payload = await bridgeJson(exec, launcher, ["extractText", String(tabId), String(maxChars)], signal);
-	const result = resultOf(payload);
-	return readString(result, "text") ?? readString(payload, "text") ?? "";
+export function countAssistantTurns(html: string): number {
+	return parse(html).querySelectorAll(`[data-message-author-role="assistant"]`).length;
 }
 
 export async function tabUrl(
@@ -249,42 +251,68 @@ export async function tabUrl(
  * runs both need to move this, so it is one knob rather than a literal.
  */
 export function pollIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
-	const raw = Number(env.CHATGPT_CONTROL_POLL_MS);
+	const raw = Number(env.GPT_CONTROL_POLL_MS);
 	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
 }
 
 /**
- * Waits for the answer to stop changing.
+ * Waits for a *new* assistant turn to appear and settle.
  *
- * ChatGPT exposes no completion flag that survives UI revisions, so this
- * watches for the page text to hold steady instead of matching a spinner
- * selector. Streaming pauses are absorbed by requiring several equal reads.
+ * Watching page text for stability is not enough. While the model is thinking,
+ * queued, or rate limited, the page holds still, so a stability check declares
+ * success and the caller reads the last assistant turn, which on a
+ * continuation is the previous answer. Anchoring on the turn count makes
+ * "a new answer exists" a precondition rather than an assumption.
  */
-export async function waitForStableText(
+export async function waitForNewAssistantTurn(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
-	options: { timeoutMs: number; intervalMs?: number; stableRounds?: number; signal?: AbortSignal },
-): Promise<{ settled: boolean; text: string }> {
+	options: { baselineCount: number; timeoutMs: number; intervalMs?: number; stableRounds?: number; signal?: AbortSignal },
+): Promise<{ settled: boolean; snapshot?: AssistantSnapshot }> {
 	const intervalMs = options.intervalMs ?? pollIntervalMs();
 	const stableRounds = options.stableRounds ?? 3;
 	const deadline = Date.now() + options.timeoutMs;
-	let previous = "";
+	let latest: AssistantSnapshot | undefined;
+	let previous: string | undefined;
 	let steady = 0;
+	let blank = 0;
 
 	while (Date.now() < deadline) {
 		await new Promise((done) => setTimeout(done, intervalMs));
 		if (options.signal?.aborted) break;
-		const current = await pageText(exec, launcher, tabId, 200_000, options.signal);
-		if (current === previous && current.trim() !== "") {
+		const snapshot = await readAssistantSnapshot(exec, launcher, tabId, options.signal);
+		if (snapshot.count <= options.baselineCount) {
+			// The reply has not been rendered yet. A still page during thinking
+			// or a rate-limit banner must not read as a settled answer.
+			steady = 0;
+			previous = undefined;
+			continue;
+		}
+		latest = snapshot;
+		// An image-only reply carries no text, so stability keys on whichever
+		// content the turn actually has. Requiring text would hang forever on a
+		// generated image.
+		const fingerprint = `${snapshot.text}\u0000${snapshot.imageUrls.join(",")}`;
+		if (fingerprint === "\u0000") {
+			// The turn exists but exposes nothing readable. Give streaming a
+			// while, then stop rather than burning the whole timeout.
+			blank += 1;
+			steady = 0;
+			previous = undefined;
+			if (blank >= stableRounds * 2) break;
+			continue;
+		}
+		blank = 0;
+		if (fingerprint === previous) {
 			steady += 1;
-			if (steady >= stableRounds) return { settled: true, text: current };
+			if (steady >= stableRounds) return { settled: true, snapshot };
 		} else {
 			steady = 0;
-			previous = current;
+			previous = fingerprint;
 		}
 	}
-	return { settled: false, text: previous };
+	return { settled: false, snapshot: latest };
 }
 
 const ENTITIES: Record<string, string> = {
@@ -337,47 +365,45 @@ export function approvedImageUrl(raw: string): URL | undefined {
 	return IMAGE_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url : undefined;
 }
 
-/** Slices the final assistant turn out of a saved ChatGPT page. */
+/** Extracts only the final assistant node, never the trailing page shell. */
 export function extractAssistantTurn(html: string): AssistantTurn {
-	const marker = html.lastIndexOf(ASSISTANT_MARKER);
-	// Advance past the rest of the enclosing opening tag: the marker sits inside
-	// it, so slicing at the marker would leave `…="assistant">` as literal text.
-	const tagEnd = marker === -1 ? -1 : html.indexOf(">", marker);
-	const region = marker === -1 ? "" : html.slice(tagEnd === -1 ? marker : tagEnd + 1);
+	const root = parse(html);
+	const turns = root.querySelectorAll(`[data-message-author-role="assistant"]`);
+	const node = turns.length === 0 ? undefined : turns[turns.length - 1];
+	if (!node) return { text: "", imageUrls: [] };
 	const imageUrls: string[] = [];
 	const seen = new Set<string>();
-	for (const match of region.matchAll(/<img\b[^>]*\bsrc="([^"]+)"/g)) {
-		const url = approvedImageUrl(decodeEntities(match[1]));
+	for (const image of node.querySelectorAll("img")) {
+		const source = image.getAttribute("src");
+		if (!source) continue;
+		const url = approvedImageUrl(source);
 		if (!url || seen.has(url.href)) continue;
 		seen.add(url.href);
 		imageUrls.push(url.href);
 	}
-
-	const text = decodeEntities(
-		region
-			.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
-			.replace(/<br\s*\/?>/gi, "\n")
-			.replace(/<\/(p|div|li|h[1-6]|pre|tr)>/gi, "\n")
-			.replace(/<li\b[^>]*>/gi, "- ")
-			.replace(/<[^>]+>/g, ""),
-	)
+	// ChatGPT renders response prose under `.markdown`; controls and feedback
+	// buttons may share the outer assistant node and are not model output.
+	const content = node.querySelector(".markdown") ?? node;
+	const text = content.structuredText
 		.replace(/[ \t]+\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
-
 	return { text, imageUrls };
 }
 
-export async function readAssistantTurn(
+export async function readAssistantSnapshot(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
 	signal?: AbortSignal,
-): Promise<AssistantTurn> {
-	const scratch = join(tmpdir(), `chatgpt-control-${tabId}-${Date.now()}.html`);
+): Promise<AssistantSnapshot> {
+	// A timestamp alone collides when two reads of the same tab land in one
+	// millisecond, which lets one caller parse another's page.
+	const scratch = join(tmpdir(), `gpt-control-${tabId}-${randomUUID()}.html`);
 	try {
 		await bridgeJson(exec, launcher, ["getHTML", String(tabId), scratch], signal, 120_000);
-		return extractAssistantTurn(await readFile(scratch, "utf8"));
+		const html = await readFile(scratch, "utf8");
+		return { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
 	} finally {
 		await rm(scratch, { force: true });
 	}
@@ -433,6 +459,7 @@ export async function fetchArtifact(
 		if (!contentType.toLowerCase().startsWith("image/")) {
 			return { blocked: `Refused a response that is not an image (${contentType || "no content type"}).` };
 		}
+
 		const declared = Number(response.headers.get("content-length"));
 		if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) {
 			return { blocked: `Refused an image larger than ${MAX_IMAGE_BYTES} bytes.` };
@@ -452,6 +479,16 @@ export async function fetchArtifact(
 	} catch (error) {
 		return { blocked: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+export async function setSessionState(
+	exec: Exec,
+	launcher: Launcher,
+	sessionId: string,
+	state: "working" | "needs_user" | "completed",
+	signal?: AbortSignal,
+): Promise<void> {
+	await bridgeJson(exec, launcher, ["taskSession", "state", sessionId, state], signal);
 }
 
 /** Yields body chunks, tolerating runtimes that expose no readable stream. */

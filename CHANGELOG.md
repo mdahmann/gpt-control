@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.0] - 2026-08-21
+
+### Added
+
+- Renamed the package and tools to GPT-Control.
+- Official Codex SDK and Responses API transports.
+- Separate wrapper-owned `conversation_id` and per-submission `run_id` records persisted under `~/.gpt-control`.
+- Run status, wait, result, cancel, per-conversation locking, and exact provider result identifiers.
+- Workspace-scoped attachment manifests with realpath containment, regular-file checks, count and byte caps, sensitive-path gates, and SHA-256 receipts.
+- Structured review findings with evidence ranges, confidence, remediation, and open questions.
+- Review receipts covering provider, model, timestamps, prompt hash, attachment hashes, result hash, and provider identifiers.
+- MCP adapter exposing the same core service as OMP and Pi.
+
+### Changed
+
+- Chrome Bridge remains the preferred signed-in browser transport. A lease or outage now returns a retryable error and never falls back to a focus-stealing browser.
+- Oracle browser mode is explicit and requires `allow_focus_steal=true`.
+- Destructive run cancellation and conversation close operations are separate write-approved tools.
+- Browser reuse, read, and close require a wrapper-owned session namespace and an exact `https://chatgpt.com` origin.
+
+## [0.1.2] - 2026-08-21
+
+### Fixed
+
+- A turn could report the wrong answer. Completion was inferred from whole-page text holding steady, but the page also holds still while the model is thinking, is queued, or is rate limited. The wait then finished early and the last assistant turn was read, which on a continuation is the previous reply, so an earlier answer could be returned as the answer to a new question. Each turn now records how many replies were on the page before submitting, waits for that count to rise, and only then waits for the new reply to settle.
+- Whole-page text is no longer used as a fallback answer. It carried the sidebar and chat history alongside the reply. When no new reply arrives, the tool now reports that and returns the job id.
+- An image-only reply no longer waits out the full timeout. Settling keys on text or images, whichever the turn carries, and a reply that exposes nothing readable gives up after a bounded number of polls.
+- Page snapshots use a unique scratch filename. Two reads of the same tab within one millisecond shared a path, letting one caller parse another's page.
+
 ## [0.1.1] - 2026-08-21
 
 ### Fixed

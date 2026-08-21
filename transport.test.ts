@@ -1,154 +1,102 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import {
-	BRIDGE_REPO,
-	NoTransportError,
-	describeCapabilities,
-	resetCapabilityCache,
-	resolveCapabilities,
-	selectRoute,
-	setupGuidance,
-	type Capabilities,
-} from "./src/capability";
-import { findOnPath, resolveBridgeLauncher, resolveOracleLauncher, splitCommandLine } from "./src/transport";
-import type { ExecResult } from "./src/types";
+import { describe, expect, test } from "bun:test";
+import { selectRoute, type Capabilities } from "./src/capability";
+import { buildOracleArgs } from "./src/oracle";
+import { runCodexTurn, runResponsesTurn, type CodexFactory, type ResponsesClient } from "./src/providers";
+import { REVIEW_OUTPUT_SCHEMA, type AttachmentManifest } from "./src/domain";
 
-const scratch: string[] = [];
+const emptyManifest: AttachmentManifest = { workspaceRoot: "/tmp", files: [], totalBytes: 0, sha256: "0".repeat(64) };
+const bridge = { launcher: { command: "chrome-bridge", args: [], origin: "test" }, probe: { ready: true } };
+const oracle = { launcher: { command: "oracle", args: [], origin: "test" }, version: "0.17.1" };
 
-function tempDir(): string {
-	const dir = mkdtempSync(join(tmpdir(), "chatgpt-control-"));
-	scratch.push(dir);
-	return dir;
-}
+describe("focus-safe route selection", () => {
+	test("prefers a live Chrome Bridge", () => {
+		expect(selectRoute({ bridge, codex: { origin: "PATH" } }).kind).toBe("chrome_bridge");
+	});
 
-afterEach(() => {
-	while (scratch.length > 0) rmSync(scratch.pop() as string, { recursive: true, force: true });
-	resetCapabilityCache();
-});
+	test("does not launch Oracle when an installed bridge is temporarily leased", () => {
+		const capabilities: Capabilities = {
+			bridgeOffline: { launcher: bridge.launcher, probe: { ready: false, reason: "leased by another client" } },
+			oracle,
+			codex: { origin: "PATH" },
+		};
+		expect(() => selectRoute(capabilities)).toThrow("No foreground browser was launched");
+	});
 
-function ok(stdout: string): ExecResult {
-	return { stdout, stderr: "", code: 0, killed: false };
-}
+	test("requires an explicit acknowledgement before Oracle browser mode", () => {
+		expect(() => selectRoute({ oracle }, { transport: "oracle_browser" })).toThrow("allow_focus_steal=true");
+		expect(selectRoute({ oracle }, { transport: "oracle_browser", allowFocusSteal: true }).kind).toBe("oracle_browser");
+	});
 
-function fail(stderr: string, code = 1): ExecResult {
-	return { stdout: "", stderr, code, killed: false };
-}
+	test("uses official Codex only when no bridge is installed", () => {
+		expect(selectRoute({ codex: { origin: "PATH", version: "codex 1" } }).kind).toBe("codex");
+	});
 
-const READY = JSON.stringify({ ready: true, endpoint: "127.0.0.1:9223", endpointStatus: "reachable", backend: "reachable", extension: "connected" });
-const NOT_READY = JSON.stringify({ ready: false, endpointStatus: "refused", extension: "unavailable", reason: "browser unavailable" });
-
-describe("command line splitting", () => {
-	test("keeps quoted path segments together", () => {
-		expect(splitCommandLine(`/usr/bin/python3 "/My Files/test_client.py"`)).toEqual(["/usr/bin/python3", "/My Files/test_client.py"]);
+	test("requires paid confirmation for Responses", () => {
+		expect(() => selectRoute({ responses: { available: true } }, { transport: "responses" })).toThrow("api_confirmed=true");
+		expect(selectRoute({ responses: { available: true } }, { transport: "responses", apiConfirmed: true }).kind).toBe("responses");
 	});
 });
 
-describe("launcher discovery", () => {
-	test("finds an executable on a synthetic PATH", () => {
-		const dir = tempDir();
-		const bin = join(dir, "chrome-bridge");
-		writeFileSync(bin, "#!/bin/sh\n");
-		chmodSync(bin, 0o755);
-		expect(findOnPath("chrome-bridge", { PATH: dir })).toBe(bin);
-		expect(findOnPath("chrome-bridge", { PATH: tempDir() })).toBeUndefined();
+describe("Codex SDK adapter", () => {
+	test("starts a thread with a structured schema and returns its real thread id", async () => {
+		let outputSchema: unknown;
+		const factory: CodexFactory = {
+			create: () => ({
+				startThread: () => ({
+					id: "thread_123",
+					run: async (_input, options) => {
+						outputSchema = options?.outputSchema;
+						return { items: [{ id: "msg_1", type: "agent_message" }], finalResponse: '{"verdict":"approve","summary":"ok","findings":[],"openQuestions":[]}', usage: { input_tokens: 1 } };
+					},
+				}),
+				resumeThread: () => { throw new Error("not expected"); },
+			}),
+		};
+		const result = await runCodexTurn({ kind: "consult", prompt: "review", manifest: emptyManifest }, factory);
+		expect(result.providerConversationId).toBe("thread_123");
+		expect(result.providerRunId).toBe("msg_1");
+		expect(outputSchema).toEqual(REVIEW_OUTPUT_SCHEMA);
 	});
 
-	test("an explicit command line wins over everything else", () => {
-		const launcher = resolveBridgeLauncher({ CHATGPT_CONTROL_BRIDGE: "/usr/bin/python3 /opt/bridge/test_client.py" });
-		expect(launcher).toMatchObject({ command: "/usr/bin/python3", args: ["/opt/bridge/test_client.py"] });
-	});
-
-	test("falls back to a repository checkout when the CLI is not on PATH", () => {
-		const dir = tempDir();
-		writeFileSync(join(dir, "test_client.py"), "print()\n");
-		const python = join(tempDir(), "python3");
-		writeFileSync(python, "#!/bin/sh\n");
-		chmodSync(python, 0o755);
-
-		const launcher = resolveBridgeLauncher({ PATH: join(python, ".."), CHROME_BRIDGE_HOME: dir, CHATGPT_CONTROL_PYTHON: python });
-		expect(launcher).toMatchObject({ command: python, args: [join(dir, "test_client.py")], cwd: dir, origin: "CHROME_BRIDGE_HOME" });
-	});
-
-	test("reports nothing when no bridge exists", () => {
-		expect(resolveBridgeLauncher({ PATH: tempDir(), HOME: tempDir(), CHATGPT_CONTROL_PYTHON: "/nonexistent" })).toBeUndefined();
-	});
-
-	test("never resolves oracle through npx", () => {
-		expect(resolveOracleLauncher({ PATH: tempDir() })).toBeUndefined();
-	});
-});
-
-describe("capability probing", () => {
-	test("marks the bridge available when the extension is connected", async () => {
-		const capabilities = await resolveCapabilities(async () => ok(READY), { CHATGPT_CONTROL_BRIDGE: "chrome-bridge" });
-		expect(capabilities.bridge).toBeDefined();
-		expect(capabilities.bridge?.probe.endpoint).toBe("127.0.0.1:9223");
-	});
-
-	test("separates installed-but-offline from absent", async () => {
-		const capabilities = await resolveCapabilities(async () => ({ stdout: NOT_READY, stderr: "", code: 1, killed: false }), {
-			CHATGPT_CONTROL_BRIDGE: "chrome-bridge",
-		});
-		expect(capabilities.bridge).toBeUndefined();
-		expect(capabilities.bridgeOffline?.probe.reason).toBe("browser unavailable");
-	});
-
-	test("only accepts oracle when the binary actually runs", async () => {
-		const capabilities = await resolveCapabilities(async () => fail("not found", 127), { CHATGPT_CONTROL_ORACLE: "oracle" });
-		expect(capabilities.oracle).toBeUndefined();
+	test("resumes the exact Codex thread for a follow-up", async () => {
+		let resumed = "";
+		const factory: CodexFactory = {
+			create: () => ({
+				startThread: () => { throw new Error("not expected"); },
+				resumeThread: (id) => {
+					resumed = id;
+					return { id, run: async () => ({ items: [], finalResponse: "continued", usage: null }) };
+				},
+			}),
+		};
+		await runCodexTurn({ kind: "chat", prompt: "next", manifest: emptyManifest, providerConversationId: "thread_abc" }, factory);
+		expect(resumed).toBe("thread_abc");
 	});
 });
 
-describe("route selection", () => {
-	const bridge: Capabilities = { bridge: { launcher: { command: "chrome-bridge", args: [], origin: "test" }, probe: { ready: true } } };
-	const oracleOnly: Capabilities = { oracle: { launcher: { command: "oracle", args: [], origin: "test" }, version: "0.17.1" } };
-
-	test("prefers Chrome Bridge and stays silent about it", () => {
-		const route = selectRoute(bridge);
-		expect(route.kind).toBe("chrome-bridge");
-		expect(route.notice).toBeUndefined();
-	});
-
-	test("falls back to Oracle and points at Chrome Bridge exactly once", () => {
-		const first = selectRoute(oracleOnly);
-		expect(first.kind).toBe("oracle-browser");
-		expect(first.notice).toContain(BRIDGE_REPO);
-		expect(selectRoute(oracleOnly).notice).toBeUndefined();
-	});
-
-	test("refuses paid API mode until it is confirmed", () => {
-		expect(() => selectRoute(oracleOnly, { engine: "api" })).toThrow("api_confirmed=true");
-		expect(selectRoute(oracleOnly, { engine: "api", apiConfirmed: true }).kind).toBe("oracle-api");
-	});
-
-	test("explains how to install when nothing is present", () => {
-		expect(() => selectRoute({})).toThrow(NoTransportError);
-		const guidance = setupGuidance({});
-		expect(guidance).toContain(BRIDGE_REPO);
-		expect(guidance).toContain("npm i -g @steipete/oracle");
-	});
-
-	test("an offline bridge is diagnosed instead of advertised as missing", () => {
-		const guidance = setupGuidance({
-			bridgeOffline: { launcher: { command: "chrome-bridge", args: [], origin: "chrome-bridge on PATH" }, probe: { ready: false, reason: "browser unavailable" } },
-		});
-		expect(guidance).toContain("browser unavailable");
-		expect(guidance).toContain("chrome-bridge on PATH");
-	});
-
-	test("api mode without oracle steers back to the bridge rather than to an install", () => {
-		expect(() => selectRoute(bridge, { engine: "api", apiConfirmed: true })).toThrow("omit engine=api");
+describe("Responses API adapter", () => {
+	test("uses structured outputs and chains the previous response id", async () => {
+		let body: Record<string, unknown> = {};
+		const client: ResponsesClient = {
+			responses: {
+				create: async (request) => {
+					body = request;
+					return { id: "resp_2", model: "gpt-5.6", output_text: '{"verdict":"approve","summary":"ok","findings":[],"openQuestions":[]}' };
+				},
+			},
+		};
+		const result = await runResponsesTurn({ kind: "consult", prompt: "review", manifest: emptyManifest, providerConversationId: "resp_1" }, client);
+		expect(body.previous_response_id).toBe("resp_1");
+		expect(body.text).toMatchObject({ format: { type: "json_schema", strict: true } });
+		expect(result.providerConversationId).toBe("resp_2");
 	});
 });
 
-describe("capability reporting", () => {
-	test("names the preferred transport and image support", () => {
-		expect(describeCapabilities({})).toMatchObject({ preferred: "none", images: "requires Chrome Bridge" });
-		const withBridge = describeCapabilities({
-			bridge: { launcher: { command: "chrome-bridge", args: [], origin: "PATH" }, probe: { ready: true, endpoint: "127.0.0.1:9223" } },
-		});
-		expect(withBridge).toMatchObject({ preferred: "chrome-bridge", images: "supported" });
+describe("Oracle legacy adapter", () => {
+	test("uses only real root flags", () => {
+		expect(buildOracleArgs({ prompt: "why", engine: "browser", followup: "sess_1" })).toEqual([
+			"--engine", "browser", "--prompt", "why", "--followup", "sess_1",
+		]);
+		expect(buildOracleArgs({ prompt: "why", engine: "browser" })).not.toContain("--json");
 	});
 });

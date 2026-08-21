@@ -1,159 +1,120 @@
-import { describe, expect, test } from "bun:test";
-import { approvedImageUrl, decodeEntities, extractAssistantTurn, extractTabId, translatePolicyDenial, PolicyDeniedError } from "./src/chatgpt";
-import { BridgeCommandError, parseCommandJson } from "./src/json";
-import { buildOracleArgs, extractOracleAnswer } from "./src/oracle";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildAttachmentManifest, isSensitive, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from "./src/files";
+import { parseReviewReport } from "./src/review";
+import { RunStore } from "./src/store";
+import { STORAGE_VERSION, type ConversationRecord } from "./src/domain";
+import { countAssistantTurns, extractAssistantTurn } from "./src/chatgpt";
 
-describe("assistant turn extraction", () => {
-	test("reads only the final assistant turn", () => {
-		const html = `
-			<div data-message-author-role="assistant"><p>stale answer</p></div>
-			<div data-message-author-role="user"><p>follow up</p></div>
-			<div data-message-author-role="assistant"><p>fresh answer</p></div>`;
-		expect(extractAssistantTurn(html).text).toBe("fresh answer");
+const roots: string[] = [];
+function scratch(): string {
+	const root = mkdtempSync(join(tmpdir(), "gpt-control-test-"));
+	roots.push(root);
+	return root;
+}
+afterEach(() => {
+	while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
+});
+
+describe("attachment manifest", () => {
+	test("realpath-resolves relative files and records size and hashes", async () => {
+		const root = scratch();
+		writeFileSync(join(root, "a.ts"), "export const a = 1;\n");
+		const manifest = await buildAttachmentManifest(["a.ts"], { workspaceRoot: root });
+		expect(manifest.files[0]).toMatchObject({ relativePath: "a.ts", size: 20 });
+		expect(manifest.files[0].sha256).toHaveLength(64);
+		expect(manifest.sha256).toHaveLength(64);
 	});
 
-	test("keeps generated images and drops avatars and duplicates", () => {
-		const html = `<img src="https://cdn.example/avatar.png">
-			<div data-message-author-role="assistant">
-				<img src="https://files.oaiusercontent.com/a.png?sig=1&amp;v=2">
-				<img src="https://files.oaiusercontent.com/a.png?sig=1&amp;v=2">
-				<img src="https://cdn.example/icon.svg">
-			</div>`;
-		expect(extractAssistantTurn(html).imageUrls).toEqual(["https://files.oaiusercontent.com/a.png?sig=1&v=2"]);
+	test("rejects a symlink escape from the workspace", async () => {
+		const root = scratch();
+		const outside = scratch();
+		writeFileSync(join(outside, "secret.txt"), "outside");
+		symlinkSync(join(outside, "secret.txt"), join(root, "link.txt"));
+		await expect(buildAttachmentManifest(["link.txt"], { workspaceRoot: root })).rejects.toThrow("outside workspace");
 	});
 
-	test("turns block markup into readable lines and strips scripts", () => {
-		const html = `<div data-message-author-role="assistant">
-			<p>First</p><script>ignored()</script><ul><li>one</li><li>two</li></ul><p>a &lt; b</p>
-		</div>`;
-		expect(extractAssistantTurn(html).text).toBe("First\n- one\n- two\na < b");
+	test("requires explicit flags for outside and sensitive files", async () => {
+		const root = scratch();
+		const outside = scratch();
+		writeFileSync(join(outside, ".env"), "KEY=value\n");
+		await expect(buildAttachmentManifest([join(outside, ".env")], { workspaceRoot: root, allowOutsideWorkspace: true })).rejects.toThrow("sensitive");
+		const manifest = await buildAttachmentManifest([join(outside, ".env")], { workspaceRoot: root, allowOutsideWorkspace: true, allowSensitiveFiles: true });
+		expect(manifest.files).toHaveLength(1);
 	});
 
-	test("reports empty rather than throwing when no assistant turn exists", () => {
-		expect(extractAssistantTurn("<div>loading</div>")).toEqual({ text: "", imageUrls: [] });
+	test("caps file count and aggregate bytes", async () => {
+		const root = scratch();
+		await expect(buildAttachmentManifest(Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, i) => `f${i}`), { workspaceRoot: root })).rejects.toThrow("Attachment limit");
+		writeFileSync(join(root, "large.bin"), Buffer.alloc(16));
+		await expect(buildAttachmentManifest(["large.bin"], { workspaceRoot: root, maxBytes: 8 })).rejects.toThrow("byte limit");
+		expect(MAX_ATTACHMENT_BYTES).toBeGreaterThan(0);
 	});
 
-	test("drops a spoofed host whose path merely contains the approved name", () => {
-		const html = `<div data-message-author-role="assistant">
-			<img src="http://169.254.169.254/latest/meta-data/oaiusercontent.com">
-			<img src="https://evil.example/x.png?ref=files.oaiusercontent.com">
-		</div>`;
-		expect(extractAssistantTurn(html).imageUrls).toEqual([]);
+	test("blocks obvious credential paths", () => {
+		expect(isSensitive("/home/me/.ssh/id_ed25519")).toBe(true);
+		expect(isSensitive("/repo/src/index.ts")).toBe(false);
 	});
 });
 
-describe("image host validation", () => {
-	test("accepts the approved hosts and their subdomains over HTTPS", () => {
-		expect(approvedImageUrl("https://files.oaiusercontent.com/a.png")?.hostname).toBe("files.oaiusercontent.com");
-		expect(approvedImageUrl("https://oaiusercontent.com/a.png")?.hostname).toBe("oaiusercontent.com");
-		expect(approvedImageUrl("https://files.openai.com/a.png")?.hostname).toBe("files.openai.com");
+describe("structured review", () => {
+	test("validates findings and evidence ranges", () => {
+		const report = parseReviewReport(JSON.stringify({
+			verdict: "request_changes",
+			summary: "one issue",
+			findings: [{ severity: "high", claim: "bug", evidence: { file: "a.ts", lineStart: 2, lineEnd: 3 }, confidence: 0.9, remediation: "fix it" }],
+			openQuestions: [],
+		}));
+		expect(report.findings[0].evidence.file).toBe("a.ts");
 	});
 
-	test("rejects lookalike hosts, plaintext, and non-URLs", () => {
-		// A suffix check without the dot boundary would accept the first of these.
-		expect(approvedImageUrl("https://evil-oaiusercontent.com/a.png")).toBeUndefined();
-		expect(approvedImageUrl("https://oaiusercontent.com.evil.example/a.png")).toBeUndefined();
-		expect(approvedImageUrl("http://files.oaiusercontent.com/a.png")).toBeUndefined();
-		expect(approvedImageUrl("file:///etc/passwd")).toBeUndefined();
-		expect(approvedImageUrl("not a url")).toBeUndefined();
-	});
-});
-
-describe("entity decoding", () => {
-	test("handles named, decimal, and hex references", () => {
-		expect(decodeEntities("a &amp; b &#39;q&#39; &#x27;r&#x27; &nbsp;end")).toBe("a & b 'q' 'r'  end");
-	});
-
-	test("leaves unknown references untouched", () => {
-		expect(decodeEntities("&notreal; stays")).toBe("&notreal; stays");
+	test("rejects prose and invalid confidence", () => {
+		expect(() => parseReviewReport("looks good")).toThrow("structured review JSON");
+		expect(() => parseReviewReport(JSON.stringify({ verdict: "approve", summary: "ok", findings: [{ severity: "high", claim: "x", evidence: { file: "a", lineStart: 1, lineEnd: 1 }, confidence: 2, remediation: "x" }], openQuestions: [] }))).toThrow();
 	});
 });
 
-describe("bridge payload parsing", () => {
-	const ok = { stdout: '{"success":true,"result":{"sessionId":"s1"}}', stderr: "", code: 0, killed: false };
-
-	test("returns the payload on success", () => {
-		expect(parseCommandJson(ok, "test")).toMatchObject({ success: true });
+describe("durable store", () => {
+	test("round-trips a conversation and excludes arbitrary JSON", async () => {
+		const store = new RunStore(scratch());
+		await store.init();
+		const now = new Date().toISOString();
+		const conversation: ConversationRecord = { version: STORAGE_VERSION, id: `conv_${"a".repeat(32)}`, provider: "codex", workspaceRoot: "/tmp", createdAt: now, updatedAt: now };
+		await store.putConversation(conversation);
+		expect(await store.getConversation(conversation.id)).toEqual(conversation);
+		writeFileSync(join(store.root, "conversations", "conv_bad.json"), '{"id":"conv_bad"}');
+		await expect(store.getConversation("conv_bad")).rejects.toThrow();
 	});
 
-	test("turns a success:false envelope into an error carrying the payload", () => {
-		const result = { stdout: '{"success":false,"error":"boom"}', stderr: "", code: 0, killed: false };
-		expect(() => parseCommandJson(result, "test")).toThrow("boom");
-	});
-
-	test("prefers stderr when the process fails without stdout", () => {
-		const result = { stdout: "", stderr: "browser unavailable", code: 111, killed: false };
-		expect(() => parseCommandJson(result, "test")).toThrow("browser unavailable");
-	});
-
-	test("rejects non-JSON output", () => {
-		const result = { stdout: "not json", stderr: "", code: 0, killed: false };
-		expect(() => parseCommandJson(result, "test")).toThrow("invalid JSON");
-	});
-
-	test("treats a nested result.success:false as a failure", () => {
-		// The bridge reports page-action failures inside a success envelope; the
-		// live `fill` miss that motivated this looked like an outright success.
-		const result = {
-			stdout: JSON.stringify({ success: true, result: { err: "No element found for selector #prompt-textarea", success: false } }),
-			stderr: "",
-			code: 0,
-			killed: false,
-		};
-		expect(() => parseCommandJson(result, "fill")).toThrow("No element found for selector #prompt-textarea");
-	});
-});
-
-describe("policy denial translation", () => {
-	test("converts an egress denial into the exact grant command", () => {
-		const error = new BridgeCommandError("denied", { policyDenial: { kind: "egress", client: "default" } });
-		const translated = translatePolicyDenial(error);
-		expect(translated).toBeInstanceOf(PolicyDeniedError);
-		expect((translated as PolicyDeniedError).remediation).toBe("chrome-bridge policy allow-egress https://chatgpt.com default");
-	});
-
-	test("keeps a target denial retryable and never suggests widening policy", () => {
-		const error = new BridgeCommandError("policy denied: tab origin unresolved", {
-			policyDenial: { kind: "target", client: "default", remediation: "supply a valid url/domain/tabId" },
+	test("serializes runs per conversation", async () => {
+		const store = new RunStore(scratch());
+		const order: string[] = [];
+		let release!: () => void;
+		let acquired!: () => void;
+		const held = new Promise<void>((done) => { release = done; });
+		const entered = new Promise<void>((done) => { acquired = done; });
+		const first = store.withConversationLock("conv_lock", async () => {
+			order.push("first-start");
+			acquired();
+			await held;
+			order.push("first-end");
 		});
-		const translated = translatePolicyDenial(error);
-		expect(translated).not.toBeInstanceOf(PolicyDeniedError);
-		expect((translated as Error).message).toContain("supply a valid url/domain/tabId");
-		expect((translated as Error).message).not.toContain("allow-origin");
-	});
-
-	test("passes through unrelated errors", () => {
-		const error = new Error("network down");
-		expect(translatePolicyDenial(error)).toBe(error);
-	});
-});
-describe("tab id extraction", () => {
-	test("finds the id across the shapes the bridge returns", () => {
-		expect(extractTabId({ tabId: 7 })).toBe(7);
-		expect(extractTabId({ result: { tabId: 8 } })).toBe(8);
-		expect(extractTabId({ result: { tabIds: [9] } })).toBe(9);
-		expect(extractTabId({ result: { tabs: [{ id: 10 }] } })).toBe(10);
-		expect(extractTabId({ result: {} })).toBeUndefined();
+		await entered;
+		const second = store.withConversationLock("conv_lock", async () => {
+			order.push("second-start");
+		});
+		release();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first-start", "first-end", "second-start"]);
 	});
 });
 
-describe("oracle fallback", () => {
-	test("locates the answer under nested keys", () => {
-		expect(extractOracleAnswer({ result: { text: "hello" } })).toBe("hello");
-		expect(extractOracleAnswer({ response: { message: { content: "deep" } } })).toBe("deep");
-	});
-
-	test("ignores empty strings so raw stdout can win", () => {
-		expect(extractOracleAnswer({ text: "   " })).toBeUndefined();
-	});
-
-	test("builds root argv without --json, which the root command rejects", () => {
-		expect(
-			buildOracleArgs({ prompt: "why", engine: "api", model: "gpt-5.5", files: ["/a.ts"], followup: "sess_123" }),
-		).toEqual(["--engine", "api", "--prompt", "why", "--model", "gpt-5.5", "--file", "/a.ts", "--followup", "sess_123"]);
-	});
-
-	test("omits every optional flag when it was not asked for", () => {
-		expect(buildOracleArgs({ prompt: "why", engine: "browser" })).toEqual(["--engine", "browser", "--prompt", "why"]);
+describe("assistant snapshots", () => {
+	test("extracts only the latest assistant message node", () => {
+		const html = '<div data-message-author-role="assistant"><div class="markdown"><p>old</p></div></div><div data-message-author-role="assistant"><div class="markdown"><p>new</p></div><button>Copy</button></div><footer>ChatGPT can make mistakes</footer>';
+		expect(countAssistantTurns(html)).toBe(2);
+		expect(extractAssistantTurn(html).text).toBe("new");
 	});
 });

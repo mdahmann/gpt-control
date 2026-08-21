@@ -1,32 +1,40 @@
-import { probeBridge, probeOracle, resolveBridgeLauncher, resolveOracleLauncher, type BridgeProbe, type Launcher } from "./transport";
+import {
+	findOnPath,
+	probeBridge,
+	probeOracle,
+	resolveBridgeLauncher,
+	resolveOracleLauncher,
+	runLauncher,
+	type BridgeProbe,
+	type Launcher,
+} from "./transport";
+import type { Provider } from "./domain";
 import type { Exec } from "./types";
 
 export const BRIDGE_REPO = "https://github.com/wolfiesch/chrome-bridge";
-
-export type RouteKind = "chrome-bridge" | "oracle-browser" | "oracle-api";
+export type TransportChoice = Provider;
 
 export interface Capabilities {
 	bridge?: { launcher: Launcher; probe: BridgeProbe };
-	/** Present when a Chrome Bridge client exists on disk but is not answering. */
 	bridgeOffline?: { launcher: Launcher; probe: BridgeProbe };
+	codex?: { version?: string; origin: string };
+	responses?: { available: true };
 	oracle?: { launcher: Launcher; version?: string };
 }
 
 export interface Route {
-	kind: RouteKind;
-	launcher: Launcher;
-	/** Shown once per process when the chosen route is not the preferred one. */
-	notice?: string;
+	kind: Provider;
+	launcher?: Launcher;
 }
 
-const CACHE_TTL_MS = 60_000;
-let cached: { at: number; value: Capabilities } | undefined;
-const noticed = new Set<RouteKind>();
+const POSITIVE_TTL_MS = 60_000;
+const NEGATIVE_TTL_MS = 12_000;
+let cached: { at: number; value: Capabilities; positive: boolean } | undefined;
+let inFlight: Promise<Capabilities> | undefined;
 
-/** Test seam: forces the next resolution to re-probe. */
 export function resetCapabilityCache(): void {
 	cached = undefined;
-	noticed.clear();
+	inFlight = undefined;
 }
 
 export async function resolveCapabilities(
@@ -34,31 +42,41 @@ export async function resolveCapabilities(
 	env: NodeJS.ProcessEnv = process.env,
 	signal?: AbortSignal,
 ): Promise<Capabilities> {
-	if (cached && Date.now() - cached.at < CACHE_TTL_MS && cached.value.bridge) return cached.value;
+	const ttl = cached?.positive ? POSITIVE_TTL_MS : NEGATIVE_TTL_MS;
+	if (cached && Date.now() - cached.at < ttl) return cached.value;
+	if (inFlight) return inFlight;
+	inFlight = probeCapabilities(exec, env, signal);
+	try {
+		const value = await inFlight;
+		cached = { at: Date.now(), value, positive: Boolean(value.bridge || value.codex || value.responses || value.oracle) };
+		return value;
+	} finally {
+		inFlight = undefined;
+	}
+}
 
+async function probeCapabilities(exec: Exec, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<Capabilities> {
 	const value: Capabilities = {};
 	const bridgeLauncher = resolveBridgeLauncher(env);
 	const oracleLauncher = resolveOracleLauncher(env);
-
-	const [probe, version] = await Promise.all([
+	const codexPath = findOnPath("codex", env);
+	const [bridgeProbe, oracleVersion, codexVersion] = await Promise.all([
 		bridgeLauncher ? probeBridge(exec, bridgeLauncher, signal).catch((): BridgeProbe => ({ ready: false, reason: "probe failed" })) : undefined,
 		oracleLauncher ? probeOracle(exec, oracleLauncher, signal).catch(() => undefined) : undefined,
+		codexPath
+			? runLauncher(exec, { command: codexPath, args: [], origin: "codex on PATH" }, ["--version"], { signal, timeout: 10_000 })
+				.then((result) => result.code === 0 ? result.stdout.trim() : undefined)
+				.catch(() => undefined)
+			: undefined,
 	]);
-
-	if (bridgeLauncher && probe) {
-		if (probe.ready) value.bridge = { launcher: bridgeLauncher, probe };
-		else value.bridgeOffline = { launcher: bridgeLauncher, probe };
+	if (bridgeLauncher && bridgeProbe) {
+		if (bridgeProbe.ready) value.bridge = { launcher: bridgeLauncher, probe: bridgeProbe };
+		else value.bridgeOffline = { launcher: bridgeLauncher, probe: bridgeProbe };
 	}
-	if (oracleLauncher && version) value.oracle = { launcher: oracleLauncher, version };
-
-	cached = { at: Date.now(), value };
+	if (codexVersion) value.codex = { version: codexVersion, origin: "codex on PATH" };
+	if (env.OPENAI_API_KEY) value.responses = { available: true };
+	if (oracleLauncher && oracleVersion) value.oracle = { launcher: oracleLauncher, version: oracleVersion };
 	return value;
-}
-
-function once(kind: RouteKind, notice: string): string | undefined {
-	if (noticed.has(kind)) return undefined;
-	noticed.add(kind);
-	return notice;
 }
 
 export class NoTransportError extends Error {
@@ -68,93 +86,80 @@ export class NoTransportError extends Error {
 	}
 }
 
+export interface RouteOptions {
+	transport?: TransportChoice;
+	apiConfirmed?: boolean;
+	allowFocusSteal?: boolean;
+}
+
 /**
- * Picks the least disruptive transport that can serve the request.
+ * Chooses a transport without surprising the user.
  *
- * Chrome Bridge wins whenever it is live: it reuses the browser the user is
- * already signed into and never takes focus. Oracle's browser mode is correct
- * but drives its own Chrome, and the API path bills the user, so both are
- * announced the first time they are chosen.
+ * A temporarily leased or sleeping Chrome Bridge is not permission to launch a
+ * foreground browser. Oracle browser mode is reachable only by explicitly
+ * naming it and acknowledging focus stealing.
  */
-export function selectRoute(
-	capabilities: Capabilities,
-	options: { engine?: "browser" | "api"; apiConfirmed?: boolean } = {},
-): Route {
-	if (options.engine === "api") {
-		if (!capabilities.oracle) throw new NoTransportError(missingOracleMessage(capabilities));
-		if (!options.apiConfirmed) {
-			throw new NoTransportError("Paid API mode bills your OpenAI key. Re-run with api_confirmed=true to authorise it.");
+export function selectRoute(capabilities: Capabilities, options: RouteOptions = {}): Route {
+	const requested = options.transport;
+	if (requested === "chrome_bridge") {
+		if (capabilities.bridge) return { kind: "chrome_bridge", launcher: capabilities.bridge.launcher };
+		throw new NoTransportError(bridgeUnavailable(capabilities));
+	}
+	if (requested === "codex") {
+		if (!capabilities.codex) throw new NoTransportError("Codex transport requested, but `codex --version` did not succeed.");
+		return { kind: "codex" };
+	}
+	if (requested === "responses") {
+		if (!options.apiConfirmed) throw new NoTransportError("Responses API is paid. Re-run with api_confirmed=true.");
+		if (!capabilities.responses) throw new NoTransportError("Responses API requested, but OPENAI_API_KEY is not available to this process.");
+		return { kind: "responses" };
+	}
+	if (requested === "oracle_browser") {
+		if (!options.allowFocusSteal) {
+			throw new NoTransportError("Oracle browser mode can foreground its own Chrome. Re-run with allow_focus_steal=true to choose it explicitly.");
 		}
-		return { kind: "oracle-api", launcher: capabilities.oracle.launcher };
+		if (!capabilities.oracle) throw new NoTransportError("Oracle browser mode requested, but the Oracle CLI is unavailable.");
+		return { kind: "oracle_browser", launcher: capabilities.oracle.launcher };
+	}
+	if (requested === "oracle_api") {
+		if (!options.apiConfirmed) throw new NoTransportError("Oracle API mode is paid. Re-run with api_confirmed=true.");
+		if (!capabilities.oracle) throw new NoTransportError("Oracle API mode requested, but the Oracle CLI is unavailable.");
+		return { kind: "oracle_api", launcher: capabilities.oracle.launcher };
 	}
 
-	if (capabilities.bridge) return { kind: "chrome-bridge", launcher: capabilities.bridge.launcher };
-
-	if (capabilities.oracle) {
-		return {
-			kind: "oracle-browser",
-			launcher: capabilities.oracle.launcher,
-			notice: once(
-				"oracle-browser",
-				`Running through Oracle's own Chrome, which can take window focus. Chrome Bridge would run this in a background tab of the Chrome you are already signed into: ${BRIDGE_REPO}`,
-			),
-		};
-	}
-
+	if (capabilities.bridge) return { kind: "chrome_bridge", launcher: capabilities.bridge.launcher };
+	if (capabilities.bridgeOffline) throw new NoTransportError(bridgeUnavailable(capabilities));
+	if (capabilities.codex) return { kind: "codex" };
 	throw new NoTransportError(setupGuidance(capabilities));
 }
 
-function missingOracleMessage(capabilities: Capabilities): string {
-	return capabilities.bridge
-		? "Paid API mode needs the Oracle CLI (`npm i -g @steipete/oracle`). Chrome Bridge is available, so omit engine=api to use your signed-in ChatGPT session instead."
-		: setupGuidance(capabilities);
+function bridgeUnavailable(capabilities: Capabilities): string {
+	const reason = capabilities.bridgeOffline?.probe.reason ?? "Chrome Bridge is not installed";
+	return `Chrome Bridge is unavailable: ${reason}. No foreground browser was launched. Retry, or explicitly choose transport=codex.`;
 }
 
-/** The single place that teaches an unconfigured user what to install. */
 export function setupGuidance(capabilities: Capabilities): string {
-	const lines = ["No ChatGPT transport is available.", ""];
-
-	if (capabilities.bridgeOffline) {
-		const reason = capabilities.bridgeOffline.probe.reason ?? "the bridge did not answer";
-		lines.push(
-			`Chrome Bridge is installed at ${capabilities.bridgeOffline.launcher.origin} but is not responding: ${reason}`,
-			"Open Chrome, confirm the bridge extension is enabled, then retry.",
-			"",
-		);
-	} else {
-		lines.push(
-			"Recommended: Chrome Bridge drives the Chrome you are already signed into, in a background tab, with no remote-debugging flag and no focus stealing.",
-			`  ${BRIDGE_REPO}`,
-			"  git clone, run ./setup.sh, load the unpacked extension, then verify with `chrome-bridge ready`.",
-			"",
-		);
-	}
-
-	if (!capabilities.oracle) {
-		lines.push(
-			"Alternative: the Oracle CLI runs ChatGPT in its own browser, or against a paid API key.",
-			"  npm i -g @steipete/oracle",
-			"",
-		);
-	}
-
-	lines.push(
-		"Point this extension at a non-standard install with CHATGPT_CONTROL_BRIDGE, CHROME_BRIDGE_HOME, or CHATGPT_CONTROL_ORACLE.",
-	);
+	const lines = ["No GPT-Control transport is available.", ""];
+	lines.push("Preferred browser path: Chrome Bridge opens an inactive tab without taking focus.", `  ${BRIDGE_REPO}`);
+	if (!capabilities.codex) lines.push("Official local path: install and authenticate the Codex CLI (`npm i -g @openai/codex`).");
+	lines.push("Paid API path: set OPENAI_API_KEY and pass transport=responses plus api_confirmed=true.");
+	lines.push("Oracle browser mode is never selected automatically because it can take focus.");
 	return lines.join("\n");
 }
 
 export function describeCapabilities(capabilities: Capabilities): Record<string, unknown> {
 	return {
-		preferred: capabilities.bridge ? "chrome-bridge" : capabilities.oracle ? "oracle-browser" : "none",
+		preferred: capabilities.bridge ? "chrome_bridge" : capabilities.bridgeOffline ? "chrome_bridge_unavailable" : capabilities.codex ? "codex" : "none",
 		chromeBridge: capabilities.bridge
 			? { available: true, origin: capabilities.bridge.launcher.origin, endpoint: capabilities.bridge.probe.endpoint }
 			: capabilities.bridgeOffline
-				? { available: false, origin: capabilities.bridgeOffline.launcher.origin, reason: capabilities.bridgeOffline.probe.reason }
-				: { available: false, reason: "no Chrome Bridge client found", install: BRIDGE_REPO },
+				? { available: false, installed: true, origin: capabilities.bridgeOffline.launcher.origin, reason: capabilities.bridgeOffline.probe.reason }
+				: { available: false, installed: false, install: BRIDGE_REPO },
+		codex: capabilities.codex ?? { available: false, install: "npm i -g @openai/codex" },
+		responses: capabilities.responses ?? { available: false, reason: "OPENAI_API_KEY unavailable" },
 		oracle: capabilities.oracle
-			? { available: true, origin: capabilities.oracle.launcher.origin, version: capabilities.oracle.version }
-			: { available: false, install: "npm i -g @steipete/oracle" },
-		images: capabilities.bridge ? "supported" : "requires Chrome Bridge",
+			? { available: true, explicitOnly: true, version: capabilities.oracle.version }
+			: { available: false, explicitOnly: true },
+		focusSafety: "Oracle browser mode requires allow_focus_steal=true and is never a fallback.",
 	};
 }
