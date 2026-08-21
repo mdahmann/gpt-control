@@ -35033,13 +35033,13 @@ function describeCapabilities(capabilities) {
 import { createHash as createHash4, randomUUID as randomUUID4 } from "node:crypto";
 import { constants as constants3 } from "node:fs";
 import { chmod as chmod4, lstat as lstat2, mkdtemp as mkdtemp2, open as open3, readFile as readFile3, realpath, rm as rm4, stat } from "node:fs/promises";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join4, parse as parse8, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
+import { basename as basename3, dirname as dirname3, isAbsolute as isAbsolute2, join as join4, parse as parse8, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
 
 // src/store.ts
 import { constants as constants2 } from "node:fs";
 import { hostname as hostname3, homedir as homedir2 } from "node:os";
 import { chmod as chmod3, lstat, mkdir as mkdir2, open as open2, readFile as readFile2, readdir, rename, rm as rm3, unlink, writeFile as writeFile2 } from "node:fs/promises";
-import { dirname as dirname2, join as join3, parse as parse7, relative, resolve as resolve3, sep } from "node:path";
+import { basename as basename2, dirname as dirname2, join as join3, parse as parse7, relative, resolve as resolve3, sep } from "node:path";
 import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
 var ProviderSchema = exports_external.literal("browser");
 var RunStatusSchema = exports_external.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
@@ -35234,6 +35234,7 @@ async function secureDirectory(path) {
 
 class RunStore {
   root;
+  legacyStateChecked = false;
   constructor(root = storageRoot()) {
     this.root = resolve3(root);
   }
@@ -35255,6 +35256,10 @@ class RunStore {
     return confinedPath(this.root, "idempotency", `${keyHash}.json`);
   }
   async init() {
+    if (!this.legacyStateChecked) {
+      await assertNoLegacySchemaV2State(this.root);
+      this.legacyStateChecked = true;
+    }
     await secureDirectory(this.root);
     await Promise.all([
       secureDirectory(confinedPath(this.root, "conversations")),
@@ -35272,6 +35277,24 @@ class RunStore {
     await this.init();
     ConversationSchema.parse(record3);
     await this.withNamedLock(`record-${record3.id}`, () => atomicWrite(this.conversationPath(record3.id), record3), { timeoutMs: 1e4 });
+  }
+  async deleteConversationIfUnreferenced(id) {
+    assertConversationId(id);
+    await this.init();
+    await this.withNamedLock(`record-${id}`, async () => {
+      const names = (await readdir(confinedPath(this.root, "runs"))).filter((name) => /^run_[a-f0-9]{32}\.json$/.test(name));
+      for (const name of names) {
+        const run = RunSchema.parse(JSON.parse(await safeRead(confinedPath(this.root, "runs", name))));
+        if (run.conversationId === id)
+          throw new Error(`Conversation ${id} is still referenced by run ${run.id}.`);
+      }
+      try {
+        await unlink(this.conversationPath(id));
+      } catch (error51) {
+        if (!isMissing(error51))
+          throw error51;
+      }
+    }, { timeoutMs: 1e4 });
   }
   async updateConversation(id, update) {
     assertConversationId(id);
@@ -35675,6 +35698,44 @@ function idempotencyKeyHash(key) {
     throw new Error("Invalid idempotency key. Use 1-128 ASCII letters, digits, dot, underscore, colon, or hyphen.");
   return createHash3("sha256").update(key).digest("hex");
 }
+async function assertNoLegacySchemaV2State(root) {
+  const candidates = [root];
+  if (basename2(root) === "v3")
+    candidates.push(dirname2(root));
+  for (const candidate of [...new Set(candidates)]) {
+    for (const directory of ["runs", "conversations"]) {
+      const path = confinedPath(candidate, directory);
+      let names;
+      try {
+        const info = await lstat(path);
+        if (info.isSymbolicLink() || !info.isDirectory()) {
+          throw new Error(`Refused unsafe legacy-state path: ${path}`);
+        }
+        names = await readdir(path);
+      } catch (error51) {
+        if (isMissing(error51))
+          continue;
+        throw error51;
+      }
+      for (const name of names.filter((value) => value.endsWith(".json"))) {
+        const recordPath = confinedPath(path, name);
+        const info = await lstat(recordPath);
+        if (info.isSymbolicLink() || !info.isFile())
+          throw new Error(`Refused unsafe legacy-state record: ${recordPath}`);
+        let version2;
+        try {
+          version2 = JSON.parse(await readFile2(recordPath, "utf8")).version;
+        } catch {
+          version2 = undefined;
+        }
+        const legacy = candidate !== root || version2 !== STORAGE_VERSION;
+        if (legacy) {
+          throw new Error(`Legacy or unknown GPT-Control durable state was detected at ${candidate}. ` + "Startup is blocked because an older browser turn may still be active. Follow docs/UPGRADE_V2.md before using schema v3.");
+        }
+      }
+    }
+  }
+}
 function isAlreadyExists(error51) {
   return error51 instanceof Error && "code" in error51 && error51.code === "EEXIST";
 }
@@ -35763,7 +35824,7 @@ async function buildAttachmentManifest(paths, options = {}) {
         if (totalBytes > maxBytes) {
           throw new Error(`Attachment byte limit exceeded: requested ${totalBytes}, maximum ${maxBytes}.`);
         }
-        const relativePath = outside ? `external/${String(index + 1).padStart(2, "0")}-${safeName(basename2(beforePath))}` : normalizeRelative(workspaceRelative || basename2(beforePath));
+        const relativePath = outside ? `external/${String(index + 1).padStart(2, "0")}-${safeName(basename3(beforePath))}` : normalizeRelative(workspaceRelative || basename3(beforePath));
         if (usedNames.has(relativePath))
           throw new Error(`Duplicate attachment snapshot name: ${relativePath}`);
         usedNames.add(relativePath);
@@ -35798,7 +35859,7 @@ async function buildAttachmentManifest(paths, options = {}) {
       totalBytes,
       sha256: manifestHash.digest("hex"),
       snapshotRoot,
-      snapshotId: `${basename2(snapshotRoot)}-${randomUUID4().slice(0, 8)}`
+      snapshotId: `${basename3(snapshotRoot)}-${randomUUID4().slice(0, 8)}`
     };
   } catch (error51) {
     await rm4(snapshotRoot, { recursive: true, force: true });
@@ -36274,23 +36335,31 @@ class GptControlService {
     return abandoned;
   }
   async closeConversation(conversationId) {
-    const active = (await this.store.listRuns({ limit: null })).find((run) => {
-      if (run.conversationId !== conversationId)
-        return false;
-      const legacyUnresolved = run.providerTurnPending === undefined && (run.status === "cancelled" || run.status === "needs_user") && (run.submissionState === "submitting" || run.submissionState === "submitted");
-      return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+    return this.store.withConversationLock(conversationId, async () => {
+      const active = (await this.store.listRuns({ limit: null })).find((run) => {
+        if (run.conversationId !== conversationId)
+          return false;
+        const legacyUnresolved = run.providerTurnPending === undefined && (run.status === "cancelled" || run.status === "needs_user") && (run.submissionState === "submitting" || run.submissionState === "submitted");
+        return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+      });
+      if (active)
+        throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
+      const conversation = await this.store.getConversation(conversationId);
+      if (conversation.closedAt)
+        return conversation;
+      if (conversation.provider !== "browser")
+        throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+      if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+        return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+      }
+      if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+        throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+      }
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      await assertExactDriverSession(driver, expected);
+      await driver.close(expected.sessionId);
+      return this.store.updateConversation(conversationId, { closedAt: nowIso() });
     });
-    if (active)
-      throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-    const conversation = await this.store.getConversation(conversationId);
-    if (conversation.closedAt)
-      return conversation;
-    if (conversation.provider !== "browser")
-      throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-    const { driver, expected } = await this.resolveOwnedDriver(conversation);
-    await assertExactDriverSession(driver, expected);
-    await driver.close(expected.sessionId);
-    return this.store.updateConversation(conversationId, { closedAt: nowIso() });
   }
   async diagnose() {
     return { ...passiveTransportDiscovery(), policy: publicPolicy(this.policy) };
@@ -36404,11 +36473,20 @@ class GptControlService {
       maxFiles: this.policy.maxAttachmentFiles,
       maxBytes: this.policy.maxAttachmentBytes
     });
+    let createdConversationId;
     try {
+      const preparedPrompt = this.prepareRunPrompt(request, manifest);
       const conversation = request.conversationId ? await this.resumeConversation(request.conversationId, request.transport) : await this.createConversation(request, manifest);
-      const run = await this.createRun(request, conversation, manifest, idempotencyHash, idempotencyRequestHash, executionReady);
+      if (!request.conversationId)
+        createdConversationId = conversation.id;
+      const run = await this.createRun(request, conversation, manifest, preparedPrompt, idempotencyHash, idempotencyRequestHash, executionReady);
       return { conversation, run };
     } catch (error51) {
+      if (createdConversationId) {
+        await this.store.deleteConversationIfUnreferenced(createdConversationId).catch(() => {
+          return;
+        });
+      }
       if (manifest.snapshotRoot)
         await rm5(manifest.snapshotRoot, { recursive: true, force: true }).catch(() => {
           return;
@@ -36423,21 +36501,12 @@ class GptControlService {
     const timestamp = nowIso();
     const id = opaqueId("conv");
     const name = `gpt-control:${request.kind}:${id}`;
-    const session = await route.driver.create(name, CHATGPT_ORIGIN);
-    if (session.name !== name) {
-      await route.driver.close(session.sessionId).catch(() => {
-        return;
-      });
-      throw new Error("Browser driver returned a session with the wrong ownership name.");
-    }
     const conversation = {
       version: STORAGE_VERSION,
       id,
       provider: "browser",
       browserDriverId: route.driver.id,
-      browserSessionId: session.sessionId,
       browserSessionName: name,
-      browserPageId: session.pageId,
       workspaceRoot: manifest.workspaceRoot,
       policyFingerprint: this.policy.fingerprint,
       createdAt: timestamp,
@@ -36465,19 +36534,10 @@ class GptControlService {
     await this.resolveOwnedDriver(conversation);
     return conversation;
   }
-  async createRun(request, conversation, manifest, idempotencyHash, idempotencyRequestHash, executionReady = true) {
+  async createRun(request, conversation, manifest, preparedPrompt, idempotencyHash, idempotencyRequestHash, executionReady = true) {
     const timestamp = nowIso();
     const id = opaqueId("run");
-    const promptBody = request.kind === "consult" ? buildReviewPrompt(request.prompt, manifest) : request.kind === "subagent" ? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent) : request.prompt;
-    const promptProofToken = opaqueId("proof");
-    const prompt = `${promptBody}
-
-[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
-    if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
-      throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
-    }
-    const promptSha256 = sha256(prompt);
-    const promptObservationSha256 = sha256(canonicalPromptObservationText(prompt));
+    const { prompt, promptProofToken, promptSha256, promptObservationSha256 } = preparedPrompt;
     const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
     const receipt = {
       provider: conversation.provider,
@@ -36535,6 +36595,22 @@ class GptControlService {
       throw error51;
     }
     return run;
+  }
+  prepareRunPrompt(request, manifest) {
+    const promptBody = request.kind === "consult" ? buildReviewPrompt(request.prompt, manifest) : request.kind === "subagent" ? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent) : request.prompt;
+    const promptProofToken = opaqueId("proof");
+    const prompt = `${promptBody}
+
+[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
+    if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
+      throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
+    }
+    return {
+      prompt,
+      promptProofToken,
+      promptSha256: sha256(prompt),
+      promptObservationSha256: sha256(canonicalPromptObservationText(prompt))
+    };
   }
   scheduleRun(runId, recovery) {
     const existing = this.activeRuns.get(runId);
@@ -36635,6 +36711,7 @@ class GptControlService {
         return current;
       if (this.cancellationIntents.has(run.id))
         return this.persistCancellation(run.id);
+      run = current;
       const completedAt = nowIso();
       const report = run.kind === "consult" ? parseReviewReport(result.text, run.attachmentManifest) : undefined;
       const resultSha256 = sha256(`${result.text}\x00${(result.imageUrls ?? []).join(`
@@ -36693,6 +36770,11 @@ class GptControlService {
         if (cancelled.providerTurnPending && cancelled.providerStopRequested) {
           this.scheduleProviderStopReconciliation(run.id);
         }
+        if (cancelled.submissionState === "not_submitted") {
+          await this.closeUnsubmittedOwnedConversation(cancelled.conversationId).catch(() => {
+            return;
+          });
+        }
         return cancelled;
       }
       const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
@@ -36706,6 +36788,10 @@ class GptControlService {
       if (terminal.providerTurnPending && terminal.providerStopRequested) {
         this.scheduleProviderStopReconciliation(run.id);
       }
+      if (!ambiguous)
+        await this.closeUnsubmittedOwnedConversation(terminal.conversationId).catch(() => {
+          return;
+        });
       return terminal;
     } finally {
       const final = await this.store.getRun(run.id).catch(() => {
@@ -36721,8 +36807,8 @@ class GptControlService {
     if (conversation.provider !== "browser") {
       throw new Error(`Provider ${conversation.provider} is disabled by the hardened 0.3 broker.`);
     }
-    const { driver, expected } = await this.resolveOwnedDriver(conversation);
-    return this.runBrowserTurn(driver, expected, conversation, run, request, signal, recovery);
+    const owned = await this.ensureOwnedDriver(conversation, run, signal);
+    return this.runBrowserTurn(owned.driver, owned.expected, owned.conversation, owned.run, request, signal, recovery);
   }
   async runBrowserTurn(driver, expected, conversation, originalRun, request, signal, recovery) {
     let run = originalRun;
@@ -36937,6 +37023,125 @@ class GptControlService {
       lastObservedUrl: outcome.lastObservedUrl,
       lastObservedUiState: outcome.lastObservedUiState
     };
+  }
+  async ensureOwnedDriver(conversation, run, signal) {
+    if (conversation.closedAt)
+      throw new Error(`Conversation ${conversation.id} is closed; browser allocation refused.`);
+    const hasSessionId = Boolean(conversation.browserSessionId);
+    const hasPageId = conversation.browserPageId !== undefined;
+    if (hasSessionId !== hasPageId)
+      throw new Error("Conversation has incomplete browser ownership state.");
+    if (hasSessionId) {
+      const owned = await this.resolveOwnedDriver(conversation);
+      if (run.receipt.browserDriverId && run.receipt.browserDriverId !== owned.driver.id) {
+        throw new Error("Run receipt browser-driver identity conflicts with its durable conversation.");
+      }
+      if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+        throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
+      }
+      if (run.receipt.browserDriverId !== owned.driver.id || run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+        run = await this.store.updateRun(run.id, {
+          receipt: {
+            ...run.receipt,
+            browserDriverId: owned.driver.id,
+            localBrowserSessionId: owned.expected.sessionId
+          }
+        });
+      }
+      if (TERMINAL2.has(run.status)) {
+        const unresolvedProviderTurn = run.providerTurnPending === true || run.submissionState === "submitting" || run.submissionState === "submitted";
+        if (unresolvedProviderTurn) {
+          throw new Error("Terminal run retains an unresolved provider turn; browser ownership was preserved for Stop reconciliation.");
+        }
+        await assertExactDriverSession(owned.driver, owned.expected);
+        await owned.driver.close(owned.expected.sessionId);
+        await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+        throw new Error("Run became terminal while browser-session ownership was being recovered.");
+      }
+      return { conversation, run, ...owned };
+    }
+    if (conversation.providerConversationUrl) {
+      throw new Error("A provider conversation URL exists without a durable owned browser session; recovery refused.");
+    }
+    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+    const available = capabilities.browser;
+    if (!available)
+      throw new Error("The configured secure browser driver is unavailable. No fallback was launched.");
+    const driverId = required2(conversation.browserDriverId, "browser driver id");
+    if (available.driver.id !== driverId) {
+      throw new Error(`Prepared conversation belongs to browser driver ${driverId}, but the live driver is ${available.driver.id}.`);
+    }
+    const name = required2(conversation.browserSessionName, "browser session name");
+    const session = await available.driver.create(name, CHATGPT_ORIGIN, signal);
+    const expected = {
+      sessionId: session.sessionId,
+      pageId: session.pageId,
+      name
+    };
+    let persisted = false;
+    try {
+      if (session.name !== name)
+        throw new Error("Browser driver returned a session with the wrong ownership name.");
+      await assertExactDriverSession(available.driver, expected, signal);
+      conversation = await this.store.updateConversation(conversation.id, {
+        browserSessionId: session.sessionId,
+        browserPageId: session.pageId
+      });
+      persisted = true;
+      run = await this.store.updateRun(run.id, {
+        receipt: {
+          ...run.receipt,
+          browserDriverId: available.driver.id,
+          localBrowserSessionId: session.sessionId
+        }
+      });
+      if (TERMINAL2.has(run.status)) {
+        await assertExactDriverSession(available.driver, expected);
+        await available.driver.close(session.sessionId);
+        await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+        throw new Error("Run became terminal while its owned browser session was being allocated.");
+      }
+      return { conversation, run, driver: available.driver, expected };
+    } catch (error51) {
+      if (!persisted) {
+        try {
+          if (session.name !== name)
+            throw new Error("Created browser session did not retain its broker ownership name.");
+          await assertExactDriverSession(available.driver, expected);
+          await available.driver.close(session.sessionId);
+        } catch (cleanupError) {
+          conversation = await this.store.updateConversation(conversation.id, {
+            browserSessionId: session.sessionId,
+            browserPageId: session.pageId
+          });
+          await this.store.updateRun(run.id, {
+            receipt: {
+              ...run.receipt,
+              browserDriverId: available.driver.id,
+              localBrowserSessionId: session.sessionId
+            }
+          });
+          throw new Error(`${errorMessage2(error51)} Browser cleanup was not proved; durable ownership was retained: ${errorMessage2(cleanupError)}`);
+        }
+      }
+      throw error51;
+    }
+  }
+  async closeUnsubmittedOwnedConversation(conversationId) {
+    const conversation = await this.store.getConversation(conversationId);
+    if (conversation.closedAt || conversation.providerConversationUrl)
+      return;
+    if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+      await this.store.updateConversation(conversationId, { closedAt: nowIso() });
+      return;
+    }
+    if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+      throw new Error("Cannot close a conversation with incomplete browser ownership state.");
+    }
+    const { driver, expected } = await this.resolveOwnedDriver(conversation);
+    await assertExactDriverSession(driver, expected);
+    await driver.close(expected.sessionId);
+    await this.store.updateConversation(conversationId, { closedAt: nowIso() });
   }
   async resolveOwnedDriver(conversation) {
     const capabilities = await this.dependencies.resolveCapabilities(this.exec);

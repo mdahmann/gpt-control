@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, parse, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -245,6 +245,7 @@ export async function secureDirectory(path: string): Promise<string> {
 
 export class RunStore {
 	readonly root: string;
+	private legacyStateChecked = false;
 
 	constructor(root = storageRoot()) {
 		this.root = resolve(root);
@@ -271,6 +272,10 @@ export class RunStore {
 	}
 
 	async init(): Promise<void> {
+		if (!this.legacyStateChecked) {
+			await assertNoLegacySchemaV2State(this.root);
+			this.legacyStateChecked = true;
+		}
 		await secureDirectory(this.root);
 		await Promise.all([
 			secureDirectory(confinedPath(this.root, "conversations")),
@@ -290,6 +295,20 @@ export class RunStore {
 		await this.init();
 		ConversationSchema.parse(record);
 		await this.withNamedLock(`record-${record.id}`, () => atomicWrite(this.conversationPath(record.id), record), { timeoutMs: 10_000 });
+	}
+
+	async deleteConversationIfUnreferenced(id: string): Promise<void> {
+		assertConversationId(id);
+		await this.init();
+		await this.withNamedLock(`record-${id}`, async () => {
+			const names = (await readdir(confinedPath(this.root, "runs")))
+				.filter((name) => /^run_[a-f0-9]{32}\.json$/.test(name));
+			for (const name of names) {
+				const run = RunSchema.parse(JSON.parse(await safeRead(confinedPath(this.root, "runs", name)))) as RunRecord;
+				if (run.conversationId === id) throw new Error(`Conversation ${id} is still referenced by run ${run.id}.`);
+			}
+			try { await unlink(this.conversationPath(id)); } catch (error) { if (!isMissing(error)) throw error; }
+		}, { timeoutMs: 10_000 });
 	}
 
 	async updateConversation(id: string, update: Partial<ConversationRecord>): Promise<ConversationRecord> {
@@ -698,6 +717,45 @@ function assertHash(value: string, label: string): void {
 export function idempotencyKeyHash(key: string): string {
 	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key)) throw new Error("Invalid idempotency key. Use 1-128 ASCII letters, digits, dot, underscore, colon, or hyphen.");
 	return createHash("sha256").update(key).digest("hex");
+}
+
+async function assertNoLegacySchemaV2State(root: string): Promise<void> {
+	const candidates = [root];
+	if (basename(root) === "v3") candidates.push(dirname(root));
+	for (const candidate of [...new Set(candidates)]) {
+		for (const directory of ["runs", "conversations"]) {
+			const path = confinedPath(candidate, directory);
+			let names: string[];
+			try {
+				const info = await lstat(path);
+				if (info.isSymbolicLink() || !info.isDirectory()) {
+					throw new Error(`Refused unsafe legacy-state path: ${path}`);
+				}
+				names = await readdir(path);
+			} catch (error) {
+				if (isMissing(error)) continue;
+				throw error;
+			}
+			for (const name of names.filter((value) => value.endsWith(".json"))) {
+				const recordPath = confinedPath(path, name);
+				const info = await lstat(recordPath);
+				if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Refused unsafe legacy-state record: ${recordPath}`);
+				let version: unknown;
+				try {
+					version = (JSON.parse(await readFile(recordPath, "utf8")) as { version?: unknown }).version;
+				} catch {
+					version = undefined;
+				}
+				const legacy = candidate !== root || version !== STORAGE_VERSION;
+				if (legacy) {
+					throw new Error(
+						`Legacy or unknown GPT-Control durable state was detected at ${candidate}. `
+						+ "Startup is blocked because an older browser turn may still be active. Follow docs/UPGRADE_V2.md before using schema v3.",
+					);
+				}
+			}
+		}
+	}
 }
 
 function isAlreadyExists(error: unknown): boolean {

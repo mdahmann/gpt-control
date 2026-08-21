@@ -345,21 +345,29 @@ export class GptControlService {
 	}
 
 	async closeConversation(conversationId: string): Promise<ConversationRecord> {
-		const active = (await this.store.listRuns({ limit: null })).find((run) => {
-			if (run.conversationId !== conversationId) return false;
-			const legacyUnresolved = run.providerTurnPending === undefined
-				&& (run.status === "cancelled" || run.status === "needs_user")
-				&& (run.submissionState === "submitting" || run.submissionState === "submitted");
-			return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+		return this.store.withConversationLock(conversationId, async () => {
+			const active = (await this.store.listRuns({ limit: null })).find((run) => {
+				if (run.conversationId !== conversationId) return false;
+				const legacyUnresolved = run.providerTurnPending === undefined
+					&& (run.status === "cancelled" || run.status === "needs_user")
+					&& (run.submissionState === "submitting" || run.submissionState === "submitted");
+				return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+			});
+			if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
+			const conversation = await this.store.getConversation(conversationId);
+			if (conversation.closedAt) return conversation;
+			if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+			if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+			}
+			if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+				throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+			}
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			await assertExactDriverSession(driver, expected);
+			await driver.close(expected.sessionId);
+			return this.store.updateConversation(conversationId, { closedAt: nowIso() });
 		});
-		if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-		const conversation = await this.store.getConversation(conversationId);
-		if (conversation.closedAt) return conversation;
-		if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-		const { driver, expected } = await this.resolveOwnedDriver(conversation);
-		await assertExactDriverSession(driver, expected);
-		await driver.close(expected.sessionId);
-		return this.store.updateConversation(conversationId, { closedAt: nowIso() });
 	}
 
 	/** Passive only: no discovered driver or provider executable runs. */
@@ -483,13 +491,22 @@ export class GptControlService {
 			maxFiles: this.policy.maxAttachmentFiles,
 			maxBytes: this.policy.maxAttachmentBytes,
 		});
+		let createdConversationId: string | undefined;
 		try {
+			const preparedPrompt = this.prepareRunPrompt(request, manifest);
 			const conversation = request.conversationId
 				? await this.resumeConversation(request.conversationId, request.transport)
 				: await this.createConversation(request, manifest);
-			const run = await this.createRun(request, conversation, manifest, idempotencyHash, idempotencyRequestHash, executionReady);
+			if (!request.conversationId) createdConversationId = conversation.id;
+			const run = await this.createRun(
+				request, conversation, manifest, preparedPrompt,
+				idempotencyHash, idempotencyRequestHash, executionReady,
+			);
 			return { conversation, run };
 		} catch (error) {
+			if (createdConversationId) {
+				await this.store.deleteConversationIfUnreferenced(createdConversationId).catch(() => undefined);
+			}
 			if (manifest.snapshotRoot) await rm(manifest.snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
 			throw error;
 		}
@@ -502,19 +519,12 @@ export class GptControlService {
 		const timestamp = nowIso();
 		const id = opaqueId("conv");
 		const name = `gpt-control:${request.kind}:${id}`;
-		const session = await route.driver.create(name, CHATGPT_ORIGIN);
-		if (session.name !== name) {
-			await route.driver.close(session.sessionId).catch(() => undefined);
-			throw new Error("Browser driver returned a session with the wrong ownership name.");
-		}
 		const conversation: ConversationRecord = {
 			version: STORAGE_VERSION,
 			id,
 			provider: "browser",
 			browserDriverId: route.driver.id,
-			browserSessionId: session.sessionId,
 			browserSessionName: name,
-			browserPageId: session.pageId,
 			workspaceRoot: manifest.workspaceRoot,
 			policyFingerprint: this.policy.fingerprint,
 			createdAt: timestamp,
@@ -546,24 +556,14 @@ export class GptControlService {
 		request: NormalizedStartRequest,
 		conversation: ConversationRecord,
 		manifest: AttachmentManifest,
+		preparedPrompt: PreparedRunPrompt,
 		idempotencyHash?: string,
 		idempotencyRequestHash?: string,
 		executionReady = true,
 	): Promise<RunRecord> {
 		const timestamp = nowIso();
 		const id = opaqueId("run");
-		const promptBody = request.kind === "consult"
-			? buildReviewPrompt(request.prompt, manifest)
-			: request.kind === "subagent"
-				? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent)
-				: request.prompt;
-		const promptProofToken = opaqueId("proof");
-		const prompt = `${promptBody}\n\n[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
-		if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
-			throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
-		}
-		const promptSha256 = sha256(prompt);
-		const promptObservationSha256 = sha256(canonicalPromptObservationText(prompt));
+		const { prompt, promptProofToken, promptSha256, promptObservationSha256 } = preparedPrompt;
 		const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
 		const receipt: ReviewReceipt = {
 			provider: conversation.provider,
@@ -619,6 +619,25 @@ export class GptControlService {
 			throw error;
 		}
 		return run;
+	}
+
+	private prepareRunPrompt(request: NormalizedStartRequest, manifest: AttachmentManifest): PreparedRunPrompt {
+		const promptBody = request.kind === "consult"
+			? buildReviewPrompt(request.prompt, manifest)
+			: request.kind === "subagent"
+				? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent)
+				: request.prompt;
+		const promptProofToken = opaqueId("proof");
+		const prompt = `${promptBody}\n\n[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
+		if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
+			throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
+		}
+		return {
+			prompt,
+			promptProofToken,
+			promptSha256: sha256(prompt),
+			promptObservationSha256: sha256(canonicalPromptObservationText(prompt)),
+		};
 	}
 
 	private scheduleRun(runId: string, recovery: boolean): Promise<RunRecord> {
@@ -718,6 +737,7 @@ export class GptControlService {
 			const current = await this.store.getRun(run.id);
 			if (TERMINAL.has(current.status)) return current;
 			if (this.cancellationIntents.has(run.id)) return this.persistCancellation(run.id);
+			run = current;
 			const completedAt = nowIso();
 			const report = run.kind === "consult" ? parseReviewReport(result.text, run.attachmentManifest) : undefined;
 			const resultSha256 = sha256(`${result.text}\u0000${(result.imageUrls ?? []).join("\n")}`);
@@ -771,6 +791,9 @@ export class GptControlService {
 				if (cancelled.providerTurnPending && cancelled.providerStopRequested) {
 					this.scheduleProviderStopReconciliation(run.id);
 				}
+				if (cancelled.submissionState === "not_submitted") {
+					await this.closeUnsubmittedOwnedConversation(cancelled.conversationId).catch(() => undefined);
+				}
 				return cancelled;
 			}
 			const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
@@ -786,6 +809,7 @@ export class GptControlService {
 			if (terminal.providerTurnPending && terminal.providerStopRequested) {
 				this.scheduleProviderStopReconciliation(run.id);
 			}
+			if (!ambiguous) await this.closeUnsubmittedOwnedConversation(terminal.conversationId).catch(() => undefined);
 			return terminal;
 		} finally {
 			const final = await this.store.getRun(run.id).catch(() => undefined);
@@ -803,8 +827,8 @@ export class GptControlService {
 		if (conversation.provider !== "browser") {
 			throw new Error(`Provider ${conversation.provider} is disabled by the hardened 0.3 broker.`);
 		}
-		const { driver, expected } = await this.resolveOwnedDriver(conversation);
-		return this.runBrowserTurn(driver, expected, conversation, run, request, signal, recovery);
+		const owned = await this.ensureOwnedDriver(conversation, run, signal);
+		return this.runBrowserTurn(owned.driver, owned.expected, owned.conversation, owned.run, request, signal, recovery);
 	}
 
 	private async runBrowserTurn(
@@ -1057,6 +1081,134 @@ export class GptControlService {
 		};
 	}
 
+	private async ensureOwnedDriver(
+		conversation: ConversationRecord,
+		run: RunRecord,
+		signal: AbortSignal,
+	): Promise<{
+		conversation: ConversationRecord;
+		run: RunRecord;
+		driver: WebChatDriver;
+		expected: ExpectedDriverSession;
+	}> {
+		if (conversation.closedAt) throw new Error(`Conversation ${conversation.id} is closed; browser allocation refused.`);
+		const hasSessionId = Boolean(conversation.browserSessionId);
+		const hasPageId = conversation.browserPageId !== undefined;
+		if (hasSessionId !== hasPageId) throw new Error("Conversation has incomplete browser ownership state.");
+		if (hasSessionId) {
+			const owned = await this.resolveOwnedDriver(conversation);
+			if (run.receipt.browserDriverId && run.receipt.browserDriverId !== owned.driver.id) {
+				throw new Error("Run receipt browser-driver identity conflicts with its durable conversation.");
+			}
+			if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+				throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
+			}
+			if (run.receipt.browserDriverId !== owned.driver.id
+				|| run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+				run = await this.store.updateRun(run.id, {
+					receipt: {
+						...run.receipt,
+						browserDriverId: owned.driver.id,
+						localBrowserSessionId: owned.expected.sessionId,
+					},
+				});
+			}
+			if (TERMINAL.has(run.status)) {
+				const unresolvedProviderTurn = run.providerTurnPending === true
+					|| run.submissionState === "submitting" || run.submissionState === "submitted";
+				if (unresolvedProviderTurn) {
+					throw new Error("Terminal run retains an unresolved provider turn; browser ownership was preserved for Stop reconciliation.");
+				}
+				await assertExactDriverSession(owned.driver, owned.expected);
+				await owned.driver.close(owned.expected.sessionId);
+				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+				throw new Error("Run became terminal while browser-session ownership was being recovered.");
+			}
+			return { conversation, run, ...owned };
+		}
+		if (conversation.providerConversationUrl) {
+			throw new Error("A provider conversation URL exists without a durable owned browser session; recovery refused.");
+		}
+		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+		const available = capabilities.browser;
+		if (!available) throw new Error("The configured secure browser driver is unavailable. No fallback was launched.");
+		const driverId = required(conversation.browserDriverId, "browser driver id");
+		if (available.driver.id !== driverId) {
+			throw new Error(`Prepared conversation belongs to browser driver ${driverId}, but the live driver is ${available.driver.id}.`);
+		}
+		const name = required(conversation.browserSessionName, "browser session name");
+		const session = await available.driver.create(name, CHATGPT_ORIGIN, signal);
+		const expected: ExpectedDriverSession = {
+			sessionId: session.sessionId,
+			pageId: session.pageId,
+			name,
+		};
+		let persisted = false;
+		try {
+			if (session.name !== name) throw new Error("Browser driver returned a session with the wrong ownership name.");
+			await assertExactDriverSession(available.driver, expected, signal);
+			conversation = await this.store.updateConversation(conversation.id, {
+				browserSessionId: session.sessionId,
+				browserPageId: session.pageId,
+			});
+			persisted = true;
+			run = await this.store.updateRun(run.id, {
+				receipt: {
+					...run.receipt,
+					browserDriverId: available.driver.id,
+					localBrowserSessionId: session.sessionId,
+				},
+			});
+			if (TERMINAL.has(run.status)) {
+				await assertExactDriverSession(available.driver, expected);
+				await available.driver.close(session.sessionId);
+				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+				throw new Error("Run became terminal while its owned browser session was being allocated.");
+			}
+			return { conversation, run, driver: available.driver, expected };
+		} catch (error) {
+			if (!persisted) {
+				try {
+					if (session.name !== name) throw new Error("Created browser session did not retain its broker ownership name.");
+					await assertExactDriverSession(available.driver, expected);
+					await available.driver.close(session.sessionId);
+				} catch (cleanupError) {
+					conversation = await this.store.updateConversation(conversation.id, {
+						browserSessionId: session.sessionId,
+						browserPageId: session.pageId,
+					});
+					await this.store.updateRun(run.id, {
+						receipt: {
+							...run.receipt,
+							browserDriverId: available.driver.id,
+							localBrowserSessionId: session.sessionId,
+						},
+					});
+					throw new Error(
+						`${errorMessage(error)} Browser cleanup was not proved; durable ownership was retained: ${errorMessage(cleanupError)}`,
+					);
+				}
+			}
+			throw error;
+		}
+	}
+
+	private async closeUnsubmittedOwnedConversation(conversationId: string): Promise<void> {
+		const conversation = await this.store.getConversation(conversationId);
+		if (conversation.closedAt || conversation.providerConversationUrl) return;
+		if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+			await this.store.updateConversation(conversationId, { closedAt: nowIso() });
+			return;
+		}
+		if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+			throw new Error("Cannot close a conversation with incomplete browser ownership state.");
+		}
+		const { driver, expected } = await this.resolveOwnedDriver(conversation);
+		await assertExactDriverSession(driver, expected);
+		await driver.close(expected.sessionId);
+		await this.store.updateConversation(conversationId, { closedAt: nowIso() });
+	}
+
 	private async resolveOwnedDriver(
 		conversation: ConversationRecord,
 	): Promise<{ driver: WebChatDriver; expected: ExpectedDriverSession }> {
@@ -1273,6 +1425,13 @@ interface NormalizedStartRequest {
 	connectorIntent?: { names: string[]; mode: "prefer" | "require" };
 	wait: boolean;
 	timeoutMs: number;
+}
+
+interface PreparedRunPrompt {
+	prompt: string;
+	promptProofToken: string;
+	promptSha256: string;
+	promptObservationSha256: string;
 }
 
 function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): NormalizedStartRequest {

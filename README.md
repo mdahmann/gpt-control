@@ -179,6 +179,10 @@ unverified build step.
 | `GPT_CONTROL_PROVIDER_ABANDON_TOKEN` | Secret operator token, at least 32 characters, required for unresolved provider-turn abandonment |
 | `GPT_CONTROL_POLL_MS` | Browser observation interval |
 
+Schema v3 refuses to start when schema-v2 run or conversation records remain in
+the legacy default state root. Resolve or stop any old provider turns first,
+then follow [docs/UPGRADE_V2.md](docs/UPGRADE_V2.md).
+
 See [SECURITY.md](SECURITY.md), [MIGRATION.md](MIGRATION.md), and
 [docs/CODEX_SUBAGENTS.md](docs/CODEX_SUBAGENTS.md).
 

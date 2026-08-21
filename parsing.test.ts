@@ -140,6 +140,15 @@ describe("verifiable structured findings", () => {
 });
 
 describe("confined durable records and ownership-aware locks", () => {
+	test("blocks schema-v3 startup while legacy schema-v2 state remains", async () => {
+		const parent = scratch();
+		mkdirSync(join(parent, "runs"), { recursive: true });
+		writeFileSync(join(parent, "runs", `run_${"a".repeat(32)}.json`), JSON.stringify({ version: 2 }));
+		const store = new RunStore(join(parent, "v3"));
+		await expect(store.init()).rejects.toThrow(/Legacy or unknown GPT-Control durable state/);
+		await expect(store.init()).rejects.toThrow(/UPGRADE_V2/);
+	});
+
 	function records(root: string): { conversation: ConversationRecord; run: RunRecord } {
 		const timestamp = nowIso();
 		const conversation: ConversationRecord = {

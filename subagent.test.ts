@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer, resumeDurableSubagents } from "./src/mcp";
+import { CHATGPT_ORIGIN } from "./src/chatgpt";
 import { idempotencyKeyHash } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
 import { FakeChromeBridge, makeChromeService, TEST_OPERATOR_ABANDON_TOKEN } from "./test_helpers";
@@ -59,6 +60,7 @@ describe("bounded Pro worker scheduler", () => {
 		}
 		await waitUntil(() => bridge.submittedPrompts.length === 3);
 		expect(bridge.submittedPrompts).toEqual(["[slow] worker-1", "[slow] worker-2", "[slow] worker-3"]);
+		expect(bridge.activeTabs()).toHaveLength(3);
 		bridge.release();
 		await waitUntil(() => bridge.submittedPrompts.length === 4);
 		bridge.release();
@@ -93,6 +95,9 @@ describe("bounded Pro worker scheduler", () => {
 			timeoutMs: 1000,
 		}, { deferExecution: true });
 		expect(prepared.run.executionReady).toBe(false);
+		expect(prepared.conversation.browserSessionId).toBeUndefined();
+		expect(prepared.conversation.browserPageId).toBeUndefined();
+		expect(bridge.activeTabs()).toEqual([]);
 		expect(bridge.submittedPrompts).toEqual([]);
 		expect(await store.getIdempotency(key)).toMatchObject({
 			runId: prepared.run.id,
@@ -101,6 +106,21 @@ describe("bounded Pro worker scheduler", () => {
 		await service.schedulePreparedRun(prepared.run.id);
 		expect((await service.waitForRun(prepared.run.id, 1500)).status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["deferred index"]);
+	});
+
+	test("validates the final wrapped prompt before allocating a browser session", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxPromptBytes: 128 });
+		await expect(service.start({
+			kind: "subagent",
+			prompt: "x",
+			idempotencyKey: "wrapped-prompt-limit",
+			connectors: ["GitHub"],
+			connectorMode: "require",
+			wait: false,
+		})).rejects.toThrow(/Prompt exceeds trusted 128-byte limit/);
+		expect(bridge.activeTabs()).toEqual([]);
+		expect(await service.listRuns()).toEqual([]);
 	});
 
 	test("does not let unactivated deferred runs consume global worker slots", async () => {
@@ -167,6 +187,56 @@ describe("bounded Pro worker scheduler", () => {
 		const recovered = await service.recoverActiveRuns();
 		expect(recovered).toMatchObject({ resumed: [], blocked: [], deferred: [prepared.run.id] });
 		expect((await service.getRun(prepared.run.id)).status).toBe("queued");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("restart repairs a persisted browser session missing from the run receipt", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(root, workspace, bridge);
+		const prepared = await first.service.start({
+			kind: "subagent",
+			prompt: "repair session receipt",
+			idempotencyKey: "repair-session-receipt",
+			wait: false,
+			timeoutMs: 1500,
+		}, { deferExecution: true });
+		const driver = bridge.capabilities().browser!.driver;
+		const session = await driver.create(prepared.conversation.browserSessionName!, CHATGPT_ORIGIN);
+		await first.service.store.updateConversation(prepared.conversation.id, {
+			browserSessionId: session.sessionId,
+			browserPageId: session.pageId,
+		});
+		expect((await first.service.getRun(prepared.run.id)).receipt.localBrowserSessionId).toBeUndefined();
+
+		const second = makeChromeService(root, workspace, bridge);
+		await second.service.schedulePreparedRun(prepared.run.id);
+		const terminal = await second.service.waitForRun(prepared.run.id, 2000);
+		expect(terminal.status).toBe("completed");
+		expect(terminal.receipt.localBrowserSessionId).toBe(session.sessionId);
+		expect(terminal.receipt.browserDriverId).toBe(driver.id);
+		expect(bridge.submittedPrompts).toEqual(["repair session receipt"]);
+	});
+
+	test("a conversation closed before execution cannot allocate a browser session", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(root, workspace, bridge);
+		const prepared = await service.start({
+			kind: "subagent",
+			prompt: "must not run after close",
+			idempotencyKey: "closed-before-allocation",
+			wait: false,
+			timeoutMs: 1000,
+		}, { deferExecution: true });
+		await service.store.updateConversation(prepared.conversation.id, { closedAt: new Date().toISOString() });
+		await service.schedulePreparedRun(prepared.run.id);
+		const terminal = await service.waitForRun(prepared.run.id, 1500);
+		expect(terminal.status).toBe("failed");
+		expect(terminal.error).toMatch(/conversation .* is closed/i);
+		expect(bridge.activeTabs()).toEqual([]);
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
 
