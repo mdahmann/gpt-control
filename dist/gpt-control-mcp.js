@@ -34720,6 +34720,9 @@ var SnapshotSchema = exports_external.object({
 }).strict();
 var ObservationSchema = exports_external.object({
   snapshot: SnapshotSchema,
+  latestUserMessageId: exports_external.string().min(1).optional(),
+  latestUserPromptSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
+  latestUserPromptProofToken: exports_external.string().regex(/^proof_[a-f0-9]{32}$/).optional(),
   composerReady: exports_external.boolean(),
   answering: exports_external.boolean(),
   thinking: exports_external.boolean(),
@@ -35304,6 +35307,23 @@ class RunStore {
       return next;
     }, { timeoutMs: 1e4 });
   }
+  async claimMcpTask(id, taskId) {
+    assertRunId(id);
+    assertTaskId(taskId);
+    await this.init();
+    return this.withNamedLock(`record-${id}`, async () => {
+      const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id))));
+      if (current.mcpTaskId && current.mcpTaskId !== taskId) {
+        throw new Error("This Pro worker is already owned by another durable MCP task.");
+      }
+      if (current.mcpTaskId === taskId)
+        return current;
+      const next = { ...current, mcpTaskId: taskId, id, updatedAt: nowIso() };
+      RunSchema.parse(next);
+      await atomicWrite(this.runPath(id), next);
+      return next;
+    }, { timeoutMs: 1e4 });
+  }
   async requestProviderStop(id) {
     assertRunId(id);
     await this.init();
@@ -35464,6 +35484,10 @@ class RunStore {
   async withTaskLock(taskId, work) {
     assertTaskId(taskId);
     return this.withNamedLock(`mcp-${taskId}`, work, { timeoutMs: 30000 });
+  }
+  async withRunTaskBindingLock(runId, work) {
+    assertRunId(runId);
+    return this.withNamedLock(`mcp-run-${runId}`, work, { timeoutMs: 30000 });
   }
   async withConversationLock(conversationId, work, options = {}) {
     assertConversationId(conversationId);
@@ -36557,7 +36581,7 @@ class GptControlService {
       const current = await this.store.getRun(runId);
       if (TERMINAL2.has(current.status))
         return false;
-      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.status === "queued" || run.status === "running" || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
       const position = contenders.findIndex((run) => run.id === runId);
       if (position >= 0 && position < this.policy.maxConcurrentWorkers)
         return true;
@@ -37434,11 +37458,22 @@ class DurableTaskStore {
     };
   }
   async bindRun(taskId, runId) {
-    await this.mutate(taskId, (record3) => {
+    await this.lockStore.withTaskLock(taskId, async () => {
+      const record3 = await this.readRecord(taskId);
       if (record3.runId && record3.runId !== runId)
         throw new Error(`Task ${taskId} is already bound to another run.`);
-      record3.runId = runId;
-      return record3;
+      await this.lockStore.withRunTaskBindingLock(runId, async () => {
+        const existingTaskId = await this.findTaskIdByRun(runId);
+        if (existingTaskId && existingTaskId !== taskId) {
+          throw new Error("This Pro worker is already bound to another durable MCP task.");
+        }
+        await this.lockStore.claimMcpTask(runId, taskId);
+        if (record3.runId === runId)
+          return;
+        record3.runId = runId;
+        validateRecord(record3, taskId);
+        await atomicWrite2(this.taskPath(taskId), record3, false);
+      });
     });
   }
   async getRunId(taskId, sessionId) {
@@ -37796,9 +37831,13 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
       try {
         const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+        if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
+          throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
+        }
+        if (started.run.executionReady && !started.run.mcpTaskId) {
+          throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
+        }
         await taskStore.bindRun(task.taskId, started.run.id);
-        if (!started.run.mcpTaskId)
-          await service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
         const currentTask = await taskStore.getTask(task.taskId);
         if (currentTask?.status === "cancelled") {
           await service.cancelRun(started.run.id);
@@ -38025,7 +38064,16 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
   if (stopRecovery.blocked.length > 0) {
     console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
   }
-  const bindings = await taskStore.listBindings();
+  let bindings = await taskStore.listBindings();
+  const claimedRuns = new Map((await service.store.listRuns({ limit: null })).filter((run) => run.mcpTaskId).map((run) => [run.mcpTaskId, run]));
+  for (const binding of bindings) {
+    if (binding.runId)
+      continue;
+    const claimed = claimedRuns.get(binding.task.taskId);
+    if (claimed)
+      await taskStore.bindRun(binding.task.taskId, claimed.id);
+  }
+  bindings = await taskStore.listBindings();
   for (const binding of bindings) {
     if (!binding.runId || !["completed", "failed", "cancelled"].includes(binding.task.status))
       continue;

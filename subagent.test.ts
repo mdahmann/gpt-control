@@ -103,6 +103,31 @@ describe("bounded Pro worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual(["deferred index"]);
 	});
 
+	test("does not let unactivated deferred runs consume global worker slots", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(root, workspace, bridge, { maxConcurrentWorkers: 3 });
+		for (const index of [1, 2, 3]) {
+			const prepared = await service.start({
+				kind: "subagent",
+				prompt: `[slow] unbound-${index}`,
+				idempotencyKey: `unbound-${index}`,
+				wait: false,
+				timeoutMs: 1000,
+			}, { deferExecution: true });
+			expect(prepared.run.executionReady).toBe(false);
+		}
+		const runnable = await service.start({
+			kind: "subagent",
+			prompt: "runnable after deferred orphans",
+			idempotencyKey: "runnable-after-orphans",
+			timeoutMs: 1000,
+		});
+		expect(runnable.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["runnable after deferred orphans"]);
+	});
+
 	test("repairs a crash-orphaned idempotency index without creating or submitting a duplicate run", async () => {
 		const root = scratch();
 		const workspace = scratch();
@@ -332,6 +357,44 @@ describe("MCP task delivery", () => {
 		expect((await store.getTask(taskB.taskId, "session-b"))?.status).toBe("working");
 	});
 
+	test("allows only one durable MCP task to own an idempotent worker", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const { service } = makeChromeService(join(root, "state"), workspace, new FakeChromeBridge());
+		const prepared = await service.start({
+			kind: "subagent",
+			prompt: "single task owner",
+			idempotencyKey: "single-task-owner",
+			wait: false,
+			timeoutMs: 1000,
+		}, { deferExecution: true });
+		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const taskA = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
+		const taskB = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
+		await store.bindRun(taskA.taskId, prepared.run.id);
+		await expect(store.bindRun(taskB.taskId, prepared.run.id)).rejects.toThrow(/already (?:bound|owned)/i);
+		expect((await service.getRun(prepared.run.id)).mcpTaskId).toBe(taskA.taskId);
+		expect(await store.findTaskIdByRun(prepared.run.id, "session-a")).toBe(taskA.taskId);
+		expect(await store.findTaskIdByRun(prepared.run.id, "session-b")).toBeUndefined();
+	});
+
+	test("a task rejected from a second run does not claim that run", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const { service } = makeChromeService(join(root, "state"), workspace, new FakeChromeBridge());
+		const first = await service.start({ kind: "subagent", prompt: "first", idempotencyKey: "task-first", wait: false }, { deferExecution: true });
+		const second = await service.start({ kind: "subagent", prompt: "second", idempotencyKey: "task-second", wait: false }, { deferExecution: true });
+		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const task = await store.createTask({ ttl: 60_000 }, 1, { method: "tools/call", params: {} } as never, "session-a");
+		await store.bindRun(task.taskId, first.run.id);
+		await expect(store.bindRun(task.taskId, second.run.id)).rejects.toThrow(/already bound to another run/i);
+		expect((await service.getRun(first.run.id)).mcpTaskId).toBe(task.taskId);
+		expect((await service.getRun(second.run.id)).mcpTaskId).toBeUndefined();
+	});
+
 	test("delivers one successful terminal result exactly once with durable truthful provenance", async () => {
 		const harness = await connectMcp();
 		try {
@@ -397,6 +460,35 @@ describe("MCP task delivery", () => {
 });
 
 describe("MCP cancellation, reconnect, restart, and fallback", () => {
+	test("restart repairs a run claim written before its task binding", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const prepared = await first.service.start({
+			kind: "subagent",
+			prompt: "repair claimed task binding",
+			idempotencyKey: "repair-claimed-task-binding",
+			wait: false,
+			timeoutMs: 1500,
+		}, { deferExecution: true });
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), first.service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+		);
+		await first.service.store.claimMcpTask(prepared.run.id, task.taskId);
+		expect(await taskStore.getRunId(task.taskId)).toBeUndefined();
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		await waitUntil(async () => (await taskStore.getTask(task.taskId))?.status === "completed", 2500);
+		expect(await taskStore.getRunId(task.taskId)).toBe(prepared.run.id);
+		expect(bridge.submittedPrompts).toEqual(["repair claimed task binding"]);
+	});
+
 	test("a task cancelled before a crash cannot submit during restart recovery", async () => {
 		const root = scratch();
 		const workspace = join(root, "workspace");

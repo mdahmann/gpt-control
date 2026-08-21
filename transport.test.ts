@@ -83,7 +83,7 @@ process.stdin.on("end", () => {
   else if (request.action === "show") result = base;
   else if (request.action === "navigate") result = { ...base, url: request.params.url };
   else if (request.action === "select_model" || request.action === "verify_model") result = { requestedModel: "Pro", observedModel: "Pro", modelVerified: true, modelEvidenceKind: "composer_selector", modelVerifiedAt: "2026-08-21T00:00:00.000Z" };
-  else if (request.action === "observe") result = { snapshot: { count: 1, text: "answer", imageUrls: [], hasMarkdown: true, messageId: "m1" }, composerReady: true, answering: false, thinking: false, toolRunning: false, retryAvailable: false, continueAvailable: false, stateSummary: "idle" };
+  else if (request.action === "observe") result = { snapshot: { count: 1, text: "answer", imageUrls: [], hasMarkdown: true, messageId: "m1" }, latestUserMessageId: "u1", latestUserPromptSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", latestUserPromptProofToken: "proof_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", composerReady: true, answering: false, thinking: false, toolRunning: false, retryAvailable: false, continueAvailable: false, stateSummary: "idle" };
   else if (request.action === "screenshot") result = request.params.outputPath;
   console.log(JSON.stringify({ version: 2, ok: true, result }));
 });
@@ -100,7 +100,10 @@ process.stdin.on("end", () => {
 			expect((await external.selectModel(created, "pro")).observedModel).toBe("Pro");
 			expect((await external.verifyModel(created, "pro")).modelVerified).toBe(true);
 			await external.send(created);
-			expect((await external.observe(created)).snapshot.text).toBe("answer");
+			const observation = await external.observe(created);
+			expect(observation.snapshot.text).toBe("answer");
+			expect(observation.latestUserMessageId).toBe("u1");
+			expect(observation.latestUserPromptProofToken).toBe("proof_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 			await external.recover(created, "reload");
 			await external.setState("s1", "completed");
 			expect(await external.screenshot(created, "/tmp/out.png")).toBe("/tmp/out.png");

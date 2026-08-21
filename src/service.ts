@@ -668,8 +668,7 @@ export class GptControlService {
 			const contenders = (await this.store.listRuns({ limit: null }))
 				.filter((run) => run.kind === "subagent" && (
 					run.providerTurnPending === true
-					|| run.status === "queued"
-					|| run.status === "running"
+					|| (run.executionReady && (run.status === "queued" || run.status === "running"))
 					|| (run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled")
 						&& (run.submissionState === "submitting" || run.submissionState === "submitted"))
 				))

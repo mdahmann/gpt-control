@@ -223,8 +223,13 @@ function registerSubagentRun(
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
 			try {
 				const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+				if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
+					throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
+				}
+				if (started.run.executionReady && !started.run.mcpTaskId) {
+					throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
+				}
 				await taskStore.bindRun(task.taskId, started.run.id);
-				if (!started.run.mcpTaskId) await service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
 				const currentTask = await taskStore.getTask(task.taskId);
 				if (currentTask?.status === "cancelled") {
 					await service.cancelRun(started.run.id);
@@ -482,7 +487,18 @@ export async function resumeDurableSubagents(
 	if (stopRecovery.blocked.length > 0) {
 		console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
 	}
-	const bindings = await taskStore.listBindings();
+	let bindings = await taskStore.listBindings();
+	const claimedRuns = new Map(
+		(await service.store.listRuns({ limit: null }))
+			.filter((run) => run.mcpTaskId)
+			.map((run) => [run.mcpTaskId!, run]),
+	);
+	for (const binding of bindings) {
+		if (binding.runId) continue;
+		const claimed = claimedRuns.get(binding.task.taskId);
+		if (claimed) await taskStore.bindRun(binding.task.taskId, claimed.id);
+	}
+	bindings = await taskStore.listBindings();
 	// Reconcile durable task authority before recovering runnable work. This also
 	// repairs records written by older builds that persisted task cancellation
 	// before run cancellation and then crashed between those writes.

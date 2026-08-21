@@ -200,10 +200,20 @@ export class DurableTaskStore implements TaskStore {
 	}
 
 	async bindRun(taskId: string, runId: string): Promise<void> {
-		await this.mutate(taskId, (record) => {
+		await this.lockStore.withTaskLock(taskId, async () => {
+			const record = await this.readRecord(taskId);
 			if (record.runId && record.runId !== runId) throw new Error(`Task ${taskId} is already bound to another run.`);
-			record.runId = runId;
-			return record;
+			await this.lockStore.withRunTaskBindingLock(runId, async () => {
+				const existingTaskId = await this.findTaskIdByRun(runId);
+				if (existingTaskId && existingTaskId !== taskId) {
+					throw new Error("This Pro worker is already bound to another durable MCP task.");
+				}
+				await this.lockStore.claimMcpTask(runId, taskId);
+				if (record.runId === runId) return;
+				record.runId = runId;
+				validateRecord(record, taskId);
+				await atomicWrite(this.taskPath(taskId), record, false);
+			});
 		});
 	}
 

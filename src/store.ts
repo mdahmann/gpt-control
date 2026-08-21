@@ -334,6 +334,23 @@ export class RunStore {
 		}, { timeoutMs: 10_000 });
 	}
 
+	async claimMcpTask(id: string, taskId: string): Promise<RunRecord> {
+		assertRunId(id);
+		assertTaskId(taskId);
+		await this.init();
+		return this.withNamedLock(`record-${id}`, async () => {
+			const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id)))) as RunRecord;
+			if (current.mcpTaskId && current.mcpTaskId !== taskId) {
+				throw new Error("This Pro worker is already owned by another durable MCP task.");
+			}
+			if (current.mcpTaskId === taskId) return current;
+			const next = { ...current, mcpTaskId: taskId, id, updatedAt: nowIso() };
+			RunSchema.parse(next);
+			await atomicWrite(this.runPath(id), next);
+			return next;
+		}, { timeoutMs: 10_000 });
+	}
+
 	async requestProviderStop(id: string): Promise<RunRecord> {
 		assertRunId(id);
 		await this.init();
@@ -500,6 +517,11 @@ export class RunStore {
 	async withTaskLock<T>(taskId: string, work: () => Promise<T>): Promise<T> {
 		assertTaskId(taskId);
 		return this.withNamedLock(`mcp-${taskId}`, work, { timeoutMs: 30_000 });
+	}
+
+	async withRunTaskBindingLock<T>(runId: string, work: () => Promise<T>): Promise<T> {
+		assertRunId(runId);
+		return this.withNamedLock(`mcp-run-${runId}`, work, { timeoutMs: 30_000 });
 	}
 
 	async withConversationLock<T>(
