@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import gptControl, { resolveOutputDir } from "./src/index";
 import { createMcpServer } from "./src/mcp";
+import { operatorPolicyFromEnv } from "./src/policy";
 import { secureDirectory } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
 import type { ExtensionAPI, SchemaNode, ToolDefinition, TypeBuilder } from "./src/types";
@@ -34,6 +35,15 @@ const Type: TypeBuilder = {
 };
 
 describe("public extension contract", () => {
+	test("operator abandonment token rotation does not change execution policy identity", () => {
+		const root = scratch();
+		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
+		const first = operatorPolicyFromEnv({}, { ...common, providerTurnAbandonmentToken: "first-operator-token-000000000000000" });
+		const second = operatorPolicyFromEnv({}, { ...common, providerTurnAbandonmentToken: "second-operator-token-00000000000000" });
+		expect(first.fingerprint).toBe(second.fingerprint);
+		expect(first.providerTurnAbandonmentTokenHash).not.toBe(second.providerTurnAbandonmentTokenHash);
+	});
+
 	test("registers image, bounded Pro worker, durable recovery, and split diagnostics", () => {
 		const tools: ToolDefinition[] = [];
 		let label = "";
@@ -48,7 +58,7 @@ describe("public extension contract", () => {
 		const names = tools.map((tool) => tool.name);
 		for (const expected of [
 			"gpt_consult", "gpt_chat", "gpt_image", "gpt_subagent_run", "gpt_subagent_get", "gpt_subagent_cancel", "gpt_subagent_list",
-			"gpt_run", "gpt_run_cancel", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
+			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");
 		expect(tools.find((tool) => tool.name === "gpt_diagnose_active")?.approval).toBe("exec");
@@ -85,6 +95,10 @@ describe("public extension contract", () => {
 
 describe("MCP plugin contract", () => {
 	test("advertises optional task execution and omits authority-expanding schemas", async () => {
+		const pluginMcp = JSON.parse(readFileSync(join(import.meta.dir, ".mcp.json"), "utf8")) as {
+			mcpServers: { "gpt-control": { env_vars: string[] } };
+		};
+		expect(pluginMcp.mcpServers["gpt-control"].env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
 		const root = scratch();
 		const { service } = makeChromeService(join(root, "state"), join(root, "workspace"), new FakeChromeBridge());
 		mkdirSync(join(root, "workspace"), { recursive: true });
@@ -107,6 +121,7 @@ describe("MCP plugin contract", () => {
 				expect(properties).not.toHaveProperty(field);
 			}
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_image");
+			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_abandon_pending");
 		} finally {
 			await client.close();
 			await server.close();

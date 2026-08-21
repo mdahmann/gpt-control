@@ -86,9 +86,10 @@ export class DurableTaskStore implements TaskStore {
 		return task;
 	}
 
-	async getTask(taskId: string, _sessionId?: string): Promise<Task | null> {
+	async getTask(taskId: string, sessionId?: string): Promise<Task | null> {
 		try {
-			return (await this.readRecord(taskId)).task;
+			const record = await this.readRecord(taskId);
+			return sessionCanAccess(record, sessionId) ? record.task : null;
 		} catch (error) {
 			if (isMissing(error)) return null;
 			throw error;
@@ -99,7 +100,7 @@ export class DurableTaskStore implements TaskStore {
 		taskId: string,
 		status: "completed" | "failed",
 		result: Result,
-		_sessionId?: string,
+		sessionId?: string,
 	): Promise<void> {
 		const resultHash = jsonHash(result);
 		let notify: Task | undefined;
@@ -117,12 +118,13 @@ export class DurableTaskStore implements TaskStore {
 			record.statusHistory.push({ status, at: timestamp, message: record.task.statusMessage });
 			notify = record.task;
 			return record;
-		});
+		}, sessionId);
 		if (notify) await this.notify(taskId, notify);
 	}
 
-	async getTaskResult(taskId: string, _sessionId?: string): Promise<Result> {
+	async getTaskResult(taskId: string, sessionId?: string): Promise<Result> {
 		const record = await this.readRecord(taskId);
+		assertSessionAccess(record, sessionId);
 		if (!TERMINAL.has(record.task.status) || record.result === undefined) {
 			throw new Error(`Task ${taskId} has no terminal result.`);
 		}
@@ -133,10 +135,10 @@ export class DurableTaskStore implements TaskStore {
 		taskId: string,
 		status: Task["status"],
 		statusMessage?: string,
-		_sessionId?: string,
+		sessionId?: string,
 	): Promise<void> {
 		if (status === "cancelled") {
-			await this.cancelTask(taskId, statusMessage);
+			await this.cancelTask(taskId, statusMessage, sessionId);
 			return;
 		}
 		let notify: Task | undefined;
@@ -162,23 +164,38 @@ export class DurableTaskStore implements TaskStore {
 			}
 			notify = record.task;
 			return record;
-		});
+		}, sessionId);
 		if (notify) await this.notify(taskId, notify);
 	}
 
-	async listTasks(cursor?: string, _sessionId?: string): Promise<{ tasks: Task[]; nextCursor?: string }> {
+	async listTasks(cursor?: string, sessionId?: string): Promise<{ tasks: Task[]; nextCursor?: string }> {
 		await this.init();
 		if (cursor !== undefined) assertTaskId(cursor);
 		const names = (await readdir(this.root))
 			.filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name))
 			.sort();
 		const start = cursor ? Math.max(0, names.indexOf(`${cursor}.json`) + 1) : 0;
-		const page = names.slice(start, start + 100);
-		const tasks = await Promise.all(page.map((name) => this.readRecord(name.slice(0, -5)).then((record) => record.task)));
-		const last = page.at(-1);
+		const tasks: Task[] = [];
+		let lastReturnedIndex = -1;
+		for (let index = start; index < names.length && tasks.length < 100; index += 1) {
+			const record = await this.readRecord(names[index].slice(0, -5));
+			if (!sessionCanAccess(record, sessionId)) continue;
+			tasks.push(record.task);
+			lastReturnedIndex = index;
+		}
+		let hasMore = false;
+		if (lastReturnedIndex >= 0) {
+			for (let index = lastReturnedIndex + 1; index < names.length; index += 1) {
+				if (sessionCanAccess(await this.readRecord(names[index].slice(0, -5)), sessionId)) {
+					hasMore = true;
+					break;
+				}
+			}
+		}
+		const last = tasks.at(-1);
 		return {
 			tasks,
-			nextCursor: start + page.length < names.length && last ? last.slice(0, -5) : undefined,
+			nextCursor: hasMore && last ? last.taskId : undefined,
 		};
 	}
 
@@ -190,18 +207,20 @@ export class DurableTaskStore implements TaskStore {
 		});
 	}
 
-	async getRunId(taskId: string): Promise<string | undefined> {
-		return (await this.readRecord(taskId)).runId;
+	async getRunId(taskId: string, sessionId?: string): Promise<string | undefined> {
+		const record = await this.readRecord(taskId);
+		assertSessionAccess(record, sessionId);
+		return record.runId;
 	}
 
 	async statusHistory(taskId: string): Promise<DurableTaskRecord["statusHistory"]> {
 		return [...(await this.readRecord(taskId)).statusHistory];
 	}
 
-	async findTaskIdByRun(runId: string): Promise<string | undefined> {
+	async findTaskIdByRun(runId: string, sessionId?: string): Promise<string | undefined> {
 		let cursor: string | undefined;
 		do {
-			const page = await this.listTasks(cursor);
+			const page = await this.listTasks(cursor, sessionId);
 			for (const task of page.tasks) {
 				if ((await this.readRecord(task.taskId)).runId === runId) return task.taskId;
 			}
@@ -210,12 +229,12 @@ export class DurableTaskStore implements TaskStore {
 		return undefined;
 	}
 
-	async listBindings(limit?: number): Promise<Array<{ task: Task; runId?: string }>> {
+	async listBindings(limit?: number, sessionId?: string): Promise<Array<{ task: Task; runId?: string }>> {
 		const values: Array<{ task: Task; runId?: string }> = [];
 		const boundedLimit = limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(limit, 1000));
 		let cursor: string | undefined;
 		do {
-			const page = await this.listTasks(cursor);
+			const page = await this.listTasks(cursor, sessionId);
 			for (const task of page.tasks) {
 				const record = await this.readRecord(task.taskId);
 				values.push({ task: record.task, runId: record.runId });
@@ -244,19 +263,22 @@ export class DurableTaskStore implements TaskStore {
 		}
 	}
 
-	private async mutate(taskId: string, update: (record: DurableTaskRecord) => DurableTaskRecord): Promise<void> {
+	private async mutate(taskId: string, update: (record: DurableTaskRecord) => DurableTaskRecord, sessionId?: string): Promise<void> {
 		await this.lockStore.withTaskLock(taskId, async () => {
-			const next = update(await this.readRecord(taskId));
+			const current = await this.readRecord(taskId);
+			assertSessionAccess(current, sessionId);
+			const next = update(current);
 			validateRecord(next, taskId);
 			await atomicWrite(this.taskPath(taskId), next, false);
 		});
 	}
 
-	private async cancelTask(taskId: string, statusMessage?: string): Promise<void> {
+	private async cancelTask(taskId: string, statusMessage?: string, sessionId?: string): Promise<void> {
 		let notify: Task | undefined;
 		let cancelledRunId: string | undefined;
 		await this.lockStore.withTaskLock(taskId, async () => {
 			const record = await this.readRecord(taskId);
+			assertSessionAccess(record, sessionId);
 			if (record.task.status === "cancelled" || TERMINAL.has(record.task.status)) return;
 			if (!TRANSITIONS[record.task.status].has("cancelled")) {
 				throw new Error(`Invalid task transition ${record.task.status} -> cancelled.`);
@@ -268,6 +290,7 @@ export class DurableTaskStore implements TaskStore {
 				// process crash can never leave a cancelled task bound to runnable work.
 				const run = await this.lockStore.updateRun(cancelledRunId, {
 					status: "cancelled",
+					providerStopRequested: true,
 					cancellationRequestedAt: timestamp,
 					completedAt: timestamp,
 					error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored.",
@@ -306,6 +329,16 @@ function validateRecord(value: unknown, expectedId: string): DurableTaskRecord {
 	if (!(record.task.status in TRANSITIONS)) throw new Error(`Invalid task status for ${expectedId}.`);
 	if (!Array.isArray(record.statusHistory)) throw new Error(`Invalid task status history for ${expectedId}.`);
 	return record;
+}
+
+function sessionCanAccess(record: DurableTaskRecord, sessionId?: string): boolean {
+	// Undefined is reserved for broker-internal recovery and single-session
+	// transports. A multiplexed transport must present the exact creating id.
+	return sessionId === undefined || (record.sessionId !== undefined && record.sessionId === sessionId);
+}
+
+function assertSessionAccess(record: DurableTaskRecord, sessionId?: string): void {
+	if (!sessionCanAccess(record, sessionId)) throw new Error(`Task ${record.task.taskId} is not owned by this MCP session.`);
 }
 
 async function atomicWrite(path: string, value: DurableTaskRecord, createOnly: boolean): Promise<void> {

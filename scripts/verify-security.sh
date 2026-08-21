@@ -2,8 +2,11 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-LOG_DIR=${GPT_CONTROL_VERIFY_LOG_DIR:-/tmp/gpt-control-0.3.1-verification}
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
+umask 077
+
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.3.1-verification}
+LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
   BUN=${GPT_CONTROL_BUN}
@@ -17,8 +20,8 @@ else
   printf '%s\n' 'Trusted Bun runtime unavailable. Install dependencies or set GPT_CONTROL_BUN.' >&2
   exit 127
 fi
+NODE=$(command -v node)
 
-mkdir -p "$LOG_DIR"
 chmod 700 "$LOG_DIR"
 cd "$ROOT"
 
@@ -48,7 +51,7 @@ run_gate bundle-build "$BUN" build src/mcp.ts --target=node --outfile="$LOG_DIR/
 run_gate bundle-current cmp dist/gpt-control-mcp.js "$LOG_DIR/gpt-control-mcp.js"
 run_gate bundle-node-syntax node --check dist/gpt-control-mcp.js
 mkdir -p "$LOG_DIR/mcp-home" "$LOG_DIR/mcp-state"
-run_gate bundle-mcp-smoke env   -u OPENAI_API_KEY -u OPENAI_BASE_URL   HOME="$LOG_DIR/mcp-home"   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   GPT_CONTROL_HOME="$LOG_DIR/mcp-state"   GPT_CONTROL_WORKSPACE_ROOT="$ROOT"   python3 scripts/mcp-stdio-smoke.py ./bin/gpt-control-mcp
+run_gate bundle-mcp-smoke env   -u OPENAI_API_KEY -u OPENAI_BASE_URL   HOME="$LOG_DIR/mcp-home"   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   GPT_CONTROL_NODE="$NODE"   GPT_CONTROL_HOME="$LOG_DIR/mcp-state"   GPT_CONTROL_WORKSPACE_ROOT="$ROOT"   python3 scripts/mcp-stdio-smoke.py ./bin/gpt-control-mcp
 run_gate browser-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test chrome.test.ts
 run_gate storage-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test parsing.test.ts
 run_gate transport-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test transport.test.ts
@@ -64,10 +67,16 @@ run_gate plugin-json python3 -m json.tool .codex-plugin/plugin.json
 run_gate mcp-json python3 -m json.tool .mcp.json
 run_gate diff-check git diff --check
 
-mapfile -d '' VERIFY_FILES < <(git ls-files -co --exclude-standard -z -- ':!bun.lock' ':!scripts/verify-security.sh')
-if (( ${#VERIFY_FILES[@]} > 0 )) && grep -InE \
-  '(^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
-  "${VERIFY_FILES[@]}" > "$LOG_DIR/secret-scan.log"; then
+secret_found=0
+: > "$LOG_DIR/secret-scan.log"
+while IFS= read -r -d '' verify_file; do
+  if grep -InE \
+    '(^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
+    "$verify_file" >> "$LOG_DIR/secret-scan.log"; then
+    secret_found=1
+  fi
+done < <(git ls-files -co --exclude-standard -z -- ':!bun.lock' ':!scripts/verify-security.sh')
+if (( secret_found )); then
   printf '%s\n' 'Potential secret material detected in the Git commit boundary:' >&2
   cat "$LOG_DIR/secret-scan.log" >&2
   exit 1
@@ -88,4 +97,5 @@ printf 'EXIT=0\n' >> "$LOG_DIR/secret-scan.log"
 } > "$LOG_DIR/summary.txt"
 chmod 600 "$LOG_DIR"/*.log "$LOG_DIR/summary.txt"
 printf '\nAll GPT-Control verification gates passed.\n'
+printf 'logs=%s\n' "$LOG_DIR"
 cat "$LOG_DIR/summary.txt"

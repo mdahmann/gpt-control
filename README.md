@@ -18,7 +18,8 @@ open a replacement browser when the configured driver is unavailable.
 - **No ambiguous replay:** plaintext recovery data is removed before the browser
   click. A restart can observe a submitted turn but cannot resubmit it.
 - **Crash-safe cancellation:** cancellation is terminal and immutable before a
-  best-effort UI stop. Late completion cannot overwrite it.
+  provider stop. Restart retries any pending exact-turn stop before it resumes
+  work. Late completion cannot overwrite cancellation.
 - **Truthful model provenance:** ChatGPT Pro is selected and read back from the
   live composer, then verified again immediately before send.
 - **Immutable attachments:** uploads use private broker-owned snapshots with
@@ -52,6 +53,7 @@ never passed through child-process argv.
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
 | `gpt_run_cancel` | Durably cancel any active run |
+| `gpt_run_abandon_pending` | Operator-authenticated release of an unresolved provider slot after manual review |
 | `gpt_conversation_close` | Close an owned local browser session; provider history remains |
 | `gpt_subagent_run` | Start one independent bounded ChatGPT Pro worker |
 | `gpt_subagent_get` | One reconnect/recovery lookup for a worker |
@@ -74,6 +76,11 @@ execution; normal completion requires no status polling. Clients without task
 support receive one long-running terminal tool response. GPT-Control does not
 assume a task notification can awaken a dormant chat thread; the durable run and
 task IDs are the recovery mechanism.
+
+Multiplexed MCP transports bind task listing, reads, results, and cancellation
+to the creating transport session. Broker-internal restart recovery remains
+able to reconcile all durable tasks. A submitted provider turn retains worker
+capacity until it becomes final or the exact turn is proved inactive.
 
 A worker can request connected tools:
 
@@ -169,6 +176,7 @@ unverified build step.
 | `GPT_CONTROL_ALLOW_OUTSIDE_WORKSPACE` | Trusted outside-root authorization (`1`) |
 | `GPT_CONTROL_ALLOW_SENSITIVE_FILES` | Trusted sensitive-file authorization (`1`) |
 | `GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS` | Permit active driver probing (`1`) |
+| `GPT_CONTROL_PROVIDER_ABANDON_TOKEN` | Secret operator token, at least 32 characters, required for unresolved provider-turn abandonment |
 | `GPT_CONTROL_POLL_MS` | Browser observation interval |
 
 See [SECURITY.md](SECURITY.md), [MIGRATION.md](MIGRATION.md), and

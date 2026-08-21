@@ -1,5 +1,5 @@
 import { parse, type HTMLElement } from "node-html-parser";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,6 +13,7 @@ export const CHATGPT_ORIGIN = "https://chatgpt.com";
 const PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
 const SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
 const FILE_INPUT_SELECTOR = 'input[type="file"]';
+const USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
 const EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 const TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 
@@ -48,6 +49,9 @@ export interface ModelVerification {
 
 export interface ChatPageObservation {
 	snapshot: AssistantSnapshot;
+	latestUserMessageId?: string;
+	latestUserPromptSha256?: string;
+	latestUserPromptProofToken?: string;
 	composerReady: boolean;
 	answering: boolean;
 	thinking: boolean;
@@ -56,6 +60,10 @@ export interface ChatPageObservation {
 	continueAvailable: boolean;
 	errorMessage?: string;
 	stateSummary: string;
+}
+
+export function canonicalPromptObservationText(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
 }
 
 export interface CompletionOutcome {
@@ -757,6 +765,18 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 export function extractChatPageObservation(html: string): ChatPageObservation {
 	const root = parse(html);
 	const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
+	const userTurns = root.querySelectorAll('[data-message-author-role="user"]');
+	const latestUser = userTurns.at(-1);
+	const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? undefined;
+	const latestUserPromptNode = latestUser
+		? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean)
+		: undefined;
+	const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "")
+		.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+	const latestUserPromptSha256 = latestUserText
+		? createHash("sha256").update(canonicalPromptObservationText(latestUserText)).digest("hex")
+		: undefined;
+	const latestUserPromptProofToken = /\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\]\s*$/.exec(latestUserText)?.[1];
 	const composerReady = PROMPT_SELECTORS.some((selector) => Boolean(root.querySelector(selector)));
 	const controls = root.querySelectorAll('button, [role="button"]');
 	const controlLabels = controls.map(nodeLabel).filter(Boolean);
@@ -790,6 +810,9 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	].filter(Boolean);
 	return {
 		snapshot,
+		latestUserMessageId,
+		latestUserPromptSha256,
+		latestUserPromptProofToken,
 		composerReady,
 		answering: stopControl,
 		thinking,

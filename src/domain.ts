@@ -132,7 +132,15 @@ export interface RunRecord {
 	connectorIntent?: ConnectorIntent;
 	status: RunStatus;
 	executionReady: boolean;
+	/** True until the exact submitted provider turn is final or proved stopped. */
+	providerTurnPending?: boolean;
+	/** Durable intent to stop a pending exact provider turn. */
+	providerStopRequested?: boolean;
+	providerTurnAbandonedAt?: string;
+	providerUserMessageId?: string;
 	promptSha256: string;
+	promptObservationSha256?: string;
+	promptProofToken?: string;
 	attachmentManifest: AttachmentManifest;
 	baselineMessageCount?: number;
 	submissionState?: SubmissionState;
@@ -196,7 +204,7 @@ export const CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 export const RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
 export const TASK_ID_PATTERN = /^task_[a-f0-9]{32}$/;
 
-export function opaqueId(prefix: "conv" | "run" | "task"): string {
+export function opaqueId(prefix: "conv" | "run" | "task" | "proof"): string {
 	return `${prefix}_${randomUUID().replaceAll("-", "")}`;
 }
 

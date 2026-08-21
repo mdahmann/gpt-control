@@ -17,7 +17,12 @@ import {
 	type ExpectedDriverSession,
 	type WebChatDriver,
 } from "./browser-driver";
-import { CHATGPT_ORIGIN, providerConversationIdentity } from "./chatgpt";
+import {
+	CHATGPT_ORIGIN,
+	canonicalPromptObservationText,
+	providerConversationIdentity,
+	type ChatPageObservation,
+} from "./chatgpt";
 import {
 	PACKAGE_VERSION,
 	STORAGE_VERSION,
@@ -171,6 +176,7 @@ export class GptControlService {
 	private readonly exec: Exec;
 	private readonly dependencies: Required<ServiceDependencies>;
 	private readonly activeRuns = new Map<string, ActiveRun>();
+	private readonly activeStopReconciliations = new Map<string, Promise<void>>();
 	private readonly cancellationIntents = new Set<string>();
 	private readonly workerSlots: FairSemaphore;
 
@@ -276,13 +282,27 @@ export class GptControlService {
 
 	async cancelRun(runId: string): Promise<RunRecord> {
 		// Register intent synchronously so a same-process completion that is already
-		// unwinding cannot win merely because the durable write contains awaits. The
-		// record lock remains the cross-process arbiter.
+		// unwinding cannot win merely because the durable operations contain awaits.
 		this.cancellationIntents.add(runId);
+		const current = await this.store.getRun(runId);
+		if (TERMINAL.has(current.status)) {
+			const legacyPending = current.providerTurnPending === undefined
+				&& (current.submissionState === "submitting" || current.submissionState === "submitted")
+				&& current.status !== "completed" && current.status !== "failed";
+			if (current.providerTurnPending || legacyPending) {
+				const requested = await this.store.requestProviderStop(runId);
+				const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
+				if (!stopped) this.scheduleProviderStopReconciliation(runId);
+			}
+			this.cancellationIntents.delete(runId);
+			return this.store.getRun(runId);
+		}
+		// The record lock remains the cross-process arbiter.
 		const cancelled = await this.persistCancellation(runId);
 		if (cancelled.status === "cancelled") {
 			this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
-			await this.stopOwnedBrowserRun(cancelled).catch(() => undefined);
+			const stopped = await this.stopOwnedBrowserRun(cancelled).catch(() => false);
+			if (!stopped) this.scheduleProviderStopReconciliation(runId);
 		}
 		if (!this.activeRuns.has(runId)) this.cancellationIntents.delete(runId);
 		return cancelled;
@@ -293,17 +313,38 @@ export class GptControlService {
 		if (TERMINAL.has(run.status)) return run;
 		const blocked = await this.store.updateRun(runId, {
 			status: "needs_user",
+			providerStopRequested: run.providerTurnPending ? true : run.providerStopRequested,
 			completedAt: nowIso(),
 			error: reason,
 			diagnostics: { ...(run.diagnostics ?? {}), terminalReason: reason },
 		});
+		if (blocked.providerTurnPending && blocked.providerStopRequested) {
+			this.scheduleProviderStopReconciliation(runId);
+		}
 		this.activeRuns.get(runId)?.controller.abort(new Error(reason));
 		return blocked;
 	}
 
+	async abandonPendingProviderTurn(runId: string, confirmation: string, operatorToken: string): Promise<RunRecord> {
+		const expectedTokenHash = this.policy.providerTurnAbandonmentTokenHash;
+		if (!expectedTokenHash || sha256(operatorToken) !== expectedTokenHash) {
+			throw new Error("Provider-turn abandonment requires a valid trusted operator token.");
+		}
+		if (confirmation !== `ABANDON ${runId}`) {
+			throw new Error(`Exact confirmation required: ABANDON ${runId}`);
+		}
+		const abandoned = await this.store.abandonProviderTurn(runId);
+		return abandoned;
+	}
+
 	async closeConversation(conversationId: string): Promise<ConversationRecord> {
-		const active = (await this.store.listRuns({ statuses: ["queued", "running"], limit: 1_000 }))
-			.find((run) => run.conversationId === conversationId);
+		const active = (await this.store.listRuns({ limit: null })).find((run) => {
+			if (run.conversationId !== conversationId) return false;
+			const legacyUnresolved = run.providerTurnPending === undefined
+				&& (run.status === "cancelled" || run.status === "needs_user")
+				&& (run.submissionState === "submitting" || run.submissionState === "submitted");
+			return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+		});
 		if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
 		const conversation = await this.store.getConversation(conversationId);
 		if (conversation.closedAt) return conversation;
@@ -324,21 +365,30 @@ export class GptControlService {
 		return describeCapabilities(await this.dependencies.resolveCapabilities(this.exec));
 	}
 
-	async retryCancelledProviderStops(): Promise<{ attempted: string[]; stopped: string[]; blocked: Array<{ runId: string; reason: string }> }> {
+	async retryRequestedProviderStops(): Promise<{ attempted: string[]; stopped: string[]; blocked: Array<{ runId: string; reason: string }> }> {
 		const attempted: string[] = [];
 		const stopped: string[] = [];
 		const blocked: Array<{ runId: string; reason: string }> = [];
-		const cancelled = await this.store.listRuns({ statuses: ["cancelled"], limit: 1_000 });
-		for (const run of cancelled) {
-			if (run.submissionState !== "submitting" && run.submissionState !== "submitted") continue;
+		const pending = await this.store.listRuns({ limit: null });
+		for (const run of pending) {
+			const legacyStopRequest = run.providerTurnPending === undefined
+				&& (run.status === "cancelled" || run.status === "needs_user")
+				&& (run.submissionState === "submitting" || run.submissionState === "submitted");
+			const explicitStopRequest = run.providerTurnPending === true && run.providerStopRequested === true;
+			if (!explicitStopRequest && !legacyStopRequest) continue;
 			attempted.push(run.id);
 			try {
+				const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
 				// This is observation plus an idempotent Stop click only when the exact
 				// owned conversation still proves an active provider turn.
-				await this.stopOwnedBrowserRun(run);
-				stopped.push(run.id);
+				if (await this.stopOwnedBrowserRun(stopRun)) stopped.push(run.id);
+				else {
+					blocked.push({ runId: run.id, reason: "The exact provider turn did not prove it was inactive." });
+					this.scheduleProviderStopReconciliation(run.id);
+				}
 			} catch (error) {
 				blocked.push({ runId: run.id, reason: errorMessage(error) });
+				this.scheduleProviderStopReconciliation(run.id);
 			}
 		}
 		return { attempted, stopped, blocked };
@@ -357,10 +407,7 @@ export class GptControlService {
 			}
 			const conversation = await this.store.getConversation(run.conversationId);
 			if (conversation.policyFingerprint !== this.policy.fingerprint) {
-				await this.store.updateRun(run.id, {
-					status: "needs_user", completedAt: nowIso(),
-					error: "Trusted operator policy changed while the run was inactive; recovery refused.",
-				});
+				await this.markNeedsUser(run.id, "Trusted operator policy changed while the run was inactive; recovery refused.");
 				blocked.push(run.id);
 				continue;
 			}
@@ -384,10 +431,7 @@ export class GptControlService {
 				this.scheduleRun(run.id, true);
 				resumed.push(run.id);
 			} catch (error) {
-				await this.store.updateRun(run.id, {
-					status: "needs_user", completedAt: nowIso(),
-					error: `Durable recovery payload unavailable: ${errorMessage(error)}`,
-				});
+				await this.markNeedsUser(run.id, `Durable recovery payload unavailable: ${errorMessage(error)}`);
 				blocked.push(run.id);
 			}
 		}
@@ -501,15 +545,18 @@ export class GptControlService {
 	): Promise<RunRecord> {
 		const timestamp = nowIso();
 		const id = opaqueId("run");
-		const prompt = request.kind === "consult"
+		const promptBody = request.kind === "consult"
 			? buildReviewPrompt(request.prompt, manifest)
 			: request.kind === "subagent"
 				? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent)
 				: request.prompt;
+		const promptProofToken = opaqueId("proof");
+		const prompt = `${promptBody}\n\n[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
 		if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
 			throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
 		}
 		const promptSha256 = sha256(prompt);
+		const promptObservationSha256 = sha256(canonicalPromptObservationText(prompt));
 		const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
 		const receipt: ReviewReceipt = {
 			provider: conversation.provider,
@@ -532,7 +579,11 @@ export class GptControlService {
 			connectorIntent: request.connectorIntent,
 			status: "queued",
 			executionReady,
+			providerTurnPending: false,
+			providerStopRequested: false,
 			promptSha256,
+			promptObservationSha256,
+			promptProofToken,
 			attachmentManifest: manifest,
 			submissionState: "not_submitted",
 			requestedChatGptModel: chatgptModel,
@@ -584,8 +635,9 @@ export class GptControlService {
 			const current = await this.store.getRun(runId);
 			if (TERMINAL.has(current.status)) return current;
 			if (controller.signal.reason instanceof RestartSuspension) return current;
-			return this.store.updateRun(runId, {
+			const terminal = await this.store.updateRun(runId, {
 				status: current.submissionState === "submitting" || current.submissionState === "submitted" ? "needs_user" : "failed",
+				providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
 				completedAt: nowIso(),
 				error: errorMessage(error),
 				diagnostics: {
@@ -595,6 +647,10 @@ export class GptControlService {
 						: undefined,
 				},
 			});
+			if (terminal.providerTurnPending && terminal.providerStopRequested) {
+				this.scheduleProviderStopReconciliation(runId);
+			}
+			return terminal;
 		}).finally(() => {
 			this.activeRuns.delete(runId);
 			this.cancellationIntents.delete(runId);
@@ -609,8 +665,14 @@ export class GptControlService {
 			if (signal.aborted) throw signal.reason ?? new Error("Worker admission was cancelled.");
 			const current = await this.store.getRun(runId);
 			if (TERMINAL.has(current.status)) return false;
-			const contenders = (await this.store.listRuns({ statuses: ["queued", "running"], limit: 10_000 }))
-				.filter((run) => run.kind === "subagent")
+			const contenders = (await this.store.listRuns({ limit: null }))
+				.filter((run) => run.kind === "subagent" && (
+					run.providerTurnPending === true
+					|| run.status === "queued"
+					|| run.status === "running"
+					|| (run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled")
+						&& (run.submissionState === "submitting" || run.submissionState === "submitted"))
+				))
 				.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
 			const position = contenders.findIndex((run) => run.id === runId);
 			if (position >= 0 && position < this.policy.maxConcurrentWorkers) return true;
@@ -626,7 +688,7 @@ export class GptControlService {
 		}
 	}
 
-	private async executeRun(runId: string, signal: AbortSignal, _recovery: boolean): Promise<RunRecord> {
+	private async executeRun(runId: string, signal: AbortSignal, recovery: boolean): Promise<RunRecord> {
 		let run = await this.store.getRun(runId);
 		if (TERMINAL.has(run.status)) return run;
 		const conversation = await this.store.getConversation(run.conversationId);
@@ -641,7 +703,7 @@ export class GptControlService {
 		}
 		if (run.status === "queued") run = await this.store.updateRun(run.id, { status: "running" });
 		try {
-			const result = await this.executeProvider(conversation, run, request, signal);
+			const result = await this.executeProvider(conversation, run, request, signal, recovery);
 			if (result.terminalStatus === "needs_user") {
 				return this.finishNeedsUser(run, result.terminalReason ?? "Provider requires operator input.", result);
 			}
@@ -691,24 +753,34 @@ export class GptControlService {
 			return run;
 		} catch (error) {
 			resetCapabilityCache();
-			const current = await this.store.getRun(run.id);
+			let current = await this.store.getRun(run.id);
 			if (signal.aborted && signal.reason instanceof RestartSuspension) return current;
 			if (TERMINAL.has(current.status)) return current;
 			if (signal.aborted) {
-				return this.store.updateRun(run.id, {
+				const cancelled = await this.store.updateRun(run.id, {
 					status: "cancelled", cancellationRequestedAt: nowIso(),
+					providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
 					completedAt: nowIso(), error: "Cancelled while provider work was active.",
 				});
+				if (cancelled.providerTurnPending && cancelled.providerStopRequested) {
+					this.scheduleProviderStopReconciliation(run.id);
+				}
+				return cancelled;
 			}
 			const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
-			return this.store.updateRun(run.id, {
+			const terminal = await this.store.updateRun(run.id, {
 				status: ambiguous ? "needs_user" : "failed",
+				providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
 				error: ambiguous
 					? `Provider state may be active; no prompt was replayed: ${errorMessage(error)}`
 					: errorMessage(error),
 				completedAt: nowIso(),
 				diagnostics: ambiguous ? { ...(current.diagnostics ?? {}), terminalReason: errorMessage(error) } : current.diagnostics,
 			});
+			if (terminal.providerTurnPending && terminal.providerStopRequested) {
+				this.scheduleProviderStopReconciliation(run.id);
+			}
+			return terminal;
 		} finally {
 			const final = await this.store.getRun(run.id).catch(() => undefined);
 			if (final && TERMINAL.has(final.status)) await this.store.deleteRunRequest(run.id).catch(() => undefined);
@@ -720,12 +792,13 @@ export class GptControlService {
 		run: RunRecord,
 		request: DurableRunRequest | undefined,
 		signal: AbortSignal,
+		recovery: boolean,
 	): Promise<ProviderTurnResult> {
 		if (conversation.provider !== "browser") {
 			throw new Error(`Provider ${conversation.provider} is disabled by the hardened 0.3 broker.`);
 		}
 		const { driver, expected } = await this.resolveOwnedDriver(conversation);
-		return this.runBrowserTurn(driver, expected, conversation, run, request, signal);
+		return this.runBrowserTurn(driver, expected, conversation, run, request, signal, recovery);
 	}
 
 	private async runBrowserTurn(
@@ -735,6 +808,7 @@ export class GptControlService {
 		originalRun: RunRecord,
 		request: DurableRunRequest | undefined,
 		signal: AbortSignal,
+		recovery: boolean,
 	): Promise<ProviderTurnResult> {
 		let run = originalRun;
 		let baselineCount = run.baselineMessageCount;
@@ -798,6 +872,7 @@ export class GptControlService {
 			modelEvidenceKind = verified.modelEvidenceKind;
 			run = await this.store.updateRun(run.id, {
 				submissionState: "submitting",
+				providerTurnPending: true,
 				receipt: {
 					...run.receipt,
 					requestedModel: verified.requestedModel,
@@ -808,14 +883,76 @@ export class GptControlService {
 					modelVerifiedAt,
 				},
 			});
-			if (TERMINAL.has(run.status)) throw new Error("Run became terminal before the browser send boundary.");
+			if (TERMINAL.has(run.status)) {
+				await this.store.clearProviderTurnState(run.id);
+				throw new Error("Run became terminal before the browser send boundary.");
+			}
 			// Delete all replay-capable plaintext before crossing the browser click
 			// boundary. A crash from here onward can only observe, never resubmit.
 			await this.store.deleteRunRequest(run.id);
 			const beforeSend = await this.store.getRun(run.id);
-			if (TERMINAL.has(beforeSend.status)) throw new Error("Run became terminal before the browser send boundary.");
+			if (TERMINAL.has(beforeSend.status)) {
+				await this.store.clearProviderTurnState(run.id);
+				throw new Error("Run became terminal before the browser send boundary.");
+			}
+			const preSendObservation = await driver.observe(ready.session, signal);
 			await driver.send(ready.session, signal);
-			run = await this.store.updateRun(run.id, { submissionState: "submitted" });
+			const identityDeadline = Math.min(
+				Date.now() + 15_000,
+				Date.parse(run.deadlineAt ?? "") || Date.now() + 15_000,
+			);
+			let submittedIdentity: { id: string; url: string } | undefined;
+			let persisted: { conversation: ConversationRecord; run: RunRecord } | undefined;
+			let firstNewProviderUserMessageId: string | undefined;
+			while (Date.now() < identityDeadline) {
+				const submittedSession = await assertExactDriverSession(driver, expected, signal);
+				const observation = await driver.observe(submittedSession, signal);
+				const observedUserMessageId = observation.latestUserMessageId;
+				if (observedUserMessageId && observedUserMessageId !== preSendObservation.latestUserMessageId) {
+					if (firstNewProviderUserMessageId && firstNewProviderUserMessageId !== observedUserMessageId) {
+						return browserNeedsUser(
+							"The provider user turn changed before send-boundary identity was durable. Completion was not attributed to this run.",
+							conversation, run,
+						);
+					}
+					firstNewProviderUserMessageId = observedUserMessageId;
+					if (!this.observationProvesPrompt(run, observation)) {
+						return browserNeedsUser(
+							"The first new provider user turn did not match the broker-owned send-boundary proof. Completion was not attributed to this run.",
+							conversation, run,
+						);
+					}
+					submittedIdentity = providerConversationIdentity(submittedSession.url);
+					if (submittedIdentity) {
+						persisted = await this.persistObservedProviderTurnIdentity(conversation, run, submittedIdentity, observation);
+						if (persisted) break;
+					}
+				}
+				await abortableSleep(100, signal);
+			}
+			if (persisted) {
+				run = persisted.run;
+				conversation = persisted.conversation;
+			}
+			const providerUserMessageId = persisted?.run.providerUserMessageId;
+			run = await this.store.updateRun(run.id, {
+				submissionState: "submitted",
+				providerUserMessageId,
+				receipt: submittedIdentity && providerUserMessageId ? {
+					...run.receipt,
+					providerConversationId: submittedIdentity.id,
+					providerConversationUrl: submittedIdentity.url,
+				} : run.receipt,
+			});
+			if (submittedIdentity && providerUserMessageId) {
+				conversation = await this.persistConversationIdentity(conversation.id, submittedIdentity);
+			}
+			if (!submittedIdentity || !providerUserMessageId) {
+				return browserNeedsUser(
+					"The bounded send-boundary observation did not provide a matching provider-issued conversation and first new user-message identity. Later transcript text was not adopted.",
+					conversation, run,
+				);
+			}
 		} else if (run.submissionState === "submitting" || run.submissionState === "submitted") {
 			if (baselineCount === undefined) {
 				return browserNeedsUser(
@@ -829,6 +966,27 @@ export class GptControlService {
 					conversation, run,
 				);
 			}
+			if (recovery) {
+				const durableIdentity = run.receipt.providerConversationUrl
+					? providerConversationIdentity(run.receipt.providerConversationUrl)
+					: undefined;
+				if (!durableIdentity || !run.providerUserMessageId) {
+					return browserNeedsUser(
+						"Recovered submitted browser run has no durable provider-issued conversation and user-message identity. Transcript text was not used as identity, the page was not adopted, and the prompt was not resent.",
+						conversation, run,
+					);
+				}
+				const conversationIdentity = conversation.providerConversationUrl
+					? providerConversationIdentity(conversation.providerConversationUrl)
+					: undefined;
+				if (conversationIdentity && conversationIdentity.url !== durableIdentity.url) {
+					return browserNeedsUser(
+						"Recovered run-scoped provider conversation identity conflicts with the durable conversation record. The page was not observed and the prompt was not resent.",
+						conversation, run,
+					);
+				}
+				if (!conversationIdentity) conversation = await this.persistConversationIdentity(conversation.id, durableIdentity);
+			}
 		} else {
 			throw new Error(`Invalid browser submission state ${run.submissionState}.`);
 		}
@@ -841,9 +999,27 @@ export class GptControlService {
 			baselineCount: required(baselineCount, "assistant-turn baseline"),
 			timeoutMs: remaining,
 			conversationUrl: conversation.providerConversationUrl,
+			providerTurnIdentityPersisted: Boolean(run.providerUserMessageId && run.receipt.providerConversationUrl),
 			signal,
 			onConversationIdentity: async (identity) => {
 				await this.persistConversationIdentity(conversation.id, identity);
+			},
+			onConversationObservation: async (identity, observation) => {
+				const expectedIdentity = run.receipt.providerConversationUrl
+					? providerConversationIdentity(run.receipt.providerConversationUrl)
+					: undefined;
+				if (!expectedIdentity || expectedIdentity.url !== identity.url) return "mismatch";
+				if (observation.latestUserMessageId
+					&& observation.latestUserMessageId !== run.providerUserMessageId) return "mismatch";
+				if (!observation.latestUserMessageId
+					|| !observation.latestUserPromptProofToken
+					|| !observation.latestUserPromptSha256) return "unavailable";
+				if (!this.observationProvesPrompt(run, observation)) return "mismatch";
+				const persisted = await this.persistObservedProviderTurnIdentity(conversation, run, identity, observation);
+				if (!persisted) return "mismatch";
+				run = persisted.run;
+				conversation = persisted.conversation;
+				return "approved";
 			},
 		});
 		if (outcome.terminalStatus === "needs_user") {
@@ -853,6 +1029,7 @@ export class GptControlService {
 			});
 		}
 		const snapshot = required(outcome.snapshot, "stable final assistant turn");
+		await this.store.clearProviderTurnState(run.id);
 		await driver.setState(expected.sessionId, "completed", signal).catch(() => undefined);
 		return {
 			provider: "browser",
@@ -918,28 +1095,126 @@ export class GptControlService {
 
 	private async persistCancellation(runId: string): Promise<RunRecord> {
 		const at = nowIso();
+		const current = await this.store.getRun(runId);
+		const providerMayBeActive = current.providerTurnPending === true
+			|| current.submissionState === "submitting"
+			|| current.submissionState === "submitted";
 		return this.store.updateRun(runId, {
 			status: "cancelled",
+			providerStopRequested: providerMayBeActive ? true : current.providerStopRequested,
 			cancellationRequestedAt: at,
 			completedAt: at,
 			error: "Cancelled by caller. Late provider completion is ignored.",
 		});
 	}
 
-	private async stopOwnedBrowserRun(run: RunRecord): Promise<void> {
-		const conversation = await this.store.getConversation(run.conversationId);
-		if (conversation.provider !== "browser") return;
-		const { driver, expected } = await this.resolveOwnedDriver(conversation);
-		const session = await assertExactDriverSession(driver, expected);
-		if (conversation.providerConversationUrl) {
-			const expectedIdentity = providerConversationIdentity(conversation.providerConversationUrl);
-			const currentIdentity = providerConversationIdentity(session.url);
-			if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url) return;
+	private observationProvesRun(run: RunRecord, observation: ChatPageObservation): boolean {
+		return Boolean(run.providerUserMessageId
+			&& observation.latestUserMessageId === run.providerUserMessageId
+			&& this.observationProvesPrompt(run, observation));
+	}
+
+	private async persistObservedProviderTurnIdentity(
+		conversation: ConversationRecord,
+		run: RunRecord,
+		identity: { id: string; url: string },
+		observation: ChatPageObservation,
+	): Promise<{ conversation: ConversationRecord; run: RunRecord } | undefined> {
+		if (!observation.latestUserMessageId || !this.observationProvesPrompt(run, observation)) return undefined;
+		const expectedExistingIdentity = conversation.providerConversationUrl
+			? providerConversationIdentity(conversation.providerConversationUrl)
+			: undefined;
+		if (expectedExistingIdentity && expectedExistingIdentity.url !== identity.url) return undefined;
+		if (run.providerUserMessageId && run.providerUserMessageId !== observation.latestUserMessageId) return undefined;
+		if (run.providerUserMessageId === observation.latestUserMessageId
+			&& run.receipt.providerConversationUrl === identity.url
+			&& conversation.providerConversationUrl === identity.url) {
+			return { conversation, run };
 		}
-		const observation = await driver.observe(session);
+		const persistedRun = await this.store.updateRun(run.id, {
+			providerUserMessageId: observation.latestUserMessageId,
+			receipt: {
+				...run.receipt,
+				providerConversationId: identity.id,
+				providerConversationUrl: identity.url,
+			},
+		});
+		const persistedConversation = await this.persistConversationIdentity(conversation.id, identity);
+		return { conversation: persistedConversation, run: persistedRun };
+	}
+
+	private observationProvesPrompt(run: RunRecord, observation: ChatPageObservation): boolean {
+		return Boolean(run.promptProofToken
+			&& run.promptObservationSha256
+			&& observation.latestUserPromptProofToken === run.promptProofToken
+			&& observation.latestUserPromptSha256 === run.promptObservationSha256);
+	}
+
+	private scheduleProviderStopReconciliation(runId: string): void {
+		if (this.activeStopReconciliations.has(runId)) return;
+		const reconciliation = (async () => {
+			for (let attempt = 0; attempt < 6; attempt += 1) {
+				const run = await this.store.getRun(runId).catch(() => undefined);
+				if (!run || !run.providerTurnPending || !run.providerStopRequested) return;
+				if (await this.stopOwnedBrowserRun(run).catch(() => false)) return;
+				if (attempt < 5) await unrefSleep(Math.min(500 * 2 ** attempt, 8_000));
+			}
+		})().finally(() => {
+			this.activeStopReconciliations.delete(runId);
+		});
+		this.activeStopReconciliations.set(runId, reconciliation);
+		void reconciliation.catch(() => undefined);
+	}
+
+	private async stopOwnedBrowserRun(run: RunRecord): Promise<boolean> {
+		let conversation = await this.store.getConversation(run.conversationId);
+		if (conversation.provider !== "browser") return false;
+		const { driver, expected } = await this.resolveOwnedDriver(conversation);
+		if (!conversation.providerConversationUrl) {
+			const durableIdentity = run.receipt.providerConversationUrl
+				? providerConversationIdentity(run.receipt.providerConversationUrl)
+				: undefined;
+			if (!durableIdentity || !run.providerUserMessageId) return false;
+			conversation = await this.persistConversationIdentity(conversation.id, durableIdentity);
+		}
+		const session = await assertExactDriverSession(driver, expected);
+		const expectedIdentity = conversation.providerConversationUrl
+			? providerConversationIdentity(conversation.providerConversationUrl)
+			: undefined;
+		const currentIdentity = providerConversationIdentity(session.url);
+		if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url) return false;
+		let observation = await driver.observe(session);
+		if (!this.observationProvesRun(run, observation)) return false;
+		let stopIssued = false;
 		if (observation.answering || observation.thinking || observation.toolRunning) {
 			await driver.recover(session, "stop");
+			stopIssued = true;
 		}
+		let stableInactiveKey: string | undefined;
+		let stableInactiveReads = 0;
+		for (let attempt = 0; attempt < 10; attempt += 1) {
+			const current = await assertExactDriverSession(driver, expected);
+			observation = await driver.observe(current);
+			if (!this.observationProvesRun(run, observation)) return false;
+			const inactive = !observation.answering && !observation.thinking && !observation.toolRunning;
+			const finalTurn = observation.snapshot.count > (run.baselineMessageCount ?? Number.POSITIVE_INFINITY)
+				&& Boolean(observation.snapshot.messageId)
+				&& (observation.snapshot.hasMarkdown || observation.snapshot.imageUrls.length > 0);
+			if (inactive && (stopIssued || finalTurn)) {
+				const key = `${observation.snapshot.count}:${observation.snapshot.messageId ?? ""}:${observation.snapshot.text}:${observation.snapshot.imageUrls.join("\n")}`;
+				stableInactiveReads = key === stableInactiveKey ? stableInactiveReads + 1 : 1;
+				stableInactiveKey = key;
+				if (stableInactiveReads >= 2) {
+					await this.store.clearProviderTurnState(run.id);
+					return true;
+				}
+			} else {
+				stableInactiveKey = undefined;
+				stableInactiveReads = 0;
+			}
+			await sleep(100);
+		}
+		return false;
 	}
 
 	private async finishNeedsUser(
@@ -947,8 +1222,10 @@ export class GptControlService {
 		reason: string,
 		result?: ProviderTurnResult,
 	): Promise<RunRecord> {
-		return this.store.updateRun(run.id, {
+		const current = await this.store.getRun(run.id);
+		const terminal = await this.store.updateRun(run.id, {
 			status: "needs_user",
+			providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
 			error: reason,
 			completedAt: nowIso(),
 			diagnostics: {
@@ -972,6 +1249,10 @@ export class GptControlService {
 				completedAt: nowIso(),
 			},
 		});
+		if (terminal.providerTurnPending && terminal.providerStopRequested) {
+			this.scheduleProviderStopReconciliation(run.id);
+		}
+		return terminal;
 	}
 }
 
@@ -1075,6 +1356,7 @@ function publicPolicy(policy: OperatorPolicy): Record<string, unknown> {
 		maxPromptBytes: policy.maxPromptBytes,
 		maxConcurrentWorkers: policy.maxConcurrentWorkers,
 		activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
+		providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
 		fingerprint: policy.fingerprint,
 	};
 }
@@ -1161,6 +1443,13 @@ function errorMessage(error: unknown): string {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((done) => setTimeout(done, ms));
+}
+
+function unrefSleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref();
+	});
 }
 
 function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {

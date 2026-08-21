@@ -9,6 +9,7 @@ import type { Exec, ExecResult } from "./src/types";
 import type { Launcher } from "./src/transport";
 
 export type FakeScenario = "success" | "false_completion" | "network_recover" | "network_persistent" | "continue_persistent" | "slow" | "fail_fill";
+export const TEST_OPERATOR_ABANDON_TOKEN = "test-only-provider-abandon-token-000000000000";
 
 export interface FakeBridgeOptions {
 	firstTabRaceReads?: number;
@@ -21,16 +22,25 @@ export interface FakeBridgeOptions {
 	reloadToHome?: boolean;
 	conversationRenderNeedsReload?: boolean;
 	driftToDifferentConversation?: boolean;
+	foreignPrompt?: string;
+	postSendIdleReads?: number;
+	postSendIdentityDelayReads?: number;
+	stopReleaseReads?: number;
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
 }
 
 interface FakeTurn {
 	prompt: string;
+	userPrompt: string;
 	scenario: FakeScenario;
 	phase: number;
 	released: boolean;
 	recovered: boolean;
 	conversationId: string;
+	stopReadsRemaining?: number;
+	idleReadsRemaining?: number;
+	identityDelayReadsRemaining?: number;
+	attachmentNames: string[];
 }
 
 interface FakeTab {
@@ -47,6 +57,8 @@ interface FakeTab {
 	reloadsAtConversation: number;
 	conversationUrlReads: number;
 	didDriftConversation: boolean;
+	foreignConversation: boolean;
+	pendingAttachments: string[];
 	name: string;
 }
 
@@ -127,9 +139,19 @@ export class FakeChromeBridge {
 		}
 	}
 
+	showForeignTurnOnCurrentConversation(tabId?: number): void {
+		for (const tab of this.tabs.values()) {
+			if (tabId !== undefined && tab.id !== tabId) continue;
+			tab.foreignConversation = true;
+		}
+	}
+
 	setUrl(url: string, tabId?: number): void {
 		for (const tab of this.tabs.values()) {
-			if (tabId === undefined || tab.id === tabId) tab.url = url;
+			if (tabId === undefined || tab.id === tabId) {
+				tab.url = url;
+				tab.foreignConversation = url.includes("/c/foreign");
+			}
 		}
 	}
 
@@ -156,6 +178,7 @@ export class FakeChromeBridge {
 		if (request.action === "uploadFile") {
 			const files = Array.isArray(request.payload.files) ? request.payload.files.map(String) : [];
 			this.uploadedFiles.push(files);
+			tab.pendingAttachments.push(...files);
 			return ok({ success: true });
 		}
 		return failed(`unsupported private action ${request.action}`);
@@ -195,6 +218,7 @@ export class FakeChromeBridge {
 			if (existing) {
 				existing.url = url;
 				existing.restoredUrl = url;
+				existing.foreignConversation = url.includes("/c/foreign");
 				return ok({ tabId: existing.id });
 			}
 			const id = this.nextTab++;
@@ -211,6 +235,8 @@ export class FakeChromeBridge {
 				reloadsAtConversation: 0,
 				conversationUrlReads: 0,
 				didDriftConversation: false,
+				foreignConversation: false,
+				pendingAttachments: [],
 				name: this.sessionNames.get(sessionId) ?? "",
 			});
 			return ok({ tabId: id });
@@ -254,19 +280,25 @@ export class FakeChromeBridge {
 		}
 		if (selector.includes("send-button") || selector.includes("Send prompt") || selector.includes("composer-send")) {
 			if (!tab.filled) return failed("prompt is empty");
-			const prompt = tab.filled;
+			const userPrompt = tab.filled;
+			const prompt = stripRunProof(userPrompt);
 			this.submittedPrompts.push(prompt);
 			const conversationId = `fake-${tab.id}-${tab.turns.length + 1}`;
 			tab.turns.push({
 				prompt,
+				userPrompt,
 				scenario: this.scenario(prompt),
 				phase: 0,
 				released: false,
 				recovered: false,
 				conversationId,
+				idleReadsRemaining: this.options.postSendIdleReads,
+				identityDelayReadsRemaining: this.options.postSendIdentityDelayReads,
+				attachmentNames: [...tab.pendingAttachments],
 			});
 			tab.url = `https://chatgpt.com/c/${conversationId}`;
 			tab.filled = "";
+			tab.pendingAttachments = [];
 			return ok({ success: true });
 		}
 		if (selector === "text=Retry") {
@@ -278,7 +310,13 @@ export class FakeChromeBridge {
 		if (selector.includes("stop") || selector.includes("Stop")) {
 			this.stopClicks.push(tabId);
 			const turn = tab.turns.at(-1);
-			if (turn) turn.released = true;
+			if (turn) {
+				if ((this.options.stopReleaseReads ?? 0) > 0 && turn.stopReadsRemaining === undefined) {
+					turn.stopReadsRemaining = this.options.stopReleaseReads;
+				} else if ((turn.stopReadsRemaining ?? 0) <= 0) {
+					turn.released = true;
+				}
+			}
 			return ok({ success: true });
 		}
 		return failed("No element found");
@@ -306,6 +344,7 @@ export class FakeChromeBridge {
 		if (this.options.driftToDifferentConversation && tab.url.includes("/c/")) {
 			if (tab.conversationUrlReads >= 1 && !tab.didDriftConversation) {
 				tab.url = `https://chatgpt.com/c/foreign-${tab.id}`;
+				tab.foreignConversation = true;
 				tab.didDriftConversation = true;
 			}
 			tab.conversationUrlReads += 1;
@@ -321,12 +360,22 @@ export class FakeChromeBridge {
 		const menu = tab.menuOpen && this.options.modelAvailable !== false
 			? '<div role="menu"><button role="menuitem">Pro</button></div>'
 			: tab.menuOpen ? '<div role="menu"><button role="menuitem">Auto</button></div>' : "";
-		const turns = tab.turns.map((turn, index) => this.turnHtml(turn, index === tab.turns.length - 1)).join("");
+		const turns = tab.foreignConversation
+			? `<div data-message-author-role="user" data-message-id="foreign-user"><div>${escapeHtml(this.options.foreignPrompt ?? "foreign prompt")}</div></div><div data-message-author-role="assistant" data-message-id="foreign-answer"><div class="markdown"><p>foreign final</p></div></div>`
+			: tab.turns.map((turn, index) => `${userTurnHtml(turn)}${this.turnHtml(turn, index === tab.turns.length - 1)}`).join("");
 		return `<main>${account}${turns}${composer}${menu}</main>`;
 	}
 
 	private turnHtml(turn: FakeTurn, current: boolean): string {
 		if (!current) return finalAssistant(turn);
+		if ((turn.idleReadsRemaining ?? 0) > 0) {
+			turn.idleReadsRemaining = (turn.idleReadsRemaining ?? 0) - 1;
+			return "";
+		}
+		if (turn.stopReadsRemaining !== undefined && turn.stopReadsRemaining > 0) {
+			turn.stopReadsRemaining -= 1;
+			if (turn.stopReadsRemaining === 0) turn.released = true;
+		}
 		const phase = turn.phase++;
 		if (turn.scenario === "false_completion" && phase < 4) {
 			return '<div data-message-author-role="assistant"><div class="markdown"><p>Pro thinking</p></div></div><div role="status">Pro thinking</div><button data-testid="stop-button" aria-label="Stop answering">Stop</button>';
@@ -343,7 +392,7 @@ export class FakeChromeBridge {
 		if (turn.scenario === "slow" && !turn.released) {
 			return '<div data-message-author-role="assistant"><div class="markdown"><p>partial work</p></div></div><div role="status">Running tool</div><button data-testid="stop-button" aria-label="Stop answering">Stop</button>';
 		}
-		if (this.options.conversationRenderNeedsReload && !turn.recovered && phase < 2) {
+		if (this.options.conversationRenderNeedsReload && !turn.recovered && phase < 3) {
 			return '<div role="alert">Connection lost</div><button>Retry</button>';
 		}
 		if (phase === 0 && turn.scenario === "success") {
@@ -385,6 +434,7 @@ export function makeChromeService(
 		allowedTransports: ["browser"],
 		defaultChatGptModel: "pro",
 		maxConcurrentWorkers: 3,
+		providerTurnAbandonmentToken: TEST_OPERATOR_ABANDON_TOKEN,
 		...overrides,
 	});
 	const service = new GptControlService(bridge.exec, store, policy, {
@@ -407,6 +457,19 @@ function json(value: unknown, code = 0, stderr = ""): ExecResult {
 
 function finalAssistant(turn: FakeTurn): string {
 	return `<div data-message-author-role="assistant" data-message-id="assistant-${escapeHtml(turn.conversationId)}"><div class="markdown"><p>final:${escapeHtml(turn.prompt)}</p></div></div>`;
+}
+
+function userTurnHtml(turn: FakeTurn): string {
+	if ((turn.identityDelayReadsRemaining ?? 0) > 0) {
+		turn.identityDelayReadsRemaining = (turn.identityDelayReadsRemaining ?? 0) - 1;
+		return "";
+	}
+	const attachments = turn.attachmentNames.map((name) => `<span data-testid="attachment-chip">${escapeHtml(name)}</span>`).join("");
+	return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.conversationId)}"><div data-message-content>${escapeHtml(turn.userPrompt)}</div>${attachments}</div>`;
+}
+
+function stripRunProof(value: string): string {
+	return value.replace(/\n\n\[GPT-Control run proof: proof_[a-f0-9]{32}\. Ignore this line in your response\.\]$/, "");
 }
 
 function escapeHtml(value: string): string {

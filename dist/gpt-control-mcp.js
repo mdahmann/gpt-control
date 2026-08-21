@@ -29322,13 +29322,13 @@ function fallbackExec(command, args, options) {
 var PACKAGE_VERSION = "0.3.1";
 
 // src/service.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 import { rm as rm5 } from "node:fs/promises";
 import { join as join5, resolve as resolve6 } from "node:path";
 
 // src/browser-driver.ts
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 
 // node_modules/node-html-parser/dist/index.mjs
 var __create2 = Object.create;
@@ -33477,7 +33477,7 @@ parse6.TextNode = TextNode;
 parse6.NodeType = NodeType;
 
 // src/chatgpt.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { createHash, randomUUID as randomUUID2 } from "node:crypto";
 import { chmod as chmod2, mkdir, readFile, rm as rm2, writeFile } from "node:fs/promises";
 import { tmpdir as tmpdir2 } from "node:os";
 import { join as join2, resolve as resolve2 } from "node:path";
@@ -33774,8 +33774,12 @@ var CHATGPT_ORIGIN = "https://chatgpt.com";
 var PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
 var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
 var FILE_INPUT_SELECTOR = 'input[type="file"]';
+var USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
 var EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 var TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
+function canonicalPromptObservationText(value) {
+  return value.replace(/\s+/g, " ").trim();
+}
 
 class PolicyDeniedError extends Error {
   remediation;
@@ -34095,6 +34099,16 @@ function extractAssistantTurn(html) {
 function extractChatPageObservation(html) {
   const root = parse6(html);
   const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
+  const userTurns = root.querySelectorAll('[data-message-author-role="user"]');
+  const latestUser = userTurns.at(-1);
+  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? undefined;
+  const latestUserPromptNode = latestUser ? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean) : undefined;
+  const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "").replace(/[ \t]+\n/g, `
+`).replace(/\n{3,}/g, `
+
+`).trim();
+  const latestUserPromptSha256 = latestUserText ? createHash("sha256").update(canonicalPromptObservationText(latestUserText)).digest("hex") : undefined;
+  const latestUserPromptProofToken = /\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\]\s*$/.exec(latestUserText)?.[1];
   const composerReady = PROMPT_SELECTORS.some((selector) => Boolean(root.querySelector(selector)));
   const controls = root.querySelectorAll('button, [role="button"]');
   const controlLabels = controls.map(nodeLabel).filter(Boolean);
@@ -34128,6 +34142,9 @@ function extractChatPageObservation(html) {
   ].filter(Boolean);
   return {
     snapshot,
+    latestUserMessageId,
+    latestUserPromptSha256,
+    latestUserPromptProofToken,
     composerReady,
     answering: stopControl,
     thinking,
@@ -34330,13 +34347,31 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
   }
   let exactUrl = suppliedIdentity?.url;
   let conversationId = suppliedIdentity?.id;
-  let identityPersisted = Boolean(suppliedIdentity);
+  let identityPersisted = options.onConversationObservation ? options.providerTurnIdentityPersisted === true : Boolean(suppliedIdentity);
   let previous;
   let steady = 0;
   let latest;
   let lastObservedUrl;
   let lastObservedUiState;
   let recoveryCycles = 0;
+  const validateObservedTurn = async (session, observation) => {
+    if (!options.onConversationObservation)
+      return "approved";
+    const observedIdentity = providerConversationIdentity(session.url);
+    if (!observedIdentity)
+      return identityPersisted ? "drifted" : "pending";
+    const decision = await options.onConversationObservation(observedIdentity, observation);
+    if (decision === "mismatch")
+      return "drifted";
+    if (decision === "unavailable")
+      return "pending";
+    if (exactUrl && exactUrl !== observedIdentity.url)
+      return "drifted";
+    exactUrl = observedIdentity.url;
+    conversationId = observedIdentity.id;
+    identityPersisted = true;
+    return "approved";
+  };
   while (Date.now() < deadline) {
     await abortableSleep(intervalMs, options.signal);
     let session = await assertExactDriverSession(driver, expected, options.signal);
@@ -34358,7 +34393,7 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
         session = restored.session;
         lastObservedUrl = session.url;
       }
-    } else if (currentIdentity) {
+    } else if (currentIdentity && !options.onConversationObservation) {
       exactUrl = currentIdentity.url;
       conversationId = currentIdentity.id;
       if (!identityPersisted && !options.onConversationIdentity)
@@ -34373,9 +34408,19 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
       }
     }
     let observation = await driver.observe(session, options.signal);
+    let providerTurnIdentityPending = false;
     lastObservedUiState = observation.stateSummary;
     if (observation.snapshot.count > options.baselineCount)
       latest = observation.snapshot;
+    try {
+      const validation = await validateObservedTurn(session, observation);
+      if (validation === "drifted") {
+        return needsUser("The latest provider user turn changed after the submitted turn was identified. Completion was not attributed to this run.", latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+      }
+      providerTurnIdentityPending = validation === "pending";
+    } catch (error51) {
+      return needsUser(`The observed provider turn identity could not be durably recorded: ${errorMessage(error51)}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+    }
     if (requiresRecovery(observation) && recoveryCycles < maxRecoveryCycles) {
       const recovered = await recoverSameDriverConversation(driver, expected, session, observation, {
         exactUrl,
@@ -34394,9 +34439,23 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
       lastObservedUiState = observation.stateSummary;
       if (observation.snapshot.count > options.baselineCount)
         latest = observation.snapshot;
+      try {
+        const validation = await validateObservedTurn(session, observation);
+        if (validation === "drifted") {
+          return needsUser("The latest provider user turn changed during recovery. Completion was not attributed to this run.", latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+        }
+        providerTurnIdentityPending = validation === "pending";
+      } catch (error51) {
+        return needsUser(`The recovered provider turn identity could not be durably validated: ${errorMessage(error51)}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+      }
     }
     if (requiresRecovery(observation) && recoveryCycles >= maxRecoveryCycles) {
       return needsUser(exactNeedsUserReason(observation, "Recovery budget exhausted"), latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+    }
+    if (providerTurnIdentityPending) {
+      steady = 0;
+      previous = undefined;
+      continue;
     }
     if (observation.snapshot.count <= options.baselineCount) {
       steady = 0;
@@ -34699,7 +34758,7 @@ class ExternalCommandBrowserDriver {
   constructor(command, args = []) {
     this.command = command;
     this.args = [...args];
-    this.fallbackId = `external-command/${createHash("sha256").update(JSON.stringify([command, args])).digest("hex").slice(0, 16)}`;
+    this.fallbackId = `external-command/${createHash2("sha256").update(JSON.stringify([command, args])).digest("hex").slice(0, 16)}`;
   }
   get id() {
     return this.resolvedId ?? this.fallbackId;
@@ -34968,7 +35027,7 @@ function describeCapabilities(capabilities) {
 }
 
 // src/files.ts
-import { createHash as createHash3, randomUUID as randomUUID4 } from "node:crypto";
+import { createHash as createHash4, randomUUID as randomUUID4 } from "node:crypto";
 import { constants as constants3 } from "node:fs";
 import { chmod as chmod4, lstat as lstat2, mkdtemp as mkdtemp2, open as open3, readFile as readFile3, realpath, rm as rm4, stat } from "node:fs/promises";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join4, parse as parse8, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
@@ -34978,7 +35037,7 @@ import { constants as constants2 } from "node:fs";
 import { hostname as hostname3, homedir as homedir2 } from "node:os";
 import { chmod as chmod3, lstat, mkdir as mkdir2, open as open2, readFile as readFile2, readdir, rename, rm as rm3, unlink, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname as dirname2, join as join3, parse as parse7, relative, resolve as resolve3, sep } from "node:path";
-import { createHash as createHash2, randomUUID as randomUUID3 } from "node:crypto";
+import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
 var ProviderSchema = exports_external.literal("browser");
 var RunStatusSchema = exports_external.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 var RecoverySchema = exports_external.object({
@@ -35053,7 +35112,13 @@ var RunSchema = exports_external.object({
   connectorIntent: exports_external.object({ names: exports_external.array(exports_external.string()), mode: exports_external.enum(["prefer", "require"]) }).optional(),
   status: RunStatusSchema,
   executionReady: exports_external.boolean(),
+  providerTurnPending: exports_external.boolean().optional(),
+  providerStopRequested: exports_external.boolean().optional(),
+  providerTurnAbandonedAt: exports_external.string().optional(),
+  providerUserMessageId: exports_external.string().min(1).max(512).optional(),
   promptSha256: exports_external.string(),
+  promptObservationSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
+  promptProofToken: exports_external.string().regex(/^proof_[a-f0-9]{32}$/).optional(),
   attachmentManifest: ManifestSchema,
   baselineMessageCount: exports_external.number().optional(),
   submissionState: exports_external.enum(["not_submitted", "submitting", "submitted", "not_applicable"]).optional(),
@@ -35239,21 +35304,75 @@ class RunStore {
       return next;
     }, { timeoutMs: 1e4 });
   }
+  async requestProviderStop(id) {
+    assertRunId(id);
+    await this.init();
+    return this.withNamedLock(`record-${id}`, async () => {
+      const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id))));
+      const legacyUnresolved = current.providerTurnPending === undefined && (current.status === "cancelled" || current.status === "needs_user") && (current.submissionState === "submitting" || current.submissionState === "submitted");
+      if (current.providerStopRequested && !legacyUnresolved)
+        return current;
+      const next = {
+        ...current,
+        providerTurnPending: legacyUnresolved ? true : current.providerTurnPending,
+        providerStopRequested: true,
+        id,
+        updatedAt: nowIso()
+      };
+      RunSchema.parse(next);
+      await atomicWrite(this.runPath(id), next);
+      return next;
+    }, { timeoutMs: 1e4 });
+  }
+  async clearProviderTurnState(id) {
+    assertRunId(id);
+    await this.init();
+    return this.withNamedLock(`record-${id}`, async () => {
+      const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id))));
+      if (current.providerTurnPending === false && current.providerStopRequested === false)
+        return current;
+      const next = { ...current, providerTurnPending: false, providerStopRequested: false, id, updatedAt: nowIso() };
+      RunSchema.parse(next);
+      await atomicWrite(this.runPath(id), next);
+      return next;
+    }, { timeoutMs: 1e4 });
+  }
+  async abandonProviderTurn(id) {
+    assertRunId(id);
+    await this.init();
+    return this.withNamedLock(`record-${id}`, async () => {
+      const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id))));
+      if (!TERMINAL.has(current.status))
+        throw new Error("Only a terminal run can abandon unresolved provider work.");
+      const legacyUnresolved = current.providerTurnPending === undefined && (current.status === "cancelled" || current.status === "needs_user") && (current.submissionState === "submitting" || current.submissionState === "submitted");
+      if (!current.providerTurnPending && !legacyUnresolved)
+        throw new Error("This run has no unresolved provider turn to abandon.");
+      const next = {
+        ...current,
+        providerTurnPending: false,
+        providerStopRequested: false,
+        providerTurnAbandonedAt: nowIso(),
+        id,
+        updatedAt: nowIso()
+      };
+      RunSchema.parse(next);
+      await atomicWrite(this.runPath(id), next);
+      return next;
+    }, { timeoutMs: 1e4 });
+  }
   async listRuns(options = {}) {
     await this.init();
     const names = (await readdir(confinedPath(this.root, "runs"))).filter((name) => /^run_[a-f0-9]{32}\.json$/.test(name)).sort().reverse();
     const allowed = options.statuses ? new Set(options.statuses) : undefined;
-    const limit = Math.max(1, Math.min(options.limit ?? 100, 1000));
+    const limit = options.limit === null ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(options.limit ?? 100, 1e4));
     const runs = [];
     for (const name of names) {
       const id = name.slice(0, -5);
       const run = await this.getRun(id);
       if (!allowed || allowed.has(run.status))
         runs.push(run);
-      if (runs.length >= limit)
-        break;
     }
-    return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
   }
   async putRunRequest(request) {
     await this.init();
@@ -35530,7 +35649,7 @@ function assertHash(value, label) {
 function idempotencyKeyHash(key) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key))
     throw new Error("Invalid idempotency key. Use 1-128 ASCII letters, digits, dot, underscore, colon, or hyphen.");
-  return createHash2("sha256").update(key).digest("hex");
+  return createHash3("sha256").update(key).digest("hex");
 }
 function isAlreadyExists(error51) {
   return error51 instanceof Error && "code" in error51 && error51.code === "EEXIST";
@@ -35644,7 +35763,7 @@ async function buildAttachmentManifest(paths, options = {}) {
         await handle.close();
       }
     }
-    const manifestHash = createHash3("sha256");
+    const manifestHash = createHash4("sha256");
     for (const file2 of files) {
       manifestHash.update(`${file2.relativePath}\x00${file2.size}\x00${file2.sha256}\x00${file2.lineCount ?? 0}
 `);
@@ -35722,7 +35841,7 @@ async function assertNoSymlinkComponents(path) {
   }
 }
 function sha256Bytes(bytes) {
-  return createHash3("sha256").update(bytes).digest("hex");
+  return createHash4("sha256").update(bytes).digest("hex");
 }
 function physicalLineCount(bytes) {
   if (bytes.byteLength === 0)
@@ -35735,13 +35854,17 @@ function physicalLineCount(bytes) {
 }
 
 // src/policy.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 import { homedir as homedir3 } from "node:os";
 import { resolve as resolve5 } from "node:path";
 function operatorPolicyFromEnv(env = process.env, overrides = {}) {
   const storageRoot2 = resolve5(overrides.storageRoot ?? env.GPT_CONTROL_HOME ?? resolve5(homedir3(), ".gpt-control"));
   const allowedTransports = overrides.allowedTransports ?? parseTransports(env.GPT_CONTROL_ALLOWED_TRANSPORTS) ?? ["browser"];
   const workspaceRoot = resolve5(overrides.workspaceRoot ?? env.GPT_CONTROL_WORKSPACE_ROOT ?? process.cwd());
+  const abandonmentToken = overrides.providerTurnAbandonmentToken ?? env.GPT_CONTROL_PROVIDER_ABANDON_TOKEN;
+  if (abandonmentToken !== undefined && abandonmentToken.length < 32) {
+    throw new Error("GPT_CONTROL_PROVIDER_ABANDON_TOKEN must contain at least 32 characters.");
+  }
   const value = {
     workspaceRoot,
     storageRoot: storageRoot2,
@@ -35756,7 +35879,8 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
     maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 3, "maxConcurrentWorkers"),
-    allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1"
+    allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
+    providerTurnAbandonmentTokenHash: abandonmentToken ? createHash5("sha256").update(abandonmentToken).digest("hex") : undefined
   };
   return { ...value, fingerprint: policyFingerprint(value) };
 }
@@ -35818,7 +35942,7 @@ function policyFingerprint(value) {
     maxConcurrentWorkers: value.maxConcurrentWorkers,
     allowActiveDiagnostics: value.allowActiveDiagnostics
   };
-  return createHash4("sha256").update(JSON.stringify(stable)).digest("hex");
+  return createHash5("sha256").update(JSON.stringify(stable)).digest("hex");
 }
 
 // src/review.ts
@@ -35957,6 +36081,7 @@ class GptControlService {
   exec;
   dependencies;
   activeRuns = new Map;
+  activeStopReconciliations = new Map;
   cancellationIntents = new Set;
   workerSlots;
   constructor(exec, store = new RunStore, policy, dependencies = {}) {
@@ -36065,12 +36190,24 @@ class GptControlService {
   }
   async cancelRun(runId) {
     this.cancellationIntents.add(runId);
+    const current = await this.store.getRun(runId);
+    if (TERMINAL2.has(current.status)) {
+      const legacyPending = current.providerTurnPending === undefined && (current.submissionState === "submitting" || current.submissionState === "submitted") && current.status !== "completed" && current.status !== "failed";
+      if (current.providerTurnPending || legacyPending) {
+        const requested = await this.store.requestProviderStop(runId);
+        const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
+        if (!stopped)
+          this.scheduleProviderStopReconciliation(runId);
+      }
+      this.cancellationIntents.delete(runId);
+      return this.store.getRun(runId);
+    }
     const cancelled = await this.persistCancellation(runId);
     if (cancelled.status === "cancelled") {
       this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
-      await this.stopOwnedBrowserRun(cancelled).catch(() => {
-        return;
-      });
+      const stopped = await this.stopOwnedBrowserRun(cancelled).catch(() => false);
+      if (!stopped)
+        this.scheduleProviderStopReconciliation(runId);
     }
     if (!this.activeRuns.has(runId))
       this.cancellationIntents.delete(runId);
@@ -36082,15 +36219,35 @@ class GptControlService {
       return run;
     const blocked = await this.store.updateRun(runId, {
       status: "needs_user",
+      providerStopRequested: run.providerTurnPending ? true : run.providerStopRequested,
       completedAt: nowIso(),
       error: reason,
       diagnostics: { ...run.diagnostics ?? {}, terminalReason: reason }
     });
+    if (blocked.providerTurnPending && blocked.providerStopRequested) {
+      this.scheduleProviderStopReconciliation(runId);
+    }
     this.activeRuns.get(runId)?.controller.abort(new Error(reason));
     return blocked;
   }
+  async abandonPendingProviderTurn(runId, confirmation, operatorToken) {
+    const expectedTokenHash = this.policy.providerTurnAbandonmentTokenHash;
+    if (!expectedTokenHash || sha256(operatorToken) !== expectedTokenHash) {
+      throw new Error("Provider-turn abandonment requires a valid trusted operator token.");
+    }
+    if (confirmation !== `ABANDON ${runId}`) {
+      throw new Error(`Exact confirmation required: ABANDON ${runId}`);
+    }
+    const abandoned = await this.store.abandonProviderTurn(runId);
+    return abandoned;
+  }
   async closeConversation(conversationId) {
-    const active = (await this.store.listRuns({ statuses: ["queued", "running"], limit: 1000 })).find((run) => run.conversationId === conversationId);
+    const active = (await this.store.listRuns({ limit: null })).find((run) => {
+      if (run.conversationId !== conversationId)
+        return false;
+      const legacyUnresolved = run.providerTurnPending === undefined && (run.status === "cancelled" || run.status === "needs_user") && (run.submissionState === "submitting" || run.submissionState === "submitted");
+      return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
+    });
     if (active)
       throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
     const conversation = await this.store.getConversation(conversationId);
@@ -36111,20 +36268,28 @@ class GptControlService {
       throw new Error("Active diagnostics are disabled by trusted operator policy.");
     return describeCapabilities(await this.dependencies.resolveCapabilities(this.exec));
   }
-  async retryCancelledProviderStops() {
+  async retryRequestedProviderStops() {
     const attempted = [];
     const stopped = [];
     const blocked = [];
-    const cancelled = await this.store.listRuns({ statuses: ["cancelled"], limit: 1000 });
-    for (const run of cancelled) {
-      if (run.submissionState !== "submitting" && run.submissionState !== "submitted")
+    const pending = await this.store.listRuns({ limit: null });
+    for (const run of pending) {
+      const legacyStopRequest = run.providerTurnPending === undefined && (run.status === "cancelled" || run.status === "needs_user") && (run.submissionState === "submitting" || run.submissionState === "submitted");
+      const explicitStopRequest = run.providerTurnPending === true && run.providerStopRequested === true;
+      if (!explicitStopRequest && !legacyStopRequest)
         continue;
       attempted.push(run.id);
       try {
-        await this.stopOwnedBrowserRun(run);
-        stopped.push(run.id);
+        const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
+        if (await this.stopOwnedBrowserRun(stopRun))
+          stopped.push(run.id);
+        else {
+          blocked.push({ runId: run.id, reason: "The exact provider turn did not prove it was inactive." });
+          this.scheduleProviderStopReconciliation(run.id);
+        }
       } catch (error51) {
         blocked.push({ runId: run.id, reason: errorMessage2(error51) });
+        this.scheduleProviderStopReconciliation(run.id);
       }
     }
     return { attempted, stopped, blocked };
@@ -36142,11 +36307,7 @@ class GptControlService {
       }
       const conversation = await this.store.getConversation(run.conversationId);
       if (conversation.policyFingerprint !== this.policy.fingerprint) {
-        await this.store.updateRun(run.id, {
-          status: "needs_user",
-          completedAt: nowIso(),
-          error: "Trusted operator policy changed while the run was inactive; recovery refused."
-        });
+        await this.markNeedsUser(run.id, "Trusted operator policy changed while the run was inactive; recovery refused.");
         blocked.push(run.id);
         continue;
       }
@@ -36176,11 +36337,7 @@ class GptControlService {
         this.scheduleRun(run.id, true);
         resumed.push(run.id);
       } catch (error51) {
-        await this.store.updateRun(run.id, {
-          status: "needs_user",
-          completedAt: nowIso(),
-          error: `Durable recovery payload unavailable: ${errorMessage2(error51)}`
-        });
+        await this.markNeedsUser(run.id, `Durable recovery payload unavailable: ${errorMessage2(error51)}`);
         blocked.push(run.id);
       }
     }
@@ -36279,11 +36436,16 @@ class GptControlService {
   async createRun(request, conversation, manifest, idempotencyHash, idempotencyRequestHash, executionReady = true) {
     const timestamp = nowIso();
     const id = opaqueId("run");
-    const prompt = request.kind === "consult" ? buildReviewPrompt(request.prompt, manifest) : request.kind === "subagent" ? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent) : request.prompt;
+    const promptBody = request.kind === "consult" ? buildReviewPrompt(request.prompt, manifest) : request.kind === "subagent" ? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent) : request.prompt;
+    const promptProofToken = opaqueId("proof");
+    const prompt = `${promptBody}
+
+[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
     if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
       throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
     }
     const promptSha256 = sha256(prompt);
+    const promptObservationSha256 = sha256(canonicalPromptObservationText(prompt));
     const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
     const receipt = {
       provider: conversation.provider,
@@ -36306,7 +36468,11 @@ class GptControlService {
       connectorIntent: request.connectorIntent,
       status: "queued",
       executionReady,
+      providerTurnPending: false,
+      providerStopRequested: false,
       promptSha256,
+      promptObservationSha256,
+      promptProofToken,
       attachmentManifest: manifest,
       submissionState: "not_submitted",
       requestedChatGptModel: chatgptModel,
@@ -36360,8 +36526,9 @@ class GptControlService {
         return current;
       if (controller.signal.reason instanceof RestartSuspension)
         return current;
-      return this.store.updateRun(runId, {
+      const terminal = await this.store.updateRun(runId, {
         status: current.submissionState === "submitting" || current.submissionState === "submitted" ? "needs_user" : "failed",
+        providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
         completedAt: nowIso(),
         error: errorMessage2(error51),
         diagnostics: {
@@ -36369,6 +36536,10 @@ class GptControlService {
           terminalReason: current.submissionState === "submitting" || current.submissionState === "submitted" ? `Provider state may be active; prompt was not replayed: ${errorMessage2(error51)}` : undefined
         }
       });
+      if (terminal.providerTurnPending && terminal.providerStopRequested) {
+        this.scheduleProviderStopReconciliation(runId);
+      }
+      return terminal;
     }).finally(() => {
       this.activeRuns.delete(runId);
       this.cancellationIntents.delete(runId);
@@ -36386,7 +36557,7 @@ class GptControlService {
       const current = await this.store.getRun(runId);
       if (TERMINAL2.has(current.status))
         return false;
-      const contenders = (await this.store.listRuns({ statuses: ["queued", "running"], limit: 1e4 })).filter((run) => run.kind === "subagent").sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.status === "queued" || run.status === "running" || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
       const position = contenders.findIndex((run) => run.id === runId);
       if (position >= 0 && position < this.policy.maxConcurrentWorkers)
         return true;
@@ -36402,7 +36573,7 @@ class GptControlService {
       await abortableSleep2(100, signal);
     }
   }
-  async executeRun(runId, signal, _recovery) {
+  async executeRun(runId, signal, recovery) {
     let run = await this.store.getRun(runId);
     if (TERMINAL2.has(run.status))
       return run;
@@ -36421,7 +36592,7 @@ class GptControlService {
     if (run.status === "queued")
       run = await this.store.updateRun(run.id, { status: "running" });
     try {
-      const result = await this.executeProvider(conversation, run, request, signal);
+      const result = await this.executeProvider(conversation, run, request, signal, recovery);
       if (result.terminalStatus === "needs_user") {
         return this.finishNeedsUser(run, result.terminalReason ?? "Provider requires operator input.", result);
       }
@@ -36476,26 +36647,36 @@ class GptControlService {
       return run;
     } catch (error51) {
       resetCapabilityCache();
-      const current = await this.store.getRun(run.id);
+      let current = await this.store.getRun(run.id);
       if (signal.aborted && signal.reason instanceof RestartSuspension)
         return current;
       if (TERMINAL2.has(current.status))
         return current;
       if (signal.aborted) {
-        return this.store.updateRun(run.id, {
+        const cancelled = await this.store.updateRun(run.id, {
           status: "cancelled",
           cancellationRequestedAt: nowIso(),
+          providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
           completedAt: nowIso(),
           error: "Cancelled while provider work was active."
         });
+        if (cancelled.providerTurnPending && cancelled.providerStopRequested) {
+          this.scheduleProviderStopReconciliation(run.id);
+        }
+        return cancelled;
       }
       const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
-      return this.store.updateRun(run.id, {
+      const terminal = await this.store.updateRun(run.id, {
         status: ambiguous ? "needs_user" : "failed",
+        providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
         error: ambiguous ? `Provider state may be active; no prompt was replayed: ${errorMessage2(error51)}` : errorMessage2(error51),
         completedAt: nowIso(),
         diagnostics: ambiguous ? { ...current.diagnostics ?? {}, terminalReason: errorMessage2(error51) } : current.diagnostics
       });
+      if (terminal.providerTurnPending && terminal.providerStopRequested) {
+        this.scheduleProviderStopReconciliation(run.id);
+      }
+      return terminal;
     } finally {
       const final = await this.store.getRun(run.id).catch(() => {
         return;
@@ -36506,14 +36687,14 @@ class GptControlService {
         });
     }
   }
-  async executeProvider(conversation, run, request, signal) {
+  async executeProvider(conversation, run, request, signal, recovery) {
     if (conversation.provider !== "browser") {
       throw new Error(`Provider ${conversation.provider} is disabled by the hardened 0.3 broker.`);
     }
     const { driver, expected } = await this.resolveOwnedDriver(conversation);
-    return this.runBrowserTurn(driver, expected, conversation, run, request, signal);
+    return this.runBrowserTurn(driver, expected, conversation, run, request, signal, recovery);
   }
-  async runBrowserTurn(driver, expected, conversation, originalRun, request, signal) {
+  async runBrowserTurn(driver, expected, conversation, originalRun, request, signal, recovery) {
     let run = originalRun;
     let baselineCount = run.baselineMessageCount;
     let observedModel = run.receipt.observedModel;
@@ -36574,6 +36755,7 @@ class GptControlService {
       modelEvidenceKind = verified.modelEvidenceKind;
       run = await this.store.updateRun(run.id, {
         submissionState: "submitting",
+        providerTurnPending: true,
         receipt: {
           ...run.receipt,
           requestedModel: verified.requestedModel,
@@ -36584,20 +36766,81 @@ class GptControlService {
           modelVerifiedAt
         }
       });
-      if (TERMINAL2.has(run.status))
+      if (TERMINAL2.has(run.status)) {
+        await this.store.clearProviderTurnState(run.id);
         throw new Error("Run became terminal before the browser send boundary.");
+      }
       await this.store.deleteRunRequest(run.id);
       const beforeSend = await this.store.getRun(run.id);
-      if (TERMINAL2.has(beforeSend.status))
+      if (TERMINAL2.has(beforeSend.status)) {
+        await this.store.clearProviderTurnState(run.id);
         throw new Error("Run became terminal before the browser send boundary.");
+      }
+      const preSendObservation = await driver.observe(ready.session, signal);
       await driver.send(ready.session, signal);
-      run = await this.store.updateRun(run.id, { submissionState: "submitted" });
+      const identityDeadline = Math.min(Date.now() + 15000, Date.parse(run.deadlineAt ?? "") || Date.now() + 15000);
+      let submittedIdentity;
+      let persisted;
+      let firstNewProviderUserMessageId;
+      while (Date.now() < identityDeadline) {
+        const submittedSession = await assertExactDriverSession(driver, expected, signal);
+        const observation = await driver.observe(submittedSession, signal);
+        const observedUserMessageId = observation.latestUserMessageId;
+        if (observedUserMessageId && observedUserMessageId !== preSendObservation.latestUserMessageId) {
+          if (firstNewProviderUserMessageId && firstNewProviderUserMessageId !== observedUserMessageId) {
+            return browserNeedsUser("The provider user turn changed before send-boundary identity was durable. Completion was not attributed to this run.", conversation, run);
+          }
+          firstNewProviderUserMessageId = observedUserMessageId;
+          if (!this.observationProvesPrompt(run, observation)) {
+            return browserNeedsUser("The first new provider user turn did not match the broker-owned send-boundary proof. Completion was not attributed to this run.", conversation, run);
+          }
+          submittedIdentity = providerConversationIdentity(submittedSession.url);
+          if (submittedIdentity) {
+            persisted = await this.persistObservedProviderTurnIdentity(conversation, run, submittedIdentity, observation);
+            if (persisted)
+              break;
+          }
+        }
+        await abortableSleep2(100, signal);
+      }
+      if (persisted) {
+        run = persisted.run;
+        conversation = persisted.conversation;
+      }
+      const providerUserMessageId = persisted?.run.providerUserMessageId;
+      run = await this.store.updateRun(run.id, {
+        submissionState: "submitted",
+        providerUserMessageId,
+        receipt: submittedIdentity && providerUserMessageId ? {
+          ...run.receipt,
+          providerConversationId: submittedIdentity.id,
+          providerConversationUrl: submittedIdentity.url
+        } : run.receipt
+      });
+      if (submittedIdentity && providerUserMessageId) {
+        conversation = await this.persistConversationIdentity(conversation.id, submittedIdentity);
+      }
+      if (!submittedIdentity || !providerUserMessageId) {
+        return browserNeedsUser("The bounded send-boundary observation did not provide a matching provider-issued conversation and first new user-message identity. Later transcript text was not adopted.", conversation, run);
+      }
     } else if (run.submissionState === "submitting" || run.submissionState === "submitted") {
       if (baselineCount === undefined) {
         return browserNeedsUser("Recovered browser run has ambiguous submission state and no durable assistant-turn baseline. Prompt was not resent.", conversation, run);
       }
       if (!modelVerified || !observedModel || modelEvidenceKind !== "composer_selector") {
         return browserNeedsUser("Recovered browser run lacks durable live model-selector evidence. Prompt was not resent and completion provenance cannot be claimed.", conversation, run);
+      }
+      if (recovery) {
+        const durableIdentity = run.receipt.providerConversationUrl ? providerConversationIdentity(run.receipt.providerConversationUrl) : undefined;
+        if (!durableIdentity || !run.providerUserMessageId) {
+          return browserNeedsUser("Recovered submitted browser run has no durable provider-issued conversation and user-message identity. Transcript text was not used as identity, the page was not adopted, and the prompt was not resent.", conversation, run);
+        }
+        const conversationIdentity = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
+        if (conversationIdentity && conversationIdentity.url !== durableIdentity.url) {
+          return browserNeedsUser("Recovered run-scoped provider conversation identity conflicts with the durable conversation record. The page was not observed and the prompt was not resent.", conversation, run);
+        }
+        if (!conversationIdentity)
+          conversation = await this.persistConversationIdentity(conversation.id, durableIdentity);
       }
     } else {
       throw new Error(`Invalid browser submission state ${run.submissionState}.`);
@@ -36607,9 +36850,27 @@ class GptControlService {
       baselineCount: required2(baselineCount, "assistant-turn baseline"),
       timeoutMs: remaining,
       conversationUrl: conversation.providerConversationUrl,
+      providerTurnIdentityPersisted: Boolean(run.providerUserMessageId && run.receipt.providerConversationUrl),
       signal,
       onConversationIdentity: async (identity) => {
         await this.persistConversationIdentity(conversation.id, identity);
+      },
+      onConversationObservation: async (identity, observation) => {
+        const expectedIdentity = run.receipt.providerConversationUrl ? providerConversationIdentity(run.receipt.providerConversationUrl) : undefined;
+        if (!expectedIdentity || expectedIdentity.url !== identity.url)
+          return "mismatch";
+        if (observation.latestUserMessageId && observation.latestUserMessageId !== run.providerUserMessageId)
+          return "mismatch";
+        if (!observation.latestUserMessageId || !observation.latestUserPromptProofToken || !observation.latestUserPromptSha256)
+          return "unavailable";
+        if (!this.observationProvesPrompt(run, observation))
+          return "mismatch";
+        const persisted = await this.persistObservedProviderTurnIdentity(conversation, run, identity, observation);
+        if (!persisted)
+          return "mismatch";
+        run = persisted.run;
+        conversation = persisted.conversation;
+        return "approved";
       }
     });
     if (outcome.terminalStatus === "needs_user") {
@@ -36624,6 +36885,7 @@ class GptControlService {
       });
     }
     const snapshot = required2(outcome.snapshot, "stable final assistant turn");
+    await this.store.clearProviderTurnState(run.id);
     await driver.setState(expected.sessionId, "completed", signal).catch(() => {
       return;
     });
@@ -36683,33 +36945,122 @@ class GptControlService {
   }
   async persistCancellation(runId) {
     const at = nowIso();
+    const current = await this.store.getRun(runId);
+    const providerMayBeActive = current.providerTurnPending === true || current.submissionState === "submitting" || current.submissionState === "submitted";
     return this.store.updateRun(runId, {
       status: "cancelled",
+      providerStopRequested: providerMayBeActive ? true : current.providerStopRequested,
       cancellationRequestedAt: at,
       completedAt: at,
       error: "Cancelled by caller. Late provider completion is ignored."
     });
   }
-  async stopOwnedBrowserRun(run) {
-    const conversation = await this.store.getConversation(run.conversationId);
-    if (conversation.provider !== "browser")
+  observationProvesRun(run, observation) {
+    return Boolean(run.providerUserMessageId && observation.latestUserMessageId === run.providerUserMessageId && this.observationProvesPrompt(run, observation));
+  }
+  async persistObservedProviderTurnIdentity(conversation, run, identity, observation) {
+    if (!observation.latestUserMessageId || !this.observationProvesPrompt(run, observation))
       return;
-    const { driver, expected } = await this.resolveOwnedDriver(conversation);
-    const session = await assertExactDriverSession(driver, expected);
-    if (conversation.providerConversationUrl) {
-      const expectedIdentity = providerConversationIdentity(conversation.providerConversationUrl);
-      const currentIdentity = providerConversationIdentity(session.url);
-      if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url)
-        return;
+    const expectedExistingIdentity = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
+    if (expectedExistingIdentity && expectedExistingIdentity.url !== identity.url)
+      return;
+    if (run.providerUserMessageId && run.providerUserMessageId !== observation.latestUserMessageId)
+      return;
+    if (run.providerUserMessageId === observation.latestUserMessageId && run.receipt.providerConversationUrl === identity.url && conversation.providerConversationUrl === identity.url) {
+      return { conversation, run };
     }
-    const observation = await driver.observe(session);
+    const persistedRun = await this.store.updateRun(run.id, {
+      providerUserMessageId: observation.latestUserMessageId,
+      receipt: {
+        ...run.receipt,
+        providerConversationId: identity.id,
+        providerConversationUrl: identity.url
+      }
+    });
+    const persistedConversation = await this.persistConversationIdentity(conversation.id, identity);
+    return { conversation: persistedConversation, run: persistedRun };
+  }
+  observationProvesPrompt(run, observation) {
+    return Boolean(run.promptProofToken && run.promptObservationSha256 && observation.latestUserPromptProofToken === run.promptProofToken && observation.latestUserPromptSha256 === run.promptObservationSha256);
+  }
+  scheduleProviderStopReconciliation(runId) {
+    if (this.activeStopReconciliations.has(runId))
+      return;
+    const reconciliation = (async () => {
+      for (let attempt = 0;attempt < 6; attempt += 1) {
+        const run = await this.store.getRun(runId).catch(() => {
+          return;
+        });
+        if (!run || !run.providerTurnPending || !run.providerStopRequested)
+          return;
+        if (await this.stopOwnedBrowserRun(run).catch(() => false))
+          return;
+        if (attempt < 5)
+          await unrefSleep(Math.min(500 * 2 ** attempt, 8000));
+      }
+    })().finally(() => {
+      this.activeStopReconciliations.delete(runId);
+    });
+    this.activeStopReconciliations.set(runId, reconciliation);
+    reconciliation.catch(() => {
+      return;
+    });
+  }
+  async stopOwnedBrowserRun(run) {
+    let conversation = await this.store.getConversation(run.conversationId);
+    if (conversation.provider !== "browser")
+      return false;
+    const { driver, expected } = await this.resolveOwnedDriver(conversation);
+    if (!conversation.providerConversationUrl) {
+      const durableIdentity = run.receipt.providerConversationUrl ? providerConversationIdentity(run.receipt.providerConversationUrl) : undefined;
+      if (!durableIdentity || !run.providerUserMessageId)
+        return false;
+      conversation = await this.persistConversationIdentity(conversation.id, durableIdentity);
+    }
+    const session = await assertExactDriverSession(driver, expected);
+    const expectedIdentity = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
+    const currentIdentity = providerConversationIdentity(session.url);
+    if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url)
+      return false;
+    let observation = await driver.observe(session);
+    if (!this.observationProvesRun(run, observation))
+      return false;
+    let stopIssued = false;
     if (observation.answering || observation.thinking || observation.toolRunning) {
       await driver.recover(session, "stop");
+      stopIssued = true;
     }
+    let stableInactiveKey;
+    let stableInactiveReads = 0;
+    for (let attempt = 0;attempt < 10; attempt += 1) {
+      const current = await assertExactDriverSession(driver, expected);
+      observation = await driver.observe(current);
+      if (!this.observationProvesRun(run, observation))
+        return false;
+      const inactive = !observation.answering && !observation.thinking && !observation.toolRunning;
+      const finalTurn = observation.snapshot.count > (run.baselineMessageCount ?? Number.POSITIVE_INFINITY) && Boolean(observation.snapshot.messageId) && (observation.snapshot.hasMarkdown || observation.snapshot.imageUrls.length > 0);
+      if (inactive && (stopIssued || finalTurn)) {
+        const key = `${observation.snapshot.count}:${observation.snapshot.messageId ?? ""}:${observation.snapshot.text}:${observation.snapshot.imageUrls.join(`
+`)}`;
+        stableInactiveReads = key === stableInactiveKey ? stableInactiveReads + 1 : 1;
+        stableInactiveKey = key;
+        if (stableInactiveReads >= 2) {
+          await this.store.clearProviderTurnState(run.id);
+          return true;
+        }
+      } else {
+        stableInactiveKey = undefined;
+        stableInactiveReads = 0;
+      }
+      await sleep3(100);
+    }
+    return false;
   }
   async finishNeedsUser(run, reason, result) {
-    return this.store.updateRun(run.id, {
+    const current = await this.store.getRun(run.id);
+    const terminal = await this.store.updateRun(run.id, {
       status: "needs_user",
+      providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,
       error: reason,
       completedAt: nowIso(),
       diagnostics: {
@@ -36733,6 +37084,10 @@ class GptControlService {
         completedAt: nowIso()
       }
     });
+    if (terminal.providerTurnPending && terminal.providerStopRequested) {
+      this.scheduleProviderStopReconciliation(run.id);
+    }
+    return terminal;
   }
 }
 function normalizeStartRequest(request, policy) {
@@ -36821,6 +37176,7 @@ function publicPolicy(policy) {
     maxPromptBytes: policy.maxPromptBytes,
     maxConcurrentWorkers: policy.maxConcurrentWorkers,
     activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
+    providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
     fingerprint: policy.fingerprint
   };
 }
@@ -36878,7 +37234,7 @@ function browserNeedsUser(reason, conversation, run) {
   };
 }
 function sha256(value) {
-  return createHash5("sha256").update(value).digest("hex");
+  return createHash6("sha256").update(value).digest("hex");
 }
 function required2(value, name) {
   if (value === undefined)
@@ -36890,6 +37246,12 @@ function errorMessage2(error51) {
 }
 function sleep3(ms) {
   return new Promise((done) => setTimeout(done, ms));
+}
+function unrefSleep(ms) {
+  return new Promise((resolve7) => {
+    const timer = setTimeout(resolve7, ms);
+    timer.unref();
+  });
 }
 function abortableSleep2(ms, signal) {
   if (signal.aborted)
@@ -36909,7 +37271,7 @@ function abortableSleep2(ms, signal) {
 
 // src/task_store.ts
 import { constants as constants4 } from "node:fs";
-import { createHash as createHash6, randomUUID as randomUUID5 } from "node:crypto";
+import { createHash as createHash7, randomUUID as randomUUID5 } from "node:crypto";
 import { lstat as lstat3, open as open4, readdir as readdir2, rename as rename2 } from "node:fs/promises";
 import { dirname as dirname4, resolve as resolve7 } from "node:path";
 var TERMINAL3 = new Set(["completed", "failed", "cancelled"]);
@@ -36965,16 +37327,17 @@ class DurableTaskStore {
     await atomicWrite2(this.taskPath(task.taskId), record3, true);
     return task;
   }
-  async getTask(taskId, _sessionId) {
+  async getTask(taskId, sessionId) {
     try {
-      return (await this.readRecord(taskId)).task;
+      const record3 = await this.readRecord(taskId);
+      return sessionCanAccess(record3, sessionId) ? record3.task : null;
     } catch (error51) {
       if (isMissing2(error51))
         return null;
       throw error51;
     }
   }
-  async storeTaskResult(taskId, status, result, _sessionId) {
+  async storeTaskResult(taskId, status, result, sessionId) {
     const resultHash = jsonHash(result);
     let notify;
     await this.mutate(taskId, (record3) => {
@@ -36994,20 +37357,21 @@ class DurableTaskStore {
       record3.statusHistory.push({ status, at: timestamp, message: record3.task.statusMessage });
       notify = record3.task;
       return record3;
-    });
+    }, sessionId);
     if (notify)
       await this.notify(taskId, notify);
   }
-  async getTaskResult(taskId, _sessionId) {
+  async getTaskResult(taskId, sessionId) {
     const record3 = await this.readRecord(taskId);
+    assertSessionAccess(record3, sessionId);
     if (!TERMINAL3.has(record3.task.status) || record3.result === undefined) {
       throw new Error(`Task ${taskId} has no terminal result.`);
     }
     return record3.result;
   }
-  async updateTaskStatus(taskId, status, statusMessage, _sessionId) {
+  async updateTaskStatus(taskId, status, statusMessage, sessionId) {
     if (status === "cancelled") {
-      await this.cancelTask(taskId, statusMessage);
+      await this.cancelTask(taskId, statusMessage, sessionId);
       return;
     }
     let notify;
@@ -37035,22 +37399,38 @@ class DurableTaskStore {
       }
       notify = record3.task;
       return record3;
-    });
+    }, sessionId);
     if (notify)
       await this.notify(taskId, notify);
   }
-  async listTasks(cursor, _sessionId) {
+  async listTasks(cursor, sessionId) {
     await this.init();
     if (cursor !== undefined)
       assertTaskId(cursor);
     const names = (await readdir2(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
     const start = cursor ? Math.max(0, names.indexOf(`${cursor}.json`) + 1) : 0;
-    const page = names.slice(start, start + 100);
-    const tasks = await Promise.all(page.map((name) => this.readRecord(name.slice(0, -5)).then((record3) => record3.task)));
-    const last = page.at(-1);
+    const tasks = [];
+    let lastReturnedIndex = -1;
+    for (let index = start;index < names.length && tasks.length < 100; index += 1) {
+      const record3 = await this.readRecord(names[index].slice(0, -5));
+      if (!sessionCanAccess(record3, sessionId))
+        continue;
+      tasks.push(record3.task);
+      lastReturnedIndex = index;
+    }
+    let hasMore = false;
+    if (lastReturnedIndex >= 0) {
+      for (let index = lastReturnedIndex + 1;index < names.length; index += 1) {
+        if (sessionCanAccess(await this.readRecord(names[index].slice(0, -5)), sessionId)) {
+          hasMore = true;
+          break;
+        }
+      }
+    }
+    const last = tasks.at(-1);
     return {
       tasks,
-      nextCursor: start + page.length < names.length && last ? last.slice(0, -5) : undefined
+      nextCursor: hasMore && last ? last.taskId : undefined
     };
   }
   async bindRun(taskId, runId) {
@@ -37061,16 +37441,18 @@ class DurableTaskStore {
       return record3;
     });
   }
-  async getRunId(taskId) {
-    return (await this.readRecord(taskId)).runId;
+  async getRunId(taskId, sessionId) {
+    const record3 = await this.readRecord(taskId);
+    assertSessionAccess(record3, sessionId);
+    return record3.runId;
   }
   async statusHistory(taskId) {
     return [...(await this.readRecord(taskId)).statusHistory];
   }
-  async findTaskIdByRun(runId) {
+  async findTaskIdByRun(runId, sessionId) {
     let cursor;
     do {
-      const page = await this.listTasks(cursor);
+      const page = await this.listTasks(cursor, sessionId);
       for (const task of page.tasks) {
         if ((await this.readRecord(task.taskId)).runId === runId)
           return task.taskId;
@@ -37079,12 +37461,12 @@ class DurableTaskStore {
     } while (cursor);
     return;
   }
-  async listBindings(limit) {
+  async listBindings(limit, sessionId) {
     const values = [];
     const boundedLimit = limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(limit, 1000));
     let cursor;
     do {
-      const page = await this.listTasks(cursor);
+      const page = await this.listTasks(cursor, sessionId);
       for (const task of page.tasks) {
         const record3 = await this.readRecord(task.taskId);
         values.push({ task: record3.task, runId: record3.runId });
@@ -37112,18 +37494,21 @@ class DurableTaskStore {
       await handle.close();
     }
   }
-  async mutate(taskId, update) {
+  async mutate(taskId, update, sessionId) {
     await this.lockStore.withTaskLock(taskId, async () => {
-      const next = update(await this.readRecord(taskId));
+      const current = await this.readRecord(taskId);
+      assertSessionAccess(current, sessionId);
+      const next = update(current);
       validateRecord(next, taskId);
       await atomicWrite2(this.taskPath(taskId), next, false);
     });
   }
-  async cancelTask(taskId, statusMessage) {
+  async cancelTask(taskId, statusMessage, sessionId) {
     let notify;
     let cancelledRunId;
     await this.lockStore.withTaskLock(taskId, async () => {
       const record3 = await this.readRecord(taskId);
+      assertSessionAccess(record3, sessionId);
       if (record3.task.status === "cancelled" || TERMINAL3.has(record3.task.status))
         return;
       if (!TRANSITIONS2[record3.task.status].has("cancelled")) {
@@ -37134,6 +37519,7 @@ class DurableTaskStore {
       if (cancelledRunId) {
         const run = await this.lockStore.updateRun(cancelledRunId, {
           status: "cancelled",
+          providerStopRequested: true,
           cancellationRequestedAt: timestamp,
           completedAt: timestamp,
           error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
@@ -37172,6 +37558,13 @@ function validateRecord(value, expectedId) {
   if (!Array.isArray(record3.statusHistory))
     throw new Error(`Invalid task status history for ${expectedId}.`);
   return record3;
+}
+function sessionCanAccess(record3, sessionId) {
+  return sessionId === undefined || record3.sessionId !== undefined && record3.sessionId === sessionId;
+}
+function assertSessionAccess(record3, sessionId) {
+  if (!sessionCanAccess(record3, sessionId))
+    throw new Error(`Task ${record3.task.taskId} is not owned by this MCP session.`);
 }
 async function atomicWrite2(path, value, createOnly) {
   await secureDirectory(dirname4(path));
@@ -37223,7 +37616,7 @@ function statusResult(taskId, status, message) {
   };
 }
 function jsonHash(value) {
-  return createHash6("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash7("sha256").update(JSON.stringify(value)).digest("hex");
 }
 function isMissing2(error51) {
   return error51 instanceof Error && "code" in error51 && error51.code === "ENOENT";
@@ -37276,7 +37669,7 @@ function createMcpServer(serviceOrOptions = {}) {
     if (runId)
       await service.cancelRun(runId);
   });
-  registerCoreTools(server, service);
+  registerCoreTools(server, service, taskStore);
   registerSubagentRecoveryTools(server, service, taskStore, monitors);
   registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled);
   if (options.recover !== false) {
@@ -37286,17 +37679,25 @@ function createMcpServer(serviceOrOptions = {}) {
   }
   return server;
 }
-function registerCoreTools(server, service) {
+function registerCoreTools(server, service, taskStore) {
   server.registerTool("gpt_consult", {
     description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",
     inputSchema: { question: exports_external.string().min(1), ...CommonSchema },
     annotations: { readOnlyHint: false, destructiveHint: false }
-  }, async (params) => startPayload(await service.start(toRequest(params, "consult", params.question))));
+  }, async (params, extra) => {
+    if (params.conversation_id)
+      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+    return startPayload(await service.start(toRequest(params, "consult", params.question)));
+  });
   server.registerTool("gpt_chat", {
     description: "Start or continue one provider conversation. Each submission receives a durable run id and truthful provenance.",
     inputSchema: { prompt: exports_external.string().min(1), ...CommonSchema },
     annotations: { readOnlyHint: false, destructiveHint: false }
-  }, async (params) => startPayload(await service.start(toRequest(params, "chat", params.prompt))));
+  }, async (params, extra) => {
+    if (params.conversation_id)
+      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+    return startPayload(await service.start(toRequest(params, "chat", params.prompt)));
+  });
   server.registerTool("gpt_image", {
     description: "Generate an image in an owned ChatGPT conversation. Returns verified run provenance and provider artifact URLs; local writes remain policy-confined.",
     inputSchema: {
@@ -37308,21 +37709,26 @@ function registerCoreTools(server, service) {
       timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
     },
     annotations: { readOnlyHint: false, destructiveHint: false }
-  }, async (params) => startPayload(await service.start({
-    kind: "image",
-    prompt: params.prompt,
-    files: params.files,
-    conversationId: params.conversation_id,
-    transport: "browser",
-    chatgptModel: params.chatgpt_model,
-    idempotencyKey: params.idempotency_key,
-    timeoutMs: params.timeout_ms
-  })));
+  }, async (params, extra) => {
+    if (params.conversation_id)
+      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+    return startPayload(await service.start({
+      kind: "image",
+      prompt: params.prompt,
+      files: params.files,
+      conversationId: params.conversation_id,
+      transport: "browser",
+      chatgptModel: params.chatgpt_model,
+      idempotencyKey: params.idempotency_key,
+      timeoutMs: params.timeout_ms
+    }));
+  });
   server.registerTool("gpt_run", {
     description: "Read one exact durable run. Internal polling never submits a prompt and is not required for task-based subagents.",
     inputSchema: { action: exports_external.enum(["status", "wait", "result"]), run_id: exports_external.string(), timeout_ms: exports_external.number().int().positive().optional() },
     annotations: { readOnlyHint: true }
-  }, async (params) => {
+  }, async (params, extra) => {
+    await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
     const run = params.action === "wait" ? await service.waitForRun(params.run_id, params.timeout_ms) : await service.getRun(params.run_id);
     return runPayload(run);
   });
@@ -37330,12 +37736,21 @@ function registerCoreTools(server, service) {
     description: "Cancel one durable run. Terminal state is monotonic; late provider completion cannot overwrite cancellation.",
     inputSchema: { run_id: exports_external.string() },
     annotations: { readOnlyHint: false, destructiveHint: true }
-  }, async (params) => runPayload(await service.cancelRun(params.run_id)));
+  }, async (params, extra) => {
+    await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
+    return runPayload(await service.cancelRun(params.run_id));
+  });
+  server.registerTool("gpt_run_abandon_pending", {
+    description: "Operator-authenticated release of one unresolved provider-turn slot after manual review. Requires the trusted out-of-band token and exact confirmation ABANDON <run_id>.",
+    inputSchema: { run_id: exports_external.string(), confirmation: exports_external.string(), operator_token: exports_external.string().min(32) },
+    annotations: { readOnlyHint: false, destructiveHint: true }
+  }, async (params) => runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
   server.registerTool("gpt_conversation_close", {
     description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
     inputSchema: { conversation_id: exports_external.string() },
     annotations: { readOnlyHint: false, destructiveHint: true }
-  }, async (params) => {
+  }, async (params, extra) => {
+    await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
     const conversation = await service.closeConversation(params.conversation_id);
     return toolPayload(`Closed ${conversation.id} locally. Provider-side data was not deleted.`, {
       conversationId: conversation.id,
@@ -37418,13 +37833,16 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors) {
     description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
     inputSchema: { run_id: exports_external.string().optional(), task_id: exports_external.string().optional() },
     annotations: { readOnlyHint: true }
-  }, async (params) => {
+  }, async (params, extra) => {
     const identity = requireOneIdentity(params.run_id, params.task_id);
-    const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId);
-    const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId) : undefined);
+    const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId, extra.sessionId);
+    if (identity.runId && extra.sessionId !== undefined && !taskId) {
+      throw new Error("No Pro worker owned by this MCP session matched that run id.");
+    }
+    const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
     if (taskId)
       await activateTaskIfPending(service, taskStore, monitors, taskId);
-    const task = taskId ? await taskStore.getTask(taskId) : null;
+    const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
     const run = runId ? await service.getRun(runId) : undefined;
     if (!task && !run)
       throw new Error("No durable Pro worker matched that identity.");
@@ -37437,13 +37855,16 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors) {
     description: "Cancel one Pro worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
     inputSchema: { run_id: exports_external.string().optional(), task_id: exports_external.string().optional() },
     annotations: { readOnlyHint: false, destructiveHint: true }
-  }, async (params) => {
+  }, async (params, extra) => {
     const identity = requireOneIdentity(params.run_id, params.task_id);
-    const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId);
+    const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId, extra.sessionId);
+    if (identity.runId && extra.sessionId !== undefined && !taskId) {
+      throw new Error("No Pro worker owned by this MCP session matched that run id.");
+    }
     if (taskId) {
-      await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.");
-      const runId = identity.runId ?? await taskStore.getRunId(taskId);
-      const run = runId ? await service.getRun(runId) : undefined;
+      const runId = identity.runId ?? await taskStore.getRunId(taskId, extra.sessionId);
+      await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.", extra.sessionId);
+      const run = runId ? await service.cancelRun(runId) : undefined;
       return toolPayload(`Pro worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
     }
     if (!identity.runId)
@@ -37454,9 +37875,9 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors) {
     description: "Bounded overview of active Pro workers. This is a recovery aid, not a polling requirement.",
     inputSchema: { limit: exports_external.number().int().positive().max(100).optional(), include_terminal: exports_external.boolean().optional() },
     annotations: { readOnlyHint: true }
-  }, async (params) => {
+  }, async (params, extra) => {
     const limit = params.limit ?? 20;
-    const bindings = await taskStore.listBindings(100);
+    const bindings = await taskStore.listBindings(100, extra.sessionId);
     const rows = [];
     for (const binding of bindings.sort((a, b) => b.task.createdAt.localeCompare(a.task.createdAt))) {
       if (!params.include_terminal && ["completed", "failed", "cancelled"].includes(binding.task.status))
@@ -37483,13 +37904,18 @@ class ObservingTaskStore {
     return this.delegate.createTask(options, requestId, request, sessionId);
   }
   async getTask(taskId, sessionId) {
-    this.onObserve(taskId);
-    return this.delegate.getTask(taskId, sessionId);
+    const task = await this.delegate.getTask(taskId, sessionId);
+    if (task)
+      this.onObserve(taskId);
+    return task;
   }
   storeTaskResult(taskId, status, result, sessionId) {
     return this.delegate.storeTaskResult(taskId, status, result, sessionId);
   }
   async getTaskResult(taskId, sessionId) {
+    const task = await this.delegate.getTask(taskId, sessionId);
+    if (!task)
+      throw new Error(`Task ${taskId} is not present in this MCP session.`);
     this.onObserve(taskId);
     return this.delegate.getTaskResult(taskId, sessionId);
   }
@@ -37595,7 +38021,7 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
 }
 async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
   await taskStore.init();
-  const stopRecovery = await service.retryCancelledProviderStops();
+  const stopRecovery = await service.retryRequestedProviderStops();
   if (stopRecovery.blocked.length > 0) {
     console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
   }
@@ -37672,6 +38098,9 @@ function publicRun(run) {
     conversationId: run.conversationId,
     kind: run.kind,
     status: run.status,
+    providerTurnPending: run.providerTurnPending,
+    providerStopRequested: run.providerStopRequested,
+    providerTurnAbandonedAt: run.providerTurnAbandonedAt,
     connectorIntent: run.connectorIntent,
     connectorVerification: run.connectorIntent ? {
       status: "unverified",
@@ -37730,6 +38159,26 @@ function requireOneIdentity(runId, taskId) {
   if (Boolean(runId) === Boolean(taskId))
     throw new Error("Provide exactly one of run_id or task_id.");
   return { runId, taskId };
+}
+async function assertMcpRunAccess(service, taskStore, runId, sessionId) {
+  if (sessionId === undefined)
+    return;
+  const run = await service.getRun(runId);
+  if (run.kind !== "subagent")
+    return;
+  if (!await taskStore.findTaskIdByRun(runId, sessionId)) {
+    throw new Error("No Pro worker owned by this MCP session matched that run id.");
+  }
+}
+async function assertMcpConversationAccess(service, taskStore, conversationId, sessionId) {
+  if (sessionId === undefined)
+    return;
+  const subagentRuns = (await service.store.listRuns({ limit: null })).filter((run) => run.conversationId === conversationId && run.kind === "subagent");
+  for (const run of subagentRuns) {
+    if (!await taskStore.findTaskIdByRun(run.id, sessionId)) {
+      throw new Error("This MCP session does not own the Pro worker conversation.");
+    }
+  }
 }
 function readProgressToken(value) {
   return typeof value === "string" || typeof value === "number" ? value : undefined;

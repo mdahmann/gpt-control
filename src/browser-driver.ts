@@ -141,6 +141,11 @@ export async function waitForCompletedDriverTurn(
 		maxRecoveryCycles?: number;
 		signal?: AbortSignal;
 		onConversationIdentity?: (identity: { id: string; url: string }) => Promise<void>;
+		onConversationObservation?: (
+			identity: { id: string; url: string },
+			observation: ChatPageObservation,
+		) => Promise<"approved" | "unavailable" | "mismatch">;
+		providerTurnIdentityPersisted?: boolean;
 	},
 ): Promise<DriverCompletionOutcome> {
 	const intervalMs = options.intervalMs ?? browserPollIntervalMs();
@@ -154,13 +159,31 @@ export async function waitForCompletedDriverTurn(
 	}
 	let exactUrl = suppliedIdentity?.url;
 	let conversationId = suppliedIdentity?.id;
-	let identityPersisted = Boolean(suppliedIdentity);
+	let identityPersisted = options.onConversationObservation
+		? options.providerTurnIdentityPersisted === true
+		: Boolean(suppliedIdentity);
 	let previous: string | undefined;
 	let steady = 0;
 	let latest: AssistantSnapshot | undefined;
 	let lastObservedUrl: string | undefined;
 	let lastObservedUiState: string | undefined;
 	let recoveryCycles = 0;
+	const validateObservedTurn = async (
+		session: DriverSession,
+		observation: ChatPageObservation,
+	): Promise<"approved" | "pending" | "drifted"> => {
+		if (!options.onConversationObservation) return "approved";
+		const observedIdentity = providerConversationIdentity(session.url);
+		if (!observedIdentity) return identityPersisted ? "drifted" : "pending";
+		const decision = await options.onConversationObservation(observedIdentity, observation);
+		if (decision === "mismatch") return "drifted";
+		if (decision === "unavailable") return "pending";
+		if (exactUrl && exactUrl !== observedIdentity.url) return "drifted";
+		exactUrl = observedIdentity.url;
+		conversationId = observedIdentity.id;
+		identityPersisted = true;
+		return "approved";
+	};
 
 	while (Date.now() < deadline) {
 		await abortableSleep(intervalMs, options.signal);
@@ -185,7 +208,7 @@ export async function waitForCompletedDriverTurn(
 				session = restored.session;
 				lastObservedUrl = session.url;
 			}
-		} else if (currentIdentity) {
+		} else if (currentIdentity && !options.onConversationObservation) {
 			exactUrl = currentIdentity.url;
 			conversationId = currentIdentity.id;
 			if (!identityPersisted && !options.onConversationIdentity) identityPersisted = true;
@@ -203,8 +226,24 @@ export async function waitForCompletedDriverTurn(
 		}
 
 		let observation = await driver.observe(session, options.signal);
+		let providerTurnIdentityPending = false;
 		lastObservedUiState = observation.stateSummary;
 		if (observation.snapshot.count > options.baselineCount) latest = observation.snapshot;
+		try {
+			const validation = await validateObservedTurn(session, observation);
+			if (validation === "drifted") {
+				return needsUser(
+					"The latest provider user turn changed after the submitted turn was identified. Completion was not attributed to this run.",
+					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+				);
+			}
+			providerTurnIdentityPending = validation === "pending";
+		} catch (error) {
+			return needsUser(
+				`The observed provider turn identity could not be durably recorded: ${errorMessage(error)}`,
+				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+			);
+		}
 
 		if (requiresRecovery(observation) && recoveryCycles < maxRecoveryCycles) {
 			const recovered = await recoverSameDriverConversation(driver, expected, session, observation, {
@@ -223,6 +262,21 @@ export async function waitForCompletedDriverTurn(
 			lastObservedUrl = session.url;
 			lastObservedUiState = observation.stateSummary;
 			if (observation.snapshot.count > options.baselineCount) latest = observation.snapshot;
+			try {
+				const validation = await validateObservedTurn(session, observation);
+				if (validation === "drifted") {
+					return needsUser(
+						"The latest provider user turn changed during recovery. Completion was not attributed to this run.",
+						latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+					);
+				}
+				providerTurnIdentityPending = validation === "pending";
+			} catch (error) {
+				return needsUser(
+					`The recovered provider turn identity could not be durably validated: ${errorMessage(error)}`,
+					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
+				);
+			}
 		}
 
 		if (requiresRecovery(observation) && recoveryCycles >= maxRecoveryCycles) {
@@ -230,6 +284,11 @@ export async function waitForCompletedDriverTurn(
 				exactNeedsUserReason(observation, "Recovery budget exhausted"),
 				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
 			);
+		}
+		if (providerTurnIdentityPending) {
+			steady = 0;
+			previous = undefined;
+			continue;
 		}
 		if (observation.snapshot.count <= options.baselineCount) {
 			steady = 0;

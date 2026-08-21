@@ -231,6 +231,25 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
+		name: "gpt_run_abandon_pending",
+		label: "GPT Run Abandon Pending Provider Turn",
+		description: "Operator-authenticated release of an unresolved provider-turn slot after manual review. This does not prove that provider work stopped.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({ run_id: Type.String(), confirmation: Type.String(), operator_token: Type.String() }),
+		execute: async (_id, params) => {
+			try {
+				const runId = String(params.run_id);
+				const run = await service.abandonPendingProviderTurn(runId, String(params.confirmation), String(params.operator_token));
+				return textResult(runText(run), publicRun(run));
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "gpt_subagent_get",
 		label: "GPT Pro Worker Get",
 		description: "One durable recovery lookup for a Pro worker after reconnect or uncertainty.",
@@ -461,6 +480,9 @@ export function publicRun(run: RunRecord): Record<string, unknown> {
 		kind: run.kind,
 		connectorIntent: run.connectorIntent,
 		status: run.status,
+		providerTurnPending: run.providerTurnPending,
+		providerStopRequested: run.providerStopRequested,
+		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
 		submissionState: run.submissionState,
 		resultText: run.resultText,
 		report: run.result,

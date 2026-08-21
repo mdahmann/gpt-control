@@ -22,6 +22,7 @@ export interface OperatorPolicy {
 	maxPromptBytes: number;
 	maxConcurrentWorkers: number;
 	allowActiveDiagnostics: boolean;
+	providerTurnAbandonmentTokenHash?: string;
 	fingerprint: string;
 }
 
@@ -40,6 +41,7 @@ export interface OperatorPolicyInput {
 	maxPromptBytes?: number;
 	maxConcurrentWorkers?: number;
 	allowActiveDiagnostics?: boolean;
+	providerTurnAbandonmentToken?: string;
 }
 
 export function operatorPolicyFromEnv(
@@ -49,6 +51,10 @@ export function operatorPolicyFromEnv(
 	const storageRoot = resolve(overrides.storageRoot ?? env.GPT_CONTROL_HOME ?? resolve(homedir(), ".gpt-control"));
 	const allowedTransports = overrides.allowedTransports ?? parseTransports(env.GPT_CONTROL_ALLOWED_TRANSPORTS) ?? ["browser"];
 	const workspaceRoot = resolve(overrides.workspaceRoot ?? env.GPT_CONTROL_WORKSPACE_ROOT ?? process.cwd());
+	const abandonmentToken = overrides.providerTurnAbandonmentToken ?? env.GPT_CONTROL_PROVIDER_ABANDON_TOKEN;
+	if (abandonmentToken !== undefined && abandonmentToken.length < 32) {
+		throw new Error("GPT_CONTROL_PROVIDER_ABANDON_TOKEN must contain at least 32 characters.");
+	}
 	const value = {
 		workspaceRoot,
 		storageRoot,
@@ -64,6 +70,9 @@ export function operatorPolicyFromEnv(
 		maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
 		maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 3, "maxConcurrentWorkers"),
 		allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
+		providerTurnAbandonmentTokenHash: abandonmentToken
+			? createHash("sha256").update(abandonmentToken).digest("hex")
+			: undefined,
 	};
 	return { ...value, fingerprint: policyFingerprint(value) };
 }

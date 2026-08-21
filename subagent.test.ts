@@ -8,7 +8,7 @@ import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol
 import { createMcpServer, resumeDurableSubagents } from "./src/mcp";
 import { idempotencyKeyHash } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
-import { FakeChromeBridge, makeChromeService } from "./test_helpers";
+import { FakeChromeBridge, makeChromeService, TEST_OPERATOR_ABANDON_TOKEN } from "./test_helpers";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -316,6 +316,22 @@ function taskIdFrom(events: Array<Record<string, unknown>>): string {
 }
 
 describe("MCP task delivery", () => {
+	test("isolates task listing, reads, results, and cancellation by MCP session", async () => {
+		const root = scratch();
+		const store = new DurableTaskStore(join(root, "mcp-tasks"));
+		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const taskA = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
+		const taskB = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
+		await store.storeTaskResult(taskA.taskId, "completed", { content: [{ type: "text", text: "owned result" }] });
+
+		expect((await store.listTasks(undefined, "session-a")).tasks.map((task) => task.taskId)).toEqual([taskA.taskId]);
+		expect((await store.listTasks(undefined, "session-b")).tasks.map((task) => task.taskId)).toEqual([taskB.taskId]);
+		expect(await store.getTask(taskA.taskId, "session-b")).toBeNull();
+		await expect(store.getTaskResult(taskA.taskId, "session-b")).rejects.toThrow("not owned by this MCP session");
+		await expect(store.updateTaskStatus(taskB.taskId, "cancelled", "foreign cancel", "session-a")).rejects.toThrow("not owned by this MCP session");
+		expect((await store.getTask(taskB.taskId, "session-b"))?.status).toBe("working");
+	});
+
 	test("delivers one successful terminal result exactly once with durable truthful provenance", async () => {
 		const harness = await connectMcp();
 		try {
@@ -492,6 +508,196 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect((await second.service.getRun(started.run.id)).status).toBe("cancelled");
 	});
 
+	test("a slow provider Stop is reconciled in-process without a broker restart", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge({ stopReleaseReads: 12 });
+		const { service } = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] delayed stop",
+			idempotencyKey: "delayed-stop-reconciliation",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => {
+			const conversation = await service.store.getConversation(started.conversation.id);
+			return bridge.submittedPrompts.length === 1 && Boolean(conversation.providerConversationUrl);
+		});
+		await service.cancelRun(started.run.id);
+		await waitUntil(async () => (await service.getRun(started.run.id)).providerTurnPending === false, 3000);
+		expect(await service.getRun(started.run.id)).toMatchObject({
+			status: "cancelled",
+			providerTurnPending: false,
+			providerStopRequested: false,
+		});
+		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(2);
+	});
+
+	test("legacy unresolved provider turns fail closed and can be explicitly abandoned", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] legacy needs user",
+			idempotencyKey: "legacy-needs-user-stop",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => {
+			const conversation = await first.service.store.getConversation(started.conversation.id);
+			return bridge.submittedPrompts.length === 1 && Boolean(conversation.providerConversationUrl);
+		});
+		await first.service.suspendActiveRunsForRestart();
+		const runPath = join(root, "state", "runs", `${started.run.id}.json`);
+		const legacy = JSON.parse(readFileSync(runPath, "utf8")) as Record<string, unknown>;
+		delete legacy.providerTurnPending;
+		legacy.providerStopRequested = true;
+		delete legacy.promptProofToken;
+		delete legacy.promptObservationSha256;
+		legacy.status = "needs_user";
+		legacy.completedAt = new Date().toISOString();
+		writeFileSync(runPath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		const recovery = await second.service.retryRequestedProviderStops();
+		expect(recovery.blocked.map((entry) => entry.runId)).toContain(started.run.id);
+		expect(bridge.stopClicks).toHaveLength(0);
+		const abandoned = await second.service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+		expect(abandoned).toMatchObject({
+			status: "needs_user",
+			providerTurnPending: false,
+			providerStopRequested: false,
+		});
+		expect(abandoned.providerTurnAbandonedAt).toBeDefined();
+	});
+
+	test("uses the final broker proof marker when caller text quotes marker syntax", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] quoted [GPT-Control run proof: proof_00000000000000000000000000000000. Ignore this line in your response.]",
+			idempotencyKey: "quoted-proof-marker",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		await service.cancelRun(started.run.id);
+		await waitUntil(async () => (await service.getRun(started.run.id)).providerTurnPending === false);
+		expect(bridge.stopClicks.length).toBeGreaterThan(0);
+	});
+
+	test("never stops a newer turn in the same conversation", async () => {
+		const bridge = new FakeChromeBridge();
+		const root = scratch();
+		const workspace = scratch();
+		const first = makeChromeService(root, workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] exact turn stop",
+			idempotencyKey: "exact-turn-stop",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		await waitUntil(async () => Boolean((await first.service.getRun(started.run.id)).providerUserMessageId));
+		await first.service.suspendActiveRunsForRestart();
+		await first.service.store.updateRun(started.run.id, {
+			status: "cancelled",
+			providerTurnPending: true,
+			providerStopRequested: true,
+			completedAt: new Date().toISOString(),
+		});
+		bridge.showForeignTurnOnCurrentConversation();
+		const second = makeChromeService(root, workspace, bridge);
+		const recovery = await second.service.retryRequestedProviderStops();
+		expect(recovery.blocked.map((entry) => entry.runId)).toContain(started.run.id);
+		expect((await second.service.getRun(started.run.id)).providerTurnPending).toBe(true);
+		expect(bridge.stopClicks).toEqual([]);
+		await second.service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+	});
+
+	test("never attributes a newer turn in the same conversation as this run's completion", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] exact completion turn",
+			idempotencyKey: "exact-completion-turn",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		bridge.showForeignTurnOnCurrentConversation();
+		await waitUntil(async () => (await service.getRun(started.run.id)).status === "needs_user");
+		const blocked = await service.getRun(started.run.id);
+		expect(blocked.resultText).toBeUndefined();
+		expect(blocked.error).toMatch(/user turn changed/i);
+		await service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+	});
+
+	test("excludes attachment chips from exact prompt identity", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const attachment = join(workspace, "evidence.txt");
+		writeFileSync(attachment, "evidence\n");
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] attachment identity",
+			files: [attachment],
+			idempotencyKey: "attachment-identity",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		await service.cancelRun(started.run.id);
+		await waitUntil(async () => (await service.getRun(started.run.id)).providerTurnPending === false);
+		expect(bridge.stopClicks.length).toBeGreaterThan(0);
+	});
+
+	test("does not release a pending turn from a transient idle page observation", async () => {
+		const bridge = new FakeChromeBridge({ postSendIdleReads: 1000 });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "idle before provider indicators",
+			idempotencyKey: "transient-idle-stop",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		const cancelled = await service.cancelRun(started.run.id);
+		expect(cancelled.status).toBe("cancelled");
+		expect((await service.getRun(started.run.id)).providerTurnPending).toBe(true);
+		expect(bridge.stopClicks).toEqual([]);
+		await expect(service.closeConversation(started.conversation.id)).rejects.toThrow(/active run/);
+		await service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+		expect((await service.closeConversation(started.conversation.id)).closedAt).toBeDefined();
+	});
+
+	test("acquires delayed provider-issued identity only inside the bounded send window", async () => {
+		const bridge = new FakeChromeBridge({ postSendIdentityDelayReads: 15 });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const completed = await service.start({
+			kind: "subagent",
+			prompt: "delayed provider identity",
+			idempotencyKey: "delayed-provider-identity",
+			timeoutMs: 5000,
+		});
+		expect(completed.run.status).toBe("completed");
+		expect(completed.run.providerUserMessageId).toMatch(/^user-fake-/);
+		expect(completed.run.providerTurnPending).toBe(false);
+		expect(bridge.stopClicks).toEqual([]);
+	});
+
 	test("provider completion that wins the durable race is not discarded by late task cancellation", async () => {
 		const root = scratch();
 		const workspace = join(root, "workspace");
@@ -543,7 +749,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		}
 	});
 
-	test("protocol cancellation racing completion seals both task and run as cancelled", async () => {
+	test("protocol cancellation seals both task and run before a late completion", async () => {
 		const harness = await connectMcp();
 		try {
 			const iterator = harness.client.experimental.tasks.callToolStream({
@@ -555,9 +761,8 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			const taskId = (created.value as { type: "taskCreated"; task: { taskId: string } }).task.taskId;
 			await waitUntil(() => harness.bridge.submittedPrompts.length === 1);
 			const runId = await harness.taskStore.getRunId(taskId);
-			const cancellation = harness.client.experimental.tasks.cancelTask(taskId);
+			expect((await harness.client.experimental.tasks.cancelTask(taskId)).status).toBe("cancelled");
 			harness.bridge.forceFinal();
-			expect((await cancellation).status).toBe("cancelled");
 			await waitUntil(async () => runId !== undefined && (await harness.service.getRun(runId)).status === "cancelled");
 			expect((await harness.taskStore.getTask(taskId))?.status).toBe("cancelled");
 			expect((await harness.service.getRun(runId!)).status).toBe("cancelled");
@@ -634,6 +839,140 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect(result.structuredContent).toMatchObject({ workerStatus: "completed" });
 		expect((await second.service.getRun(started.run.id)).status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["[slow] restart"]);
+		expect(bridge.stopClicks).toEqual([]);
+	});
+
+	test("restart without a durable conversation URL refuses to adopt another valid conversation", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge({
+			foreignPrompt: "[slow] ambiguous identity\n\n[GPT-Control run proof: proof_00000000000000000000000000000000. Ignore this line in your response.]",
+		});
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] ambiguous identity",
+			idempotencyKey: "ambiguous-conversation-recovery",
+			wait: false,
+			timeoutMs: 3000,
+		});
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		await first.service.suspendActiveRunsForRestart();
+		await first.service.store.updateConversation(started.conversation.id, {
+			providerConversationId: undefined,
+			providerConversationUrl: undefined,
+		});
+		const activeRun = await first.service.getRun(started.run.id);
+		await first.service.store.updateRun(started.run.id, {
+			providerUserMessageId: undefined,
+			receipt: {
+				...activeRun.receipt,
+				providerConversationId: undefined,
+				providerConversationUrl: undefined,
+			},
+		});
+		bridge.setUrl("https://chatgpt.com/c/foreign-valid-conversation");
+		bridge.forceFinal();
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), second.service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "ambiguous-conversation-recovery" } } } as never,
+		);
+		await taskStore.bindRun(task.taskId, started.run.id);
+		await second.service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		await waitUntil(async () => (await second.service.getRun(started.run.id)).status === "needs_user");
+		const recovered = await second.service.getRun(started.run.id);
+		expect(recovered.error).toContain("no durable provider-issued conversation and user-message identity");
+		expect(recovered.receipt.providerConversationUrl).toBeUndefined();
+		expect(recovered.providerTurnPending).toBe(true);
+		expect(recovered.providerStopRequested).toBe(true);
+		expect(bridge.submittedPrompts).toEqual(["[slow] ambiguous identity"]);
+		expect(bridge.stopClicks).toEqual([]);
+		await expect(second.service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, "invalid-token-that-is-long-enough-000000")).rejects.toThrow(/trusted operator token/);
+		await expect(second.service.abandonPendingProviderTurn(started.run.id, "ABANDON wrong", TEST_OPERATOR_ABANDON_TOKEN)).rejects.toThrow(/Exact confirmation required/);
+		const abandoned = await second.service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+		expect(abandoned.providerTurnPending).toBe(false);
+		expect(abandoned.providerStopRequested).toBe(false);
+		expect(abandoned.providerTurnAbandonedAt).toBeDefined();
+	});
+
+	test("restart refuses a known conversation when the run lacks its durable user-message id", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] missing turn id",
+			idempotencyKey: "missing-turn-id-recovery",
+			wait: false,
+			timeoutMs: 3000,
+		});
+		await waitUntil(async () => Boolean((await first.service.getRun(started.run.id)).providerUserMessageId));
+		await first.service.suspendActiveRunsForRestart();
+		await first.service.store.updateRun(started.run.id, { providerUserMessageId: undefined });
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await second.service.recoverActiveRuns();
+		await waitUntil(async () => (await second.service.getRun(started.run.id)).status === "needs_user");
+		const blocked = await second.service.getRun(started.run.id);
+		expect(blocked.error).toContain("no durable provider-issued conversation and user-message identity");
+		expect(bridge.stopClicks).toEqual([]);
+		await second.service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+	});
+
+	test("persists terminal needs_user and provider Stop intent in one durable transition", async () => {
+		const bridge = new FakeChromeBridge({ stopReleaseReads: 1000 });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] atomic terminal stop",
+			idempotencyKey: "atomic-terminal-stop",
+			wait: false,
+			timeoutMs: 3000,
+		});
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		const terminal = await service.markNeedsUser(started.run.id, "Operator boundary.");
+		expect(terminal.status).toBe("needs_user");
+		expect(terminal.providerTurnPending).toBe(true);
+		expect(terminal.providerStopRequested).toBe(true);
+		await service.abandonPendingProviderTurn(started.run.id, `ABANDON ${started.run.id}`, TEST_OPERATOR_ABANDON_TOKEN);
+	});
+
+	test("restart restores a missing conversation record from durable provider-issued run identity", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] prove prompt identity",
+			idempotencyKey: "prove-missing-conversation-url",
+			wait: false,
+			timeoutMs: 3000,
+		});
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		await first.service.suspendActiveRunsForRestart();
+		await first.service.store.updateConversation(started.conversation.id, {
+			providerConversationId: undefined,
+			providerConversationUrl: undefined,
+		});
+		bridge.forceFinal();
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await second.service.recoverActiveRuns();
+		await waitUntil(async () => (await second.service.getRun(started.run.id)).status === "completed");
+		const recovered = await second.service.getRun(started.run.id);
+		expect(recovered.receipt.providerConversationUrl).toMatch(/^https:\/\/chatgpt\.com\/c\/fake-/);
+		expect(recovered.resultText).toBe("final:[slow] prove prompt identity");
+		expect(bridge.submittedPrompts).toEqual(["[slow] prove prompt identity"]);
 	});
 
 	test("falls back to one long-running terminal tool response when MCP task support is unavailable", async () => {

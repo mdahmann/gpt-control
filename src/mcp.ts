@@ -80,7 +80,7 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 		if (runId) await service.cancelRun(runId);
 	});
 
-	registerCoreTools(server, service);
+	registerCoreTools(server, service, taskStore);
 	registerSubagentRecoveryTools(server, service, taskStore, monitors);
 	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled);
 
@@ -92,18 +92,24 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 	return server;
 }
 
-function registerCoreTools(server: McpServer, service: GptControlService): void {
+function registerCoreTools(server: McpServer, service: GptControlService, taskStore: DurableTaskStore): void {
 	server.registerTool("gpt_consult", {
 		description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",
 		inputSchema: { question: z.string().min(1), ...CommonSchema },
 		annotations: { readOnlyHint: false, destructiveHint: false },
-	}, async (params) => startPayload(await service.start(toRequest(params, "consult", params.question))));
+	}, async (params, extra) => {
+		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+		return startPayload(await service.start(toRequest(params, "consult", params.question)));
+	});
 
 	server.registerTool("gpt_chat", {
 		description: "Start or continue one provider conversation. Each submission receives a durable run id and truthful provenance.",
 		inputSchema: { prompt: z.string().min(1), ...CommonSchema },
 		annotations: { readOnlyHint: false, destructiveHint: false },
-	}, async (params) => startPayload(await service.start(toRequest(params, "chat", params.prompt))));
+	}, async (params, extra) => {
+		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+		return startPayload(await service.start(toRequest(params, "chat", params.prompt)));
+	});
 
 	server.registerTool("gpt_image", {
 		description: "Generate an image in an owned ChatGPT conversation. Returns verified run provenance and provider artifact URLs; local writes remain policy-confined.",
@@ -116,22 +122,26 @@ function registerCoreTools(server: McpServer, service: GptControlService): void 
 			timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
 		},
 		annotations: { readOnlyHint: false, destructiveHint: false },
-	}, async (params) => startPayload(await service.start({
-		kind: "image",
-		prompt: params.prompt,
-		files: params.files,
-		conversationId: params.conversation_id,
-		transport: "browser",
-		chatgptModel: params.chatgpt_model,
-		idempotencyKey: params.idempotency_key,
-		timeoutMs: params.timeout_ms,
-	})));
+	}, async (params, extra) => {
+		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
+		return startPayload(await service.start({
+			kind: "image",
+			prompt: params.prompt,
+			files: params.files,
+			conversationId: params.conversation_id,
+			transport: "browser",
+			chatgptModel: params.chatgpt_model,
+			idempotencyKey: params.idempotency_key,
+			timeoutMs: params.timeout_ms,
+		}));
+	});
 
 	server.registerTool("gpt_run", {
 		description: "Read one exact durable run. Internal polling never submits a prompt and is not required for task-based subagents.",
 		inputSchema: { action: z.enum(["status", "wait", "result"]), run_id: z.string(), timeout_ms: z.number().int().positive().optional() },
 		annotations: { readOnlyHint: true },
-	}, async (params) => {
+	}, async (params, extra) => {
+		await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
 		const run = params.action === "wait" ? await service.waitForRun(params.run_id, params.timeout_ms) : await service.getRun(params.run_id);
 		return runPayload(run);
 	});
@@ -140,13 +150,23 @@ function registerCoreTools(server: McpServer, service: GptControlService): void 
 		description: "Cancel one durable run. Terminal state is monotonic; late provider completion cannot overwrite cancellation.",
 		inputSchema: { run_id: z.string() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
-	}, async (params) => runPayload(await service.cancelRun(params.run_id)));
+	}, async (params, extra) => {
+		await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
+		return runPayload(await service.cancelRun(params.run_id));
+	});
+
+	server.registerTool("gpt_run_abandon_pending", {
+		description: "Operator-authenticated release of one unresolved provider-turn slot after manual review. Requires the trusted out-of-band token and exact confirmation ABANDON <run_id>.",
+		inputSchema: { run_id: z.string(), confirmation: z.string(), operator_token: z.string().min(32) },
+		annotations: { readOnlyHint: false, destructiveHint: true },
+	}, async (params) => runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
 
 	server.registerTool("gpt_conversation_close", {
 		description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
 		inputSchema: { conversation_id: z.string() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
-	}, async (params) => {
+	}, async (params, extra) => {
+		await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
 		const conversation = await service.closeConversation(params.conversation_id);
 		return toolPayload(`Closed ${conversation.id} locally. Provider-side data was not deleted.`, {
 			conversationId: conversation.id,
@@ -247,12 +267,15 @@ function registerSubagentRecoveryTools(
 		description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
 		inputSchema: { run_id: z.string().optional(), task_id: z.string().optional() },
 		annotations: { readOnlyHint: true },
-	}, async (params) => {
+	}, async (params, extra) => {
 		const identity = requireOneIdentity(params.run_id, params.task_id);
-		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!);
-		const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId) : undefined);
+		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!, extra.sessionId);
+		if (identity.runId && extra.sessionId !== undefined && !taskId) {
+			throw new Error("No Pro worker owned by this MCP session matched that run id.");
+		}
+		const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
 		if (taskId) await activateTaskIfPending(service, taskStore, monitors, taskId);
-		const task = taskId ? await taskStore.getTask(taskId) : null;
+		const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
 		const run = runId ? await service.getRun(runId) : undefined;
 		if (!task && !run) throw new Error("No durable Pro worker matched that identity.");
 		return toolPayload(run ? runText(run) : `Task ${taskId}: ${task?.status}.`, {
@@ -265,13 +288,18 @@ function registerSubagentRecoveryTools(
 		description: "Cancel one Pro worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
 		inputSchema: { run_id: z.string().optional(), task_id: z.string().optional() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
-	}, async (params) => {
+	}, async (params, extra) => {
 		const identity = requireOneIdentity(params.run_id, params.task_id);
-		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!);
+		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!, extra.sessionId);
+		if (identity.runId && extra.sessionId !== undefined && !taskId) {
+			throw new Error("No Pro worker owned by this MCP session matched that run id.");
+		}
 		if (taskId) {
-			await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.");
-			const runId = identity.runId ?? await taskStore.getRunId(taskId);
-			const run = runId ? await service.getRun(runId) : undefined;
+			const runId = identity.runId ?? await taskStore.getRunId(taskId, extra.sessionId);
+			await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.", extra.sessionId);
+			// Keep the tool's provider-Stop guarantee explicit. The task-store listener
+			// also routes protocol tasks/cancel here; cancelRun is durable and idempotent.
+			const run = runId ? await service.cancelRun(runId) : undefined;
 			return toolPayload(`Pro worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
 		}
 		if (!identity.runId) throw new Error("No run id was available to cancel.");
@@ -282,9 +310,9 @@ function registerSubagentRecoveryTools(
 		description: "Bounded overview of active Pro workers. This is a recovery aid, not a polling requirement.",
 		inputSchema: { limit: z.number().int().positive().max(100).optional(), include_terminal: z.boolean().optional() },
 		annotations: { readOnlyHint: true },
-	}, async (params) => {
+	}, async (params, extra) => {
 		const limit = params.limit ?? 20;
-		const bindings = await taskStore.listBindings(100);
+		const bindings = await taskStore.listBindings(100, extra.sessionId);
 		const rows: Array<Record<string, unknown>> = [];
 		for (const binding of bindings.sort((a, b) => b.task.createdAt.localeCompare(a.task.createdAt))) {
 			if (!params.include_terminal && ["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
@@ -307,8 +335,9 @@ class ObservingTaskStore implements TaskStore {
 	}
 
 	async getTask(taskId: string, sessionId?: string): Promise<Task | null> {
-		this.onObserve(taskId);
-		return this.delegate.getTask(taskId, sessionId);
+		const task = await this.delegate.getTask(taskId, sessionId);
+		if (task) this.onObserve(taskId);
+		return task;
 	}
 
 	storeTaskResult(taskId: string, status: "completed" | "failed", result: Result, sessionId?: string): Promise<void> {
@@ -316,6 +345,8 @@ class ObservingTaskStore implements TaskStore {
 	}
 
 	async getTaskResult(taskId: string, sessionId?: string): Promise<Result> {
+		const task = await this.delegate.getTask(taskId, sessionId);
+		if (!task) throw new Error(`Task ${taskId} is not present in this MCP session.`);
 		this.onObserve(taskId);
 		return this.delegate.getTaskResult(taskId, sessionId);
 	}
@@ -447,7 +478,7 @@ export async function resumeDurableSubagents(
 	monitors = new Map<string, Promise<void>>(),
 ): Promise<void> {
 	await taskStore.init();
-	const stopRecovery = await service.retryCancelledProviderStops();
+	const stopRecovery = await service.retryRequestedProviderStops();
 	if (stopRecovery.blocked.length > 0) {
 		console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
 	}
@@ -530,6 +561,9 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		conversationId: run.conversationId,
 		kind: run.kind,
 		status: run.status,
+		providerTurnPending: run.providerTurnPending,
+		providerStopRequested: run.providerStopRequested,
+		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
 		connectorIntent: run.connectorIntent,
 		connectorVerification: run.connectorIntent ? {
 			status: "unverified",
@@ -590,6 +624,36 @@ function toolPayload(text: string, structured: unknown, isError = false): CallTo
 function requireOneIdentity(runId?: string, taskId?: string): { runId?: string; taskId?: string } {
 	if (Boolean(runId) === Boolean(taskId)) throw new Error("Provide exactly one of run_id or task_id.");
 	return { runId, taskId };
+}
+
+async function assertMcpRunAccess(
+	service: GptControlService,
+	taskStore: DurableTaskStore,
+	runId: string,
+	sessionId?: string,
+): Promise<void> {
+	if (sessionId === undefined) return;
+	const run = await service.getRun(runId);
+	if (run.kind !== "subagent") return;
+	if (!await taskStore.findTaskIdByRun(runId, sessionId)) {
+		throw new Error("No Pro worker owned by this MCP session matched that run id.");
+	}
+}
+
+async function assertMcpConversationAccess(
+	service: GptControlService,
+	taskStore: DurableTaskStore,
+	conversationId: string,
+	sessionId?: string,
+): Promise<void> {
+	if (sessionId === undefined) return;
+	const subagentRuns = (await service.store.listRuns({ limit: null }))
+		.filter((run) => run.conversationId === conversationId && run.kind === "subagent");
+	for (const run of subagentRuns) {
+		if (!await taskStore.findTaskIdByRun(run.id, sessionId)) {
+			throw new Error("This MCP session does not own the Pro worker conversation.");
+		}
+	}
 }
 
 function readProgressToken(value: unknown): ProgressToken | undefined {

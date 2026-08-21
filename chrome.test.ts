@@ -203,6 +203,11 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({ kind: "subagent", prompt: "[slow] timeout", timeoutMs: 40 });
 		expect(result.run.status).toBe("needs_user");
+		await service.retryRequestedProviderStops();
+		const stopped = await service.getRun(result.run.id);
+		expect(stopped.providerTurnPending).toBe(false);
+		expect(stopped.providerStopRequested).toBe(false);
+		expect(bridge.stopClicks).toHaveLength(1);
 		bridge.forceFinal();
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect((await service.getRun(result.run.id)).status).toBe("needs_user");

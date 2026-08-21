@@ -91,7 +91,13 @@ const RunSchema = z.object({
 	connectorIntent: z.object({ names: z.array(z.string()), mode: z.enum(["prefer", "require"]) }).optional(),
 	status: RunStatusSchema,
 	executionReady: z.boolean(),
+	providerTurnPending: z.boolean().optional(),
+	providerStopRequested: z.boolean().optional(),
+	providerTurnAbandonedAt: z.string().optional(),
+	providerUserMessageId: z.string().min(1).max(512).optional(),
 	promptSha256: z.string(),
+	promptObservationSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+	promptProofToken: z.string().regex(/^proof_[a-f0-9]{32}$/).optional(),
 	attachmentManifest: ManifestSchema,
 	baselineMessageCount: z.number().optional(),
 	submissionState: z.enum(["not_submitted", "submitting", "submitted", "not_applicable"]).optional(),
@@ -328,19 +334,77 @@ export class RunStore {
 		}, { timeoutMs: 10_000 });
 	}
 
-	async listRuns(options: { statuses?: readonly RunStatus[]; limit?: number } = {}): Promise<RunRecord[]> {
+	async requestProviderStop(id: string): Promise<RunRecord> {
+		assertRunId(id);
+		await this.init();
+		return this.withNamedLock(`record-${id}`, async () => {
+			const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id)))) as RunRecord;
+			const legacyUnresolved = current.providerTurnPending === undefined
+				&& (current.status === "cancelled" || current.status === "needs_user")
+				&& (current.submissionState === "submitting" || current.submissionState === "submitted");
+			if (current.providerStopRequested && !legacyUnresolved) return current;
+			const next = {
+				...current,
+				providerTurnPending: legacyUnresolved ? true : current.providerTurnPending,
+				providerStopRequested: true,
+				id,
+				updatedAt: nowIso(),
+			};
+			RunSchema.parse(next);
+			await atomicWrite(this.runPath(id), next);
+			return next;
+		}, { timeoutMs: 10_000 });
+	}
+
+	async clearProviderTurnState(id: string): Promise<RunRecord> {
+		assertRunId(id);
+		await this.init();
+		return this.withNamedLock(`record-${id}`, async () => {
+			const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id)))) as RunRecord;
+			if (current.providerTurnPending === false && current.providerStopRequested === false) return current;
+			const next = { ...current, providerTurnPending: false, providerStopRequested: false, id, updatedAt: nowIso() };
+			RunSchema.parse(next);
+			await atomicWrite(this.runPath(id), next);
+			return next;
+		}, { timeoutMs: 10_000 });
+	}
+
+	async abandonProviderTurn(id: string): Promise<RunRecord> {
+		assertRunId(id);
+		await this.init();
+		return this.withNamedLock(`record-${id}`, async () => {
+			const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id)))) as RunRecord;
+			if (!TERMINAL.has(current.status)) throw new Error("Only a terminal run can abandon unresolved provider work.");
+			const legacyUnresolved = current.providerTurnPending === undefined
+				&& (current.status === "cancelled" || current.status === "needs_user")
+				&& (current.submissionState === "submitting" || current.submissionState === "submitted");
+			if (!current.providerTurnPending && !legacyUnresolved) throw new Error("This run has no unresolved provider turn to abandon.");
+			const next = {
+				...current,
+				providerTurnPending: false,
+				providerStopRequested: false,
+				providerTurnAbandonedAt: nowIso(),
+				id,
+				updatedAt: nowIso(),
+			};
+			RunSchema.parse(next);
+			await atomicWrite(this.runPath(id), next);
+			return next;
+		}, { timeoutMs: 10_000 });
+	}
+
+	async listRuns(options: { statuses?: readonly RunStatus[]; limit?: number | null } = {}): Promise<RunRecord[]> {
 		await this.init();
 		const names = (await readdir(confinedPath(this.root, "runs"))).filter((name) => /^run_[a-f0-9]{32}\.json$/.test(name)).sort().reverse();
 		const allowed = options.statuses ? new Set(options.statuses) : undefined;
-		const limit = Math.max(1, Math.min(options.limit ?? 100, 1000));
+		const limit = options.limit === null ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(options.limit ?? 100, 10_000));
 		const runs: RunRecord[] = [];
 		for (const name of names) {
 			const id = name.slice(0, -5);
 			const run = await this.getRun(id);
 			if (!allowed || allowed.has(run.status)) runs.push(run);
-			if (runs.length >= limit) break;
 		}
-		return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		return runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
 	}
 
 	async putRunRequest(request: DurableRunRequest): Promise<void> {
