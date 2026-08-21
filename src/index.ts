@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve, sep } from "node:path";
-import { captureScreenshot, fetchArtifact } from "./chatgpt";
+import { CHATGPT_ORIGIN, fetchArtifact } from "./chatgpt";
 import { resolveExec, resolveType, applyLabel } from "./host";
 import { GptControlService, type StartRequest } from "./service";
 import { resolveCapabilities } from "./capability";
@@ -46,7 +46,7 @@ function startRequest(params: Record<string, unknown>, kind: "consult" | "chat" 
 }
 
 function isTransport(value: unknown): value is StartRequest["transport"] {
-	return value === "chrome_bridge" || value === "oracle_browser" || value === "oracle_api";
+	return value === "browser" || value === "oracle_browser" || value === "oracle_api";
 }
 
 function runText(run: RunRecord): string {
@@ -177,7 +177,7 @@ export default function gptControl(pi: ExtensionAPI): void {
 		}),
 		execute: async (_id, params) => {
 			try {
-				const request = startRequest({ ...params, transport: params.transport ?? "chrome_bridge" }, "image");
+				const request = startRequest({ ...params, transport: params.transport ?? "browser" }, "image");
 				const result = await service.start(request);
 				if (result.run.status !== "completed") return textResult(runText(result.run), { conversationId: result.conversation.id, runId: result.run.id, status: result.run.status }, true);
 				return await imageResult(exec, service, result.run, params.output_dir, params.allow_external_output);
@@ -209,7 +209,7 @@ function commonParameters(Type: TypeBuilder): Record<string, Record<string, unkn
 	return {
 		conversation_id: Type.Optional(Type.String({ description: "Wrapper-owned conversation id for a follow-up." })),
 		files: Type.Optional(Type.Array(Type.String())),
-		transport: Type.Optional(Type.Union([Type.Literal("chrome_bridge"), Type.Literal("oracle_browser"), Type.Literal("oracle_api")])),
+		transport: Type.Optional(Type.Union([Type.Literal("browser"), Type.Literal("oracle_browser"), Type.Literal("oracle_api")])),
 		model: Type.Optional(Type.String()),
 		workspace_root: Type.Optional(Type.String({ description: "Boundary for attachments; defaults to the process working directory." })),
 		allow_outside_workspace: Type.Optional(Type.Boolean()),
@@ -246,12 +246,18 @@ async function imageResult(exec: Exec, service: GptControlService, run: RunRecor
 	if (paths.length === 0) {
 		const conversation = await service.store.getConversation(run.conversationId);
 		const capabilities = await resolveCapabilities(exec);
-		if (conversation.provider === "chrome_bridge" && capabilities.bridge && conversation.bridgeTabId !== undefined) {
-			const path = resolve(outputDir, `${run.id}.screenshot.png`);
-			const screenshot = await captureScreenshot(exec, capabilities.bridge.launcher, conversation.bridgeTabId, path);
-			if (screenshot) {
-				paths.push(screenshot);
-				content.push({ type: "image", data: (await readFile(screenshot)).toString("base64"), mimeType: "image/png" });
+		if (conversation.provider === "browser" && capabilities.browser && conversation.browserDriverId === capabilities.browser.driver.id && conversation.browserSessionId) {
+			const session = await capabilities.browser.driver.show(conversation.browserSessionId);
+			const owned = session.name.startsWith("gpt-control:")
+				&& session.pageId === conversation.browserPageId
+				&& new URL(session.url).origin === CHATGPT_ORIGIN;
+			if (owned) {
+				const path = resolve(outputDir, `${run.id}.screenshot.png`);
+				const screenshot = await capabilities.browser.driver.screenshot(session, path);
+				if (screenshot) {
+					paths.push(screenshot);
+					content.push({ type: "image", data: (await readFile(screenshot)).toString("base64"), mimeType: "image/png" });
+				}
 			}
 		}
 	}

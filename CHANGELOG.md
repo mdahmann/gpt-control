@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- Versioned `WebChatDriver` interface covering probe, create, show, upload, submit, snapshot, state, close, and screenshot operations.
+- External command adapter configured with `GPT_CONTROL_BROWSER_DRIVER`. Requests use JSON on stdin and validated envelopes on stdout, so prompts and file paths do not appear in process arguments.
+- Chrome Bridge adapter behind the same interface.
+
+### Changed
+
+- The public default transport is now `browser`, not `chrome_bridge`.
+- Conversation records persist driver-neutral session and page identifiers plus the driver id.
+- GPT-Control no longer assumes Chrome Bridge is installed. It is one optional autodetected adapter.
+- Storage schema advanced to version 2 for the driver-neutral conversation contract.
+
 ## [0.2.1] - 2026-08-21
 
 ### Changed

@@ -1,7 +1,7 @@
 {
   "name": "gpt-control",
-  "version": "0.2.1",
-  "description": "Let any CLI agent harness control the signed-in ChatGPT web UI through a focus-safe Chrome Bridge transport",
+  "version": "0.3.0",
+  "description": "Let any CLI agent harness control the signed-in ChatGPT web UI through a pluggable browser-driver protocol",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/wolfiesch/gpt-control",

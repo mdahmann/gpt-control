@@ -1,7 +1,7 @@
 ---
 name: gpt-control
-description: Use when the user asks to get an independent model review, cross-check code or a plan, continue a GPT-Control conversation, inspect a model run, or generate or iterate on an image through Chrome Bridge. Not for facts the working tree or a local test can answer directly.
-version: 0.2.1
+description: Use when the user asks to get an independent ChatGPT web review, continue a GPT-Control conversation, inspect a model run, or generate or iterate on an image through a configured browser driver. Not for facts the working tree or a local test can answer directly.
+version: 0.3.0
 ---
 
 # GPT-Control
@@ -11,12 +11,12 @@ tool always talks to the ChatGPT website.
 
 ## Choose a transport
 
-- `chrome_bridge`: default. Signed-in ChatGPT in an inactive tab. If the bridge is leased or unavailable, retry; GPT-Control will not open another browser.
+- `browser`: default. Uses `GPT_CONTROL_BROWSER_DRIVER` when configured, otherwise an autodetected adapter such as Chrome Bridge.
 - `oracle_browser`: explicit legacy fallback. It can take focus and requires `allow_focus_steal=true`.
 - `oracle_api`: explicit paid legacy fallback.
 
-Do not route through Codex or the Responses API. The harness already has its own
-model access, and those paths do not control the ChatGPT web UI.
+Never infer a fallback from driver failure. If the recorded driver is unavailable,
+retry or ask the user to restore that driver.
 
 ## IDs and tools
 

@@ -80,7 +80,7 @@ describe("conversation and run semantics", () => {
 		const fake = browserExec();
 		const service = new GptControlService(fake.exec, new RunStore(scratch()));
 		const workspace = scratch();
-		const first = await service.start({ kind: "chat", prompt: "first", transport: "chrome_bridge", workspaceRoot: workspace, timeoutMs: 200 });
+		const first = await service.start({ kind: "chat", prompt: "first", transport: "browser", workspaceRoot: workspace, timeoutMs: 200 });
 		const second = await service.start({ kind: "chat", prompt: "second", conversationId: first.conversation.id, workspaceRoot: workspace, timeoutMs: 200 });
 		expect(second.conversation.id).toBe(first.conversation.id);
 		expect(second.run.id).not.toBe(first.run.id);
@@ -106,21 +106,21 @@ describe("conversation and run semantics", () => {
 		const workspace = scratch();
 		writeFileSync(join(workspace, "a.ts"), "export const a = 1;\n");
 		const service = new GptControlService(exec, new RunStore(scratch()));
-		const result = await service.start({ kind: "consult", prompt: "review", files: ["a.ts"], transport: "chrome_bridge", workspaceRoot: workspace, timeoutMs: 200 });
+		const result = await service.start({ kind: "consult", prompt: "review", files: ["a.ts"], transport: "browser", workspaceRoot: workspace, timeoutMs: 200 });
 		expect(result.run.result?.verdict).toBe("approve");
 		expect(result.run.attachmentManifest.files[0].sha256).toHaveLength(64);
 		expect(result.run.receipt.promptSha256).toHaveLength(64);
 		expect(result.run.receipt.resultSha256).toHaveLength(64);
 	});
 
-	test("rejects foreign Chrome Bridge sessions before reading or closing", async () => {
+	test("rejects foreign browser sessions before reading or closing", async () => {
 		const fake = browserExec({ foreign: true });
 		const store = new RunStore(scratch());
 		const service = new GptControlService(fake.exec, store);
 		const workspace = scratch();
-		const first = await service.start({ kind: "chat", prompt: "first", transport: "chrome_bridge", workspaceRoot: workspace, timeoutMs: 50 });
+		const first = await service.start({ kind: "chat", prompt: "first", transport: "browser", workspaceRoot: workspace, timeoutMs: 50 });
 		expect(first.run.status).toBe("failed");
-		expect(first.run.error).toContain("foreign Chrome Bridge session");
+		expect(first.run.error).toContain("foreign browser session");
 	});
 });
 

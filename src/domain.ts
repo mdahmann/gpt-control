@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.2.0";
-export const STORAGE_VERSION = 1;
+export const PACKAGE_VERSION = "0.3.0";
+export const STORAGE_VERSION = 2;
 
-export type Provider = "chrome_bridge" | "oracle_browser" | "oracle_api";
+export type Provider = "browser" | "oracle_browser" | "oracle_api";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "needs_user";
 export type RunKind = "consult" | "chat" | "image";
 export type Verdict = "approve" | "request_changes" | "inconclusive";
@@ -65,8 +65,9 @@ export interface ConversationRecord {
 	id: string;
 	provider: Provider;
 	providerConversationId?: string;
-	bridgeSessionId?: string;
-	bridgeTabId?: number;
+	browserDriverId?: string;
+	browserSessionId?: string;
+	browserPageId?: string | number;
 	workspaceRoot: string;
 	createdAt: string;
 	updatedAt: string;

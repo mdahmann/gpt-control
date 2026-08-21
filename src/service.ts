@@ -1,26 +1,7 @@
 import { createHash } from "node:crypto";
-import {
-	describeCapabilities,
-	resetCapabilityCache,
-	resolveCapabilities,
-	selectRoute,
-	type Route,
-	type TransportChoice,
-} from "./capability";
-import {
-	CHATGPT_ORIGIN,
-	attachFiles,
-	closeSession,
-	createSession,
-	openChat,
-	readAssistantSnapshot,
-	setSessionState,
-	showSession,
-	submitPrompt,
-	tabIdFromSession,
-	tabUrl,
-	waitForNewAssistantTurn,
-} from "./chatgpt";
+import { type DriverSession, type WebChatDriver, waitForNewDriverSnapshot } from "./browser-driver";
+import { describeCapabilities, resetCapabilityCache, resolveCapabilities, selectRoute, type TransportChoice } from "./capability";
+import { CHATGPT_ORIGIN } from "./chatgpt";
 import {
 	STORAGE_VERSION,
 	nowIso,
@@ -117,8 +98,7 @@ export class GptControlService {
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {
 			const run = await this.store.getRun(runId);
-			if (TERMINAL.has(run.status)) return run;
-			if (Date.now() >= deadline) return run;
+			if (TERMINAL.has(run.status) || Date.now() >= deadline) return run;
 			await new Promise((done) => setTimeout(done, 200));
 		}
 	}
@@ -132,11 +112,11 @@ export class GptControlService {
 
 	async closeConversation(conversationId: string): Promise<ConversationRecord> {
 		const conversation = await this.store.getConversation(conversationId);
-		if (conversation.provider === "chrome_bridge") {
+		if (conversation.provider === "browser") {
 			const capabilities = await resolveCapabilities(this.exec);
-			if (!capabilities.bridge) throw new Error("Chrome Bridge is unavailable; the conversation tabs were not closed.");
-			await this.assertOwnedBrowserConversation(conversation, capabilities.bridge.launcher);
-			await closeSession(this.exec, capabilities.bridge.launcher, required(conversation.bridgeSessionId, "bridge session id"));
+			const driver = this.requireMatchingDriver(conversation, capabilities.browser?.driver);
+			const session = await this.assertOwnedBrowserConversation(conversation, driver);
+			await driver.close(session.sessionId);
 		}
 		return this.store.updateConversation(conversationId, { closedAt: nowIso() });
 	}
@@ -161,13 +141,13 @@ export class GptControlService {
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
-		if (route.kind === "chrome_bridge") {
-			const launcher = required(route.launcher, "Chrome Bridge launcher");
-			const sessionId = await createSession(this.exec, launcher, `gpt-control:${request.kind}:${conversation.id}`);
-			const tabId = await openChat(this.exec, launcher, sessionId, CHATGPT_ORIGIN);
-			conversation.bridgeSessionId = sessionId;
-			conversation.bridgeTabId = tabId;
-			conversation.providerConversationId = sessionId;
+		if (route.kind === "browser") {
+			const driver = required(route.driver, "browser driver");
+			const session = await driver.create(`gpt-control:${request.kind}:${conversation.id}`, CHATGPT_ORIGIN);
+			conversation.browserDriverId = driver.id;
+			conversation.browserSessionId = session.sessionId;
+			conversation.browserPageId = session.pageId;
+			conversation.providerConversationId = session.sessionId;
 		}
 		await this.store.putConversation(conversation);
 		return conversation;
@@ -176,12 +156,8 @@ export class GptControlService {
 	private async resumeConversation(id: string, transport?: TransportChoice): Promise<ConversationRecord> {
 		const conversation = await this.store.getConversation(id);
 		if (conversation.closedAt) throw new Error(`Conversation ${id} is closed.`);
-		if (transport && transport !== conversation.provider) {
-			throw new Error(`Conversation ${id} uses ${conversation.provider}; it cannot be resumed through ${transport}.`);
-		}
-		if (conversation.provider === "oracle_browser" || conversation.provider === "oracle_api") {
-			throw new Error("Oracle fallback is one-shot only. Omit conversation_id or choose an official transport.");
-		}
+		if (transport && transport !== conversation.provider) throw new Error(`Conversation ${id} uses ${conversation.provider}; it cannot be resumed through ${transport}.`);
+		if (conversation.provider === "oracle_browser" || conversation.provider === "oracle_api") throw new Error("Oracle fallback is one-shot only. Omit conversation_id or use the browser transport.");
 		return conversation;
 	}
 
@@ -225,9 +201,7 @@ export class GptControlService {
 			const completedAt = nowIso();
 			const report = request.kind === "consult" ? parseReviewReport(result.text) : undefined;
 			const resultSha256 = sha256(result.text);
-			await this.store.updateConversation(conversation.id, {
-				providerConversationId: result.providerConversationId ?? conversation.providerConversationId,
-			});
+			await this.store.updateConversation(conversation.id, { providerConversationId: result.providerConversationId ?? conversation.providerConversationId });
 			run = await this.store.updateRun(run.id, {
 				status: "completed",
 				providerRunId: result.providerRunId,
@@ -247,28 +221,20 @@ export class GptControlService {
 			});
 			return run;
 		} catch (error) {
-			const cancelled = signal.aborted;
 			resetCapabilityCache();
 			return this.store.updateRun(run.id, {
-				status: cancelled ? "cancelled" : "failed",
+				status: signal.aborted ? "cancelled" : "failed",
 				error: error instanceof Error ? error.message : String(error),
 				completedAt: nowIso(),
 			});
 		}
 	}
 
-	private async executeProvider(
-		conversation: ConversationRecord,
-		run: RunRecord,
-		request: StartRequest,
-		prompt: string,
-		signal: AbortSignal,
-	): Promise<ProviderTurnResult> {
+	private async executeProvider(conversation: ConversationRecord, run: RunRecord, request: StartRequest, prompt: string, signal: AbortSignal): Promise<ProviderTurnResult> {
 		const capabilities = await resolveCapabilities(this.exec);
-		if (conversation.provider === "chrome_bridge") {
-			const bridge = capabilities.bridge;
-			if (!bridge) throw new Error("Chrome Bridge became unavailable. No foreground fallback was launched.");
-			return this.runBrowserTurn(conversation, run, prompt, bridge.launcher, signal, request.timeoutMs ?? 10 * 60_000);
+		if (conversation.provider === "browser") {
+			const driver = this.requireMatchingDriver(conversation, capabilities.browser?.driver);
+			return this.runBrowserTurn(conversation, run, prompt, driver, signal, request.timeoutMs ?? 10 * 60_000);
 		}
 		const oracle = capabilities.oracle;
 		if (!oracle) throw new Error("Oracle CLI became unavailable.");
@@ -283,45 +249,41 @@ export class GptControlService {
 		return { provider: conversation.provider, text: response.text, model: request.model, transportVersion: oracle.version };
 	}
 
-	private async runBrowserTurn(
-		conversation: ConversationRecord,
-		run: RunRecord,
-		prompt: string,
-		launcher: NonNullable<Route["launcher"]>,
-		signal: AbortSignal,
-		timeoutMs: number,
-	): Promise<ProviderTurnResult> {
-		const owned = await this.assertOwnedBrowserConversation(conversation, launcher);
-		const baseline = await readAssistantSnapshot(this.exec, launcher, owned.tabId, signal);
+	private async runBrowserTurn(conversation: ConversationRecord, run: RunRecord, prompt: string, driver: WebChatDriver, signal: AbortSignal, timeoutMs: number): Promise<ProviderTurnResult> {
+		const session = await this.assertOwnedBrowserConversation(conversation, driver);
+		const baseline = await driver.snapshot(session, signal);
 		await this.store.updateRun(run.id, { baselineMessageCount: baseline.count });
-		await attachFiles(this.exec, launcher, owned.tabId, run.attachmentManifest.files.map((file) => file.path), signal);
-		await submitPrompt(this.exec, launcher, owned.tabId, prompt, signal);
-		const next = await waitForNewAssistantTurn(this.exec, launcher, owned.tabId, { baselineCount: baseline.count, timeoutMs, signal });
+		await driver.upload(session, run.attachmentManifest.files.map((file) => file.path), signal);
+		await driver.submit(session, prompt, signal);
+		const next = await waitForNewDriverSnapshot(driver, session, { baselineCount: baseline.count, timeoutMs, signal });
 		if (!next.snapshot) {
-			await setSessionState(this.exec, launcher, owned.sessionId, "needs_user", signal).catch(() => undefined);
+			await driver.setState(session.sessionId, "needs_user", signal).catch(() => undefined);
 			throw new Error("No new assistant turn appeared before the timeout. Inspect the run later; the previous answer was not returned.");
 		}
-		await setSessionState(this.exec, launcher, owned.sessionId, next.settled ? "completed" : "needs_user", signal).catch(() => undefined);
+		await driver.setState(session.sessionId, next.settled ? "completed" : "needs_user", signal).catch(() => undefined);
 		return {
-			provider: "chrome_bridge",
+			provider: "browser",
 			text: next.snapshot.text,
-			providerConversationId: owned.sessionId,
+			providerConversationId: session.sessionId,
 			providerRunId: `assistant_turn_${next.snapshot.count}`,
-			transportVersion: "chrome-bridge",
+			transportVersion: driver.id,
 			imageUrls: next.snapshot.imageUrls,
 		};
 	}
 
-	private async assertOwnedBrowserConversation(conversation: ConversationRecord, launcher: NonNullable<Route["launcher"]>): Promise<{ sessionId: string; tabId: number }> {
-		const sessionId = required(conversation.bridgeSessionId, "bridge session id");
-		const session = await showSession(this.exec, launcher, sessionId);
-		const name = typeof session.name === "string" ? session.name : "";
-		if (!name.startsWith("gpt-control:")) throw new Error(`Refused foreign Chrome Bridge session ${sessionId}.`);
-		const tabId = tabIdFromSession(session);
-		if (tabId === undefined || tabId !== conversation.bridgeTabId) throw new Error(`Chrome Bridge session ${sessionId} no longer owns the recorded tab.`);
-		const current = await tabUrl(this.exec, launcher, tabId);
-		if (!current || new URL(current).origin !== CHATGPT_ORIGIN) throw new Error(`Refused tab outside ${CHATGPT_ORIGIN}.`);
-		return { sessionId, tabId };
+	private requireMatchingDriver(conversation: ConversationRecord, driver?: WebChatDriver): WebChatDriver {
+		if (!driver) throw new Error("The recorded browser driver is unavailable. No fallback browser was launched.");
+		if (driver.id !== conversation.browserDriverId) throw new Error(`Conversation ${conversation.id} belongs to browser driver ${conversation.browserDriverId}, not ${driver.id}.`);
+		return driver;
+	}
+
+	private async assertOwnedBrowserConversation(conversation: ConversationRecord, driver: WebChatDriver): Promise<DriverSession> {
+		const sessionId = required(conversation.browserSessionId, "browser session id");
+		const session = await driver.show(sessionId);
+		if (!session.name.startsWith("gpt-control:")) throw new Error(`Refused foreign browser session ${sessionId}.`);
+		if (session.pageId !== conversation.browserPageId) throw new Error(`Browser session ${sessionId} no longer owns the recorded page.`);
+		if (new URL(session.url).origin !== CHATGPT_ORIGIN) throw new Error(`Refused page outside ${CHATGPT_ORIGIN}.`);
+		return session;
 	}
 }
 
