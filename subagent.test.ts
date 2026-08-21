@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -381,6 +381,146 @@ describe("MCP task delivery", () => {
 });
 
 describe("MCP cancellation, reconnect, restart, and fallback", () => {
+	test("a task cancelled before a crash cannot submit during restart recovery", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const prepared = await first.service.start({
+			kind: "subagent",
+			prompt: "MUST_NOT_SUBMIT_AFTER_CANCEL",
+			idempotencyKey: "cancel-crash-restart",
+			wait: false,
+			timeoutMs: 1500,
+		}, { deferExecution: true });
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), first.service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "cancel-crash-restart" } } } as never,
+		);
+		await taskStore.bindRun(task.taskId, prepared.run.id);
+		await first.service.store.updateRun(prepared.run.id, { mcpTaskId: task.taskId });
+
+		// No cancellation listener is installed. This is the exact process-crash
+		// boundary that previously left a cancelled task bound to a queued run.
+		await taskStore.updateTaskStatus(task.taskId, "cancelled", "cancel before broker crash");
+		expect((await taskStore.getTask(task.taskId))?.status).toBe("cancelled");
+		expect((await first.service.getRun(prepared.run.id)).status).toBe("cancelled");
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect((await second.service.getRun(prepared.run.id)).status).toBe("cancelled");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("restart reconciles a cancelled binding beyond the former 100-task cutoff", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const prepared = await first.service.start({
+			kind: "subagent",
+			prompt: "MUST_NOT_SUBMIT_AFTER_PAGINATED_CANCEL",
+			idempotencyKey: "cancelled-binding-after-one-hundred",
+			wait: false,
+			timeoutMs: 1500,
+		}, { deferExecution: true });
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), first.service.store);
+		const tasks = [];
+		for (let index = 0; index < 101; index += 1) {
+			tasks.push(await taskStore.createTask(
+				{ ttl: 60_000, pollInterval: 100 },
+				index + 1,
+				{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: `pagination-${index}` } } } as never,
+			));
+		}
+		const target = tasks.slice().sort((a, b) => a.taskId.localeCompare(b.taskId)).at(-1)!;
+		await taskStore.bindRun(target.taskId, prepared.run.id);
+		await first.service.store.updateRun(prepared.run.id, { mcpTaskId: target.taskId });
+
+		// Recreate the legacy crash boundary directly: task cancellation was durable,
+		// but its bound run was still queued and executable.
+		const taskPath = join(root, "state", "mcp-tasks", `${target.taskId}.json`);
+		const record = JSON.parse(readFileSync(taskPath, "utf8")) as { task: { status: string; lastUpdatedAt: string } };
+		record.task.status = "cancelled";
+		record.task.lastUpdatedAt = new Date().toISOString();
+		writeFileSync(taskPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+		expect(await taskStore.listBindings(100)).toHaveLength(100);
+		expect(await taskStore.listBindings()).toHaveLength(101);
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		expect((await second.service.getRun(prepared.run.id)).status).toBe("cancelled");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("restart retries the provider Stop boundary for a submitted cancelled run", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "[slow] stop after restart",
+			idempotencyKey: "cancelled-provider-stop-retry",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => {
+			const conversation = await first.service.store.getConversation(started.conversation.id);
+			return bridge.submittedPrompts.length === 1 && Boolean(conversation.providerConversationUrl);
+		});
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), first.service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "cancelled-provider-stop-retry" } } } as never,
+		);
+		await taskStore.bindRun(task.taskId, started.run.id);
+		await taskStore.updateTaskStatus(task.taskId, "cancelled", "cancel before stop listener");
+		expect((await first.service.getRun(started.run.id)).status).toBe("cancelled");
+		expect(bridge.stopClicks).toEqual([]);
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		expect(bridge.stopClicks).toHaveLength(1);
+		expect((await second.service.getRun(started.run.id)).status).toBe("cancelled");
+	});
+
+	test("provider completion that wins the durable race is not discarded by late task cancellation", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(join(root, "state"), workspace, bridge);
+		const completed = await service.start({
+			kind: "subagent",
+			prompt: "completion wins",
+			idempotencyKey: "completion-wins-cancel-race",
+			timeoutMs: 1000,
+		});
+		expect(completed.run.status).toBe("completed");
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "completion-wins-cancel-race" } } } as never,
+		);
+		await taskStore.bindRun(task.taskId, completed.run.id);
+
+		await taskStore.updateTaskStatus(task.taskId, "cancelled", "late cancellation");
+		expect((await taskStore.getTask(task.taskId))?.status).toBe("working");
+		expect((await service.getRun(completed.run.id)).status).toBe("completed");
+		await resumeDurableSubagents(service, taskStore, new Map());
+		await waitUntil(async () => (await taskStore.getTask(task.taskId))?.status === "completed");
+		expect((await taskStore.getTaskResult(task.taskId) as CallToolResult).structuredContent).toMatchObject({ workerStatus: "completed" });
+	});
+
 	test("immediate task cancellation after creation prevents prompt submission", async () => {
 		const harness = await connectMcp({ bridge: new FakeChromeBridge({ firstTabRaceReads: 20 }) });
 		try {
@@ -501,12 +641,22 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		try {
 			const result = await harness.client.callTool({
 				name: "gpt_subagent_run",
-				arguments: { prompt: "fallback worker", idempotency_key: "fallback-worker", timeout_ms: 1000 },
+				arguments: {
+					prompt: "fallback worker",
+					idempotency_key: "fallback-worker",
+					connectors: ["GitHub"],
+					connector_mode: "require",
+					timeout_ms: 1000,
+				},
 			});
 			expect(result.isError).not.toBe(true);
-			expect(result.structuredContent).toMatchObject({ run: { status: "completed" } });
+			expect(result.structuredContent).toMatchObject({ run: {
+				status: "completed",
+				connectorVerification: { status: "unverified", evidenceKind: "provider_prompt_intent_only" },
+			} });
 			expect(await harness.taskStore.listBindings()).toEqual([]);
-			expect(harness.bridge.submittedPrompts).toEqual(["fallback worker"]);
+			expect(harness.bridge.submittedPrompts).toHaveLength(1);
+			expect(harness.bridge.submittedPrompts[0]).toContain("Assignment:\nfallback worker");
 		} finally {
 			await harness.close();
 		}

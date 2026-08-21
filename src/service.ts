@@ -324,6 +324,26 @@ export class GptControlService {
 		return describeCapabilities(await this.dependencies.resolveCapabilities(this.exec));
 	}
 
+	async retryCancelledProviderStops(): Promise<{ attempted: string[]; stopped: string[]; blocked: Array<{ runId: string; reason: string }> }> {
+		const attempted: string[] = [];
+		const stopped: string[] = [];
+		const blocked: Array<{ runId: string; reason: string }> = [];
+		const cancelled = await this.store.listRuns({ statuses: ["cancelled"], limit: 1_000 });
+		for (const run of cancelled) {
+			if (run.submissionState !== "submitting" && run.submissionState !== "submitted") continue;
+			attempted.push(run.id);
+			try {
+				// This is observation plus an idempotent Stop click only when the exact
+				// owned conversation still proves an active provider turn.
+				await this.stopOwnedBrowserRun(run);
+				stopped.push(run.id);
+			} catch (error) {
+				blocked.push({ runId: run.id, reason: errorMessage(error) });
+			}
+		}
+		return { attempted, stopped, blocked };
+	}
+
 	async recoverActiveRuns(): Promise<{ resumed: string[]; blocked: string[]; deferred: string[] }> {
 		await this.store.init();
 		const runs = await this.store.listRuns({ statuses: ["queued", "running"], limit: 1_000 });

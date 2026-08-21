@@ -86,9 +86,12 @@ A worker can request connected tools:
 }
 ```
 
-Connector names express intent only. They do not grant permission or prove
-availability. A required unavailable connector must produce a blocker rather
-than invented evidence.
+Connector names express prompt intent only. They do not grant permission or
+prove availability. GPT-Control cannot observe ChatGPT connector tool calls, so
+every connector-enabled result reports `connectorVerification.status` as
+`unverified`. The worker is instructed to return a blocker when a required
+connector is unavailable, but the caller must independently verify the actual
+connector call and evidence before accepting the result.
 
 ## Conversations, runs, and receipts
 

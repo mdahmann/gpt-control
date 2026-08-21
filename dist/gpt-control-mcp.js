@@ -36111,6 +36111,24 @@ class GptControlService {
       throw new Error("Active diagnostics are disabled by trusted operator policy.");
     return describeCapabilities(await this.dependencies.resolveCapabilities(this.exec));
   }
+  async retryCancelledProviderStops() {
+    const attempted = [];
+    const stopped = [];
+    const blocked = [];
+    const cancelled = await this.store.listRuns({ statuses: ["cancelled"], limit: 1000 });
+    for (const run of cancelled) {
+      if (run.submissionState !== "submitting" && run.submissionState !== "submitted")
+        continue;
+      attempted.push(run.id);
+      try {
+        await this.stopOwnedBrowserRun(run);
+        stopped.push(run.id);
+      } catch (error51) {
+        blocked.push({ runId: run.id, reason: errorMessage2(error51) });
+      }
+    }
+    return { attempted, stopped, blocked };
+  }
   async recoverActiveRuns() {
     await this.store.init();
     const runs = await this.store.listRuns({ statuses: ["queued", "running"], limit: 1000 });
@@ -36988,8 +37006,11 @@ class DurableTaskStore {
     return record3.result;
   }
   async updateTaskStatus(taskId, status, statusMessage, _sessionId) {
+    if (status === "cancelled") {
+      await this.cancelTask(taskId, statusMessage);
+      return;
+    }
     let notify;
-    let cancelledRunId;
     await this.mutate(taskId, (record3) => {
       if (record3.task.status === status) {
         if (statusMessage === undefined || statusMessage === record3.task.statusMessage)
@@ -37008,11 +37029,7 @@ class DurableTaskStore {
       const timestamp = nowIso();
       record3.task = { ...record3.task, status, lastUpdatedAt: timestamp, statusMessage };
       record3.statusHistory.push({ status, at: timestamp, message: statusMessage });
-      if (status === "cancelled") {
-        record3.result = cancellationResult(taskId, record3.runId, statusMessage);
-        record3.resultHash = jsonHash(record3.result);
-        cancelledRunId = record3.runId;
-      } else if ((status === "completed" || status === "failed") && record3.result === undefined) {
+      if ((status === "completed" || status === "failed") && record3.result === undefined) {
         record3.result = statusResult(taskId, status, statusMessage);
         record3.resultHash = jsonHash(record3.result);
       }
@@ -37021,9 +37038,6 @@ class DurableTaskStore {
     });
     if (notify)
       await this.notify(taskId, notify);
-    if (notify?.status === "cancelled") {
-      await this.cancellationListener?.(taskId, cancelledRunId);
-    }
   }
   async listTasks(cursor, _sessionId) {
     await this.init();
@@ -37065,15 +37079,16 @@ class DurableTaskStore {
     } while (cursor);
     return;
   }
-  async listBindings(limit = 100) {
+  async listBindings(limit) {
     const values = [];
+    const boundedLimit = limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(limit, 1000));
     let cursor;
     do {
       const page = await this.listTasks(cursor);
       for (const task of page.tasks) {
         const record3 = await this.readRecord(task.taskId);
         values.push({ task: record3.task, runId: record3.runId });
-        if (values.length >= Math.max(1, Math.min(limit, 1000)))
+        if (values.length >= boundedLimit)
           return values;
       }
       cursor = page.nextCursor;
@@ -37103,6 +37118,41 @@ class DurableTaskStore {
       validateRecord(next, taskId);
       await atomicWrite2(this.taskPath(taskId), next, false);
     });
+  }
+  async cancelTask(taskId, statusMessage) {
+    let notify;
+    let cancelledRunId;
+    await this.lockStore.withTaskLock(taskId, async () => {
+      const record3 = await this.readRecord(taskId);
+      if (record3.task.status === "cancelled" || TERMINAL3.has(record3.task.status))
+        return;
+      if (!TRANSITIONS2[record3.task.status].has("cancelled")) {
+        throw new Error(`Invalid task transition ${record3.task.status} -> cancelled.`);
+      }
+      const timestamp = nowIso();
+      cancelledRunId = record3.runId;
+      if (cancelledRunId) {
+        const run = await this.lockStore.updateRun(cancelledRunId, {
+          status: "cancelled",
+          cancellationRequestedAt: timestamp,
+          completedAt: timestamp,
+          error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
+        });
+        if (run.status !== "cancelled")
+          return;
+      }
+      record3.task = { ...record3.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
+      record3.result = cancellationResult(taskId, record3.runId, statusMessage);
+      record3.resultHash = jsonHash(record3.result);
+      record3.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
+      validateRecord(record3, taskId);
+      await atomicWrite2(this.taskPath(taskId), record3, false);
+      notify = record3.task;
+    });
+    if (notify)
+      await this.notify(taskId, notify);
+    if (notify)
+      await this.cancellationListener?.(taskId, cancelledRunId);
   }
   async notify(taskId, task) {
     try {
@@ -37545,8 +37595,20 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
 }
 async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
   await taskStore.init();
+  const stopRecovery = await service.retryCancelledProviderStops();
+  if (stopRecovery.blocked.length > 0) {
+    console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
+  }
+  const bindings = await taskStore.listBindings();
+  for (const binding of bindings) {
+    if (!binding.runId || !["completed", "failed", "cancelled"].includes(binding.task.status))
+      continue;
+    const run = await service.getRun(binding.runId);
+    if (run.status === "queued" || run.status === "running" || run.status === "cancelled")
+      await service.cancelRun(binding.runId);
+  }
   await service.recoverActiveRuns();
-  for (const binding of await taskStore.listBindings(100)) {
+  for (const binding of bindings) {
     if (["completed", "failed", "cancelled"].includes(binding.task.status))
       continue;
     if (!binding.runId) {
@@ -37557,9 +37619,6 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
       }, true));
       continue;
     }
-    const run = await service.getRun(binding.runId);
-    if (!run.executionReady)
-      continue;
     await service.schedulePreparedRun(binding.runId);
     startTaskMonitor(service, taskStore, monitors, binding.task.taskId, binding.runId);
   }
@@ -37614,6 +37673,11 @@ function publicRun(run) {
     kind: run.kind,
     status: run.status,
     connectorIntent: run.connectorIntent,
+    connectorVerification: run.connectorIntent ? {
+      status: "unverified",
+      evidenceKind: "provider_prompt_intent_only",
+      note: "GPT-Control cannot observe ChatGPT connector tool calls. Verify required connector results independently before accepting the worker output."
+    } : undefined,
     providerRunId: run.providerRunId,
     resultText: run.resultText,
     report: run.result,

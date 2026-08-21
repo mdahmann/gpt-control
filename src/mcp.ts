@@ -447,8 +447,21 @@ export async function resumeDurableSubagents(
 	monitors = new Map<string, Promise<void>>(),
 ): Promise<void> {
 	await taskStore.init();
+	const stopRecovery = await service.retryCancelledProviderStops();
+	if (stopRecovery.blocked.length > 0) {
+		console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
+	}
+	const bindings = await taskStore.listBindings();
+	// Reconcile durable task authority before recovering runnable work. This also
+	// repairs records written by older builds that persisted task cancellation
+	// before run cancellation and then crashed between those writes.
+	for (const binding of bindings) {
+		if (!binding.runId || !["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
+		const run = await service.getRun(binding.runId);
+		if (run.status === "queued" || run.status === "running" || run.status === "cancelled") await service.cancelRun(binding.runId);
+	}
 	await service.recoverActiveRuns();
-	for (const binding of await taskStore.listBindings(100)) {
+	for (const binding of bindings) {
 		if (["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
 		if (!binding.runId) {
 			await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("Pro worker task has no durable run binding; no prompt was resubmitted.", {
@@ -458,8 +471,6 @@ export async function resumeDurableSubagents(
 			}, true));
 			continue;
 		}
-		const run = await service.getRun(binding.runId);
-		if (!run.executionReady) continue;
 		await service.schedulePreparedRun(binding.runId);
 		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, binding.runId);
 	}
@@ -520,6 +531,11 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		kind: run.kind,
 		status: run.status,
 		connectorIntent: run.connectorIntent,
+		connectorVerification: run.connectorIntent ? {
+			status: "unverified",
+			evidenceKind: "provider_prompt_intent_only",
+			note: "GPT-Control cannot observe ChatGPT connector tool calls. Verify required connector results independently before accepting the worker output.",
+		} : undefined,
 		providerRunId: run.providerRunId,
 		resultText: run.resultText,
 		report: run.result,

@@ -3,8 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 LOG_DIR=${GPT_CONTROL_VERIFY_LOG_DIR:-/tmp/gpt-control-0.3.1-verification}
-EXPECTED_BASE=37390634844c8b9fc0dc73894b6b72a04f05826c
-EXPECTED_BRANCH=pro/upstream-0.3-hardening-subagents
+EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
   BUN=${GPT_CONTROL_BUN}
@@ -24,14 +23,12 @@ chmod 700 "$LOG_DIR"
 cd "$ROOT"
 
 branch=$(git branch --show-current)
-if [[ -n "$branch" && "$branch" != "$EXPECTED_BRANCH" && "${GPT_CONTROL_ALLOW_VERIFY_OTHER_BRANCH:-0}" != 1 ]]; then
-  printf 'Refusing verification on branch %s; expected %s.\n' "$branch" "$EXPECTED_BRANCH" >&2
-  exit 1
+if [[ -n "$EXPECTED_BASE" ]]; then
+  git merge-base --is-ancestor "$EXPECTED_BASE" HEAD || {
+    printf 'Expected upstream base %s is not an ancestor of HEAD.\n' "$EXPECTED_BASE" >&2
+    exit 1
+  }
 fi
-git merge-base --is-ancestor "$EXPECTED_BASE" HEAD || {
-  printf 'Expected upstream base %s is not an ancestor of HEAD.\n' "$EXPECTED_BASE" >&2
-  exit 1
-}
 
 run_gate() {
   local name=$1
@@ -58,6 +55,7 @@ run_gate transport-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test tr
 run_gate subagent-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test subagent.test.ts
 run_gate contract-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test index.test.ts
 run_gate full-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test
+run_gate production-audit "$BUN" audit --production
 run_gate shell-syntax bash -n bin/gpt-control-mcp scripts/verify-security.sh
 run_gate python-syntax python3 -c 'from pathlib import Path; [compile(path.read_text(), str(path), "exec") for path in (Path("scripts/mcp-stdio-smoke.py"), Path("scripts/package-smoke.py"))]'
 run_gate package-smoke python3 scripts/package-smoke.py
@@ -84,7 +82,7 @@ printf 'EXIT=0\n' >> "$LOG_DIR/secret-scan.log"
   printf 'bun=%s\n' "$("$BUN" --version)"
   printf 'node=%s\n' "$(node --version)"
   printf 'codex=%s\n' "$(codex --version 2>/dev/null | tail -1 || true)"
-  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests full-tests shell-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
+  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests full-tests production-audit shell-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
     printf '%s_exit=%s\n' "$gate" "$(sed -n 's/^EXIT=//p' "$LOG_DIR/$gate.log" | tail -1)"
   done
 } > "$LOG_DIR/summary.txt"

@@ -5,12 +5,16 @@ import { join } from "node:path";
 import {
 	CHATGPT_ORIGIN,
 	captureOwnedScreenshot,
+	clickSend,
 	createSession,
 	extractChatPageObservation,
 	extractComposerModel,
+	fillPrompt,
 	openChat,
 	selectAndVerifyChatGptModel,
+	tabUrl,
 	verifyChatGptModelBeforeSend,
+	waitForCompletedAssistantTurn,
 	waitForOwnedChatReady,
 } from "./src/chatgpt";
 import { FakeChromeBridge, makeChromeService } from "./test_helpers";
@@ -69,6 +73,44 @@ describe("observed Chrome failures", () => {
 		expect(bridge.submittedPrompts).toEqual(["same chat recovery"]);
 		expect(result.run.receipt.providerConversationUrl).toMatch(/^https:\/\/chatgpt\.com\/c\//);
 		expect(result.run.receipt.recoveryAttempts?.some((attempt) => attempt.action === "restore_conversation_url")).toBe(true);
+	});
+
+	test("restores conversation A after the owned page drifts to valid conversation B", async () => {
+		const bridge = new FakeChromeBridge({ driftToDifferentConversation: true });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "subagent", prompt: "wrong conversation recovery", timeoutMs: 1500 });
+		expect(result.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["wrong conversation recovery"]);
+		expect(result.run.receipt.providerConversationUrl).toMatch(/^https:\/\/chatgpt\.com\/c\/fake-/);
+		expect(result.run.receipt.providerConversationUrl).not.toContain("foreign-");
+		expect(result.run.receipt.recoveryAttempts).toContainEqual(expect.objectContaining({
+			action: "restore_conversation_url",
+			outcome: "recovered",
+			reason: expect.stringContaining("different ChatGPT conversation"),
+		}));
+	});
+
+	test("legacy completion helper also refuses to adopt a different valid conversation", async () => {
+		const { bridge, sessionId, tabId } = await readyFake({ driftToDifferentConversation: true });
+		await fillPrompt(bridge.exec, bridge.launcher, tabId, "legacy exact recovery");
+		await clickSend(bridge.exec, bridge.launcher, tabId);
+		const exactUrl = await tabUrl(bridge.exec, bridge.launcher, tabId);
+		expect(exactUrl).toMatch(/^https:\/\/chatgpt\.com\/c\/fake-/);
+		const outcome = await waitForCompletedAssistantTurn(bridge.exec, bridge.launcher, sessionId, tabId, {
+			baselineCount: 0,
+			conversationUrl: exactUrl,
+			timeoutMs: 1000,
+			intervalMs: 1,
+			stableRounds: 1,
+		});
+		expect(outcome.terminalStatus).toBe("completed");
+		expect(outcome.providerConversationUrl).toBe(exactUrl);
+		expect(outcome.providerConversationUrl).not.toContain("foreign-");
+		expect(outcome.recoveryAttempts).toContainEqual(expect.objectContaining({
+			action: "restore_conversation_url",
+			outcome: "recovered",
+		}));
+		expect(bridge.submittedPrompts).toEqual(["legacy exact recovery"]);
 	});
 
 	test("recovers a network error by explicit live Retry without duplicate prompt submission", async () => {

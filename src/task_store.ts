@@ -135,8 +135,11 @@ export class DurableTaskStore implements TaskStore {
 		statusMessage?: string,
 		_sessionId?: string,
 	): Promise<void> {
+		if (status === "cancelled") {
+			await this.cancelTask(taskId, statusMessage);
+			return;
+		}
 		let notify: Task | undefined;
-		let cancelledRunId: string | undefined;
 		await this.mutate(taskId, (record) => {
 			if (record.task.status === status) {
 				if (statusMessage === undefined || statusMessage === record.task.statusMessage) return record;
@@ -153,11 +156,7 @@ export class DurableTaskStore implements TaskStore {
 			const timestamp = nowIso();
 			record.task = { ...record.task, status, lastUpdatedAt: timestamp, statusMessage };
 			record.statusHistory.push({ status, at: timestamp, message: statusMessage });
-			if (status === "cancelled") {
-				record.result = cancellationResult(taskId, record.runId, statusMessage);
-				record.resultHash = jsonHash(record.result);
-				cancelledRunId = record.runId;
-			} else if ((status === "completed" || status === "failed") && record.result === undefined) {
+			if ((status === "completed" || status === "failed") && record.result === undefined) {
 				record.result = statusResult(taskId, status, statusMessage);
 				record.resultHash = jsonHash(record.result);
 			}
@@ -165,9 +164,6 @@ export class DurableTaskStore implements TaskStore {
 			return record;
 		});
 		if (notify) await this.notify(taskId, notify);
-		if (notify?.status === "cancelled") {
-			await this.cancellationListener?.(taskId, cancelledRunId);
-		}
 	}
 
 	async listTasks(cursor?: string, _sessionId?: string): Promise<{ tasks: Task[]; nextCursor?: string }> {
@@ -214,15 +210,16 @@ export class DurableTaskStore implements TaskStore {
 		return undefined;
 	}
 
-	async listBindings(limit = 100): Promise<Array<{ task: Task; runId?: string }>> {
+	async listBindings(limit?: number): Promise<Array<{ task: Task; runId?: string }>> {
 		const values: Array<{ task: Task; runId?: string }> = [];
+		const boundedLimit = limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(limit, 1000));
 		let cursor: string | undefined;
 		do {
 			const page = await this.listTasks(cursor);
 			for (const task of page.tasks) {
 				const record = await this.readRecord(task.taskId);
 				values.push({ task: record.task, runId: record.runId });
-				if (values.length >= Math.max(1, Math.min(limit, 1000))) return values;
+				if (values.length >= boundedLimit) return values;
 			}
 			cursor = page.nextCursor;
 		} while (cursor);
@@ -253,6 +250,42 @@ export class DurableTaskStore implements TaskStore {
 			validateRecord(next, taskId);
 			await atomicWrite(this.taskPath(taskId), next, false);
 		});
+	}
+
+	private async cancelTask(taskId: string, statusMessage?: string): Promise<void> {
+		let notify: Task | undefined;
+		let cancelledRunId: string | undefined;
+		await this.lockStore.withTaskLock(taskId, async () => {
+			const record = await this.readRecord(taskId);
+			if (record.task.status === "cancelled" || TERMINAL.has(record.task.status)) return;
+			if (!TRANSITIONS[record.task.status].has("cancelled")) {
+				throw new Error(`Invalid task transition ${record.task.status} -> cancelled.`);
+			}
+			const timestamp = nowIso();
+			cancelledRunId = record.runId;
+			if (cancelledRunId) {
+				// The run is the execution authority. Seal it before the task record so a
+				// process crash can never leave a cancelled task bound to runnable work.
+				const run = await this.lockStore.updateRun(cancelledRunId, {
+					status: "cancelled",
+					cancellationRequestedAt: timestamp,
+					completedAt: timestamp,
+					error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored.",
+				});
+				// If provider completion won the run-record lock, do not discard that
+				// immutable result by independently cancelling its still-working task.
+				if (run.status !== "cancelled") return;
+			}
+			record.task = { ...record.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
+			record.result = cancellationResult(taskId, record.runId, statusMessage);
+			record.resultHash = jsonHash(record.result);
+			record.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
+			validateRecord(record, taskId);
+			await atomicWrite(this.taskPath(taskId), record, false);
+			notify = record.task;
+		});
+		if (notify) await this.notify(taskId, notify);
+		if (notify) await this.cancellationListener?.(taskId, cancelledRunId);
 	}
 
 	private async notify(taskId: string, task: Task): Promise<void> {

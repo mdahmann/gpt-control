@@ -52,10 +52,18 @@ It does not grant permissions.
 - `require`: return a blocker if any named connector is unavailable. Never
   fabricate connector access, output, or a successful action.
 
+This contract is advisory because the browser broker cannot observe ChatGPT's
+connector tool-call stream. Public run data therefore reports connector
+verification as `unverified` with evidence kind `provider_prompt_intent_only`.
+For a required GitHub or Zenbox connector, Codex must independently check a
+harmless connector result and its source before it accepts the worker output.
+
 ## Cancellation and restart
 
 `tasks/cancel` and `gpt_subagent_cancel` first seal the durable run as cancelled,
-then attempt to stop the exact browser turn. A late completion is ignored.
+then seal the task, then attempt to stop the exact browser turn. A crash between
+these steps cannot leave a cancelled task bound to runnable work. A late
+completion is ignored.
 
 On shutdown, the MCP process suspends its local watcher. On restart, submitted
 work is observed in the same driver/session/page/conversation with the original

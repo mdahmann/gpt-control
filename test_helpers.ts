@@ -20,6 +20,7 @@ export interface FakeBridgeOptions {
 	foreignSession?: boolean;
 	reloadToHome?: boolean;
 	conversationRenderNeedsReload?: boolean;
+	driftToDifferentConversation?: boolean;
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
 }
 
@@ -44,6 +45,8 @@ interface FakeTab {
 	state: string;
 	restoredUrl?: string;
 	reloadsAtConversation: number;
+	conversationUrlReads: number;
+	didDriftConversation: boolean;
 	name: string;
 }
 
@@ -206,6 +209,8 @@ export class FakeChromeBridge {
 				turns: [],
 				state: "working",
 				reloadsAtConversation: 0,
+				conversationUrlReads: 0,
+				didDriftConversation: false,
 				name: this.sessionNames.get(sessionId) ?? "",
 			});
 			return ok({ tabId: id });
@@ -297,6 +302,13 @@ export class FakeChromeBridge {
 		if (tab.url === "chrome://newtab/") {
 			tab.newTabReads += 1;
 			if (tab.newTabReads > (this.options.firstTabRaceReads ?? 0)) tab.url = "https://chatgpt.com/";
+		}
+		if (this.options.driftToDifferentConversation && tab.url.includes("/c/")) {
+			if (tab.conversationUrlReads >= 1 && !tab.didDriftConversation) {
+				tab.url = `https://chatgpt.com/c/foreign-${tab.id}`;
+				tab.didDriftConversation = true;
+			}
+			tab.conversationUrlReads += 1;
 		}
 		return tab.url;
 	}

@@ -528,8 +528,12 @@ export async function waitForCompletedAssistantTurn(
 	const maxRecoveryCycles = options.maxRecoveryCycles ?? 3;
 	const deadline = Date.now() + options.timeoutMs;
 	const recoveryAttempts: RecoveryAttempt[] = [];
-	let conversationUrl = options.conversationUrl;
-	let conversationId = providerConversationIdentity(conversationUrl ?? "")?.id;
+	const suppliedIdentity = options.conversationUrl ? providerConversationIdentity(options.conversationUrl) : undefined;
+	if (options.conversationUrl && !suppliedIdentity) {
+		throw new Error(`Refused unprovable ChatGPT conversation URL: ${options.conversationUrl}`);
+	}
+	let conversationUrl = suppliedIdentity?.url;
+	let conversationId = suppliedIdentity?.id;
 	let previous: string | undefined;
 	let steady = 0;
 	let latest: AssistantSnapshot | undefined;
@@ -541,8 +545,31 @@ export async function waitForCompletedAssistantTurn(
 		await sleep(intervalMs);
 		if (options.signal?.aborted) throw new Error("ChatGPT completion wait was cancelled.");
 		lastObservedUrl = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, options.signal);
-		const identity = providerConversationIdentity(lastObservedUrl ?? "");
-		if (identity) {
+		let identity = providerConversationIdentity(lastObservedUrl ?? "");
+		if (conversationUrl && identity?.url !== conversationUrl) {
+			try {
+				await restoreExactConversation(exec, launcher, sessionId, tabId, conversationUrl, options.baselineCount, {
+					timeoutMs: Math.max(intervalMs * 3, 1_000), signal: options.signal,
+				});
+				recoveryAttempts.push({
+					at: nowIso(), action: "restore_conversation_url",
+					reason: identity
+						? `Owned page drifted to a different ChatGPT conversation (${identity.id}).`
+						: `Owned page lost its exact ChatGPT conversation URL (${lastObservedUrl}).`,
+					outcome: "recovered", detail: conversationUrl,
+				});
+				lastObservedUrl = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, options.signal);
+				identity = providerConversationIdentity(lastObservedUrl ?? "");
+				if (identity?.url !== conversationUrl) throw new Error(`Observed ${lastObservedUrl} after exact restoration.`);
+			} catch (error) {
+				return {
+					terminalStatus: "needs_user",
+					reason: `Could not restore the exact ChatGPT conversation without resubmitting: ${error instanceof Error ? error.message : String(error)}`,
+					snapshot: latest, providerConversationId: conversationId, providerConversationUrl: conversationUrl,
+					recoveryAttempts, lastObservedUrl, lastObservedUiState,
+				};
+			}
+		} else if (!conversationUrl && identity) {
 			conversationUrl = identity.url;
 			conversationId = identity.id;
 		}
@@ -560,9 +587,13 @@ export async function waitForCompletedAssistantTurn(
 			recoveryCycles += 1;
 			lastObservedUrl = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, options.signal);
 			const recoveredIdentity = providerConversationIdentity(lastObservedUrl ?? "");
-			if (recoveredIdentity) {
-				conversationUrl = recoveredIdentity.url;
-				conversationId = recoveredIdentity.id;
+			if (conversationUrl && recoveredIdentity?.url !== conversationUrl) {
+				return {
+					terminalStatus: "needs_user",
+					reason: `Recovery left the owned page outside the exact ChatGPT conversation ${conversationUrl}.`,
+					snapshot: latest, providerConversationId: conversationId, providerConversationUrl: conversationUrl,
+					recoveryAttempts, lastObservedUrl, lastObservedUiState,
+				};
 			}
 			lastObservedUiState = observation.stateSummary;
 			latest = observation.snapshot.count > options.baselineCount ? observation.snapshot : latest;
@@ -587,15 +618,15 @@ export async function waitForCompletedAssistantTurn(
 			continue;
 		}
 		latest = observation.snapshot;
-		const finalCandidate = (observation.snapshot.hasMarkdown && observation.snapshot.text.trim() !== "")
-			|| observation.snapshot.imageUrls.length > 0;
+		const finalCandidate = ((observation.snapshot.hasMarkdown && observation.snapshot.text.trim() !== "")
+			|| observation.snapshot.imageUrls.length > 0) && Boolean(conversationUrl && conversationId);
 		if (!finalCandidate || observation.answering || observation.thinking || observation.toolRunning || observation.errorMessage
 			|| observation.retryAvailable || observation.continueAvailable) {
 			steady = 0;
 			previous = undefined;
 			continue;
 		}
-		const fingerprint = `${observation.snapshot.text}\u0000${observation.snapshot.imageUrls.join(",")}`;
+		const fingerprint = `${observation.snapshot.count}\u0000${observation.snapshot.messageId ?? ""}\u0000${observation.snapshot.text}\u0000${observation.snapshot.imageUrls.join(",")}`;
 		if (fingerprint === previous) {
 			steady += 1;
 			if (steady >= stableRounds) {
@@ -988,16 +1019,15 @@ async function recoverSameConversation(
 		options.attempts.push({ at: nowIso(), action: "reload", reason, outcome: "failed", detail: error instanceof Error ? error.message : String(error) });
 	}
 
-	let current = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, options.signal);
-	if (options.conversationUrl && (!current || !providerConversationIdentity(current))) {
+	const current = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, options.signal);
+	const expectedIdentity = options.conversationUrl ? providerConversationIdentity(options.conversationUrl) : undefined;
+	if (expectedIdentity && providerConversationIdentity(current ?? "")?.url !== expectedIdentity.url) {
 		try {
-			const identity = providerConversationIdentity(options.conversationUrl);
-			if (!identity) throw new Error("retained conversation URL is not provable");
-			const payload = await bridgeJson(exec, launcher, ["taskSession", "navigate", sessionId, identity.url], options.signal, 120_000);
+			const payload = await bridgeJson(exec, launcher, ["taskSession", "navigate", sessionId, expectedIdentity.url], options.signal, 120_000);
 			const navigated = extractTabId(payload);
 			if (navigated !== undefined && navigated !== tabId) throw new Error("recovery attempted to replace the owned tab");
 			await bridgeJson(exec, launcher, ["reload", String(tabId)], options.signal, 120_000);
-			options.attempts.push({ at: nowIso(), action: "restore_conversation_url", reason, outcome: "still_active", detail: identity.url });
+			options.attempts.push({ at: nowIso(), action: "restore_conversation_url", reason, outcome: "still_active", detail: expectedIdentity.url });
 		} catch (error) {
 			options.attempts.push({ at: nowIso(), action: "restore_conversation_url", reason, outcome: "failed", detail: error instanceof Error ? error.message : String(error) });
 		}
