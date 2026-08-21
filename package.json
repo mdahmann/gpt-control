@@ -1,7 +1,7 @@
 {
   "name": "gpt-control",
-  "version": "0.2.0",
-  "description": "A trustworthy cross-model review broker for coding agents: real runs, structured findings, attachment receipts, and Chrome Bridge, Codex, or Responses transports",
+  "version": "0.2.1",
+  "description": "Let any CLI agent harness control the signed-in ChatGPT web UI through a focus-safe Chrome Bridge transport",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/wolfiesch/gpt-control",
@@ -50,10 +50,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "@openai/codex-sdk": "^0.149.0",
     "@sinclair/typebox": "^0.34.52",
     "node-html-parser": "^9.0.1",
-    "openai": "^7.5.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

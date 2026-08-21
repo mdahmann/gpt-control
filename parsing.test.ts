@@ -81,7 +81,7 @@ describe("durable store", () => {
 		const store = new RunStore(scratch());
 		await store.init();
 		const now = new Date().toISOString();
-		const conversation: ConversationRecord = { version: STORAGE_VERSION, id: `conv_${"a".repeat(32)}`, provider: "codex", workspaceRoot: "/tmp", createdAt: now, updatedAt: now };
+		const conversation: ConversationRecord = { version: STORAGE_VERSION, id: `conv_${"a".repeat(32)}`, provider: "chrome_bridge", workspaceRoot: "/tmp", createdAt: now, updatedAt: now };
 		await store.putConversation(conversation);
 		expect(await store.getConversation(conversation.id)).toEqual(conversation);
 		writeFileSync(join(store.root, "conversations", "conv_bad.json"), '{"id":"conv_bad"}');

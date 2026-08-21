@@ -46,7 +46,7 @@ function startRequest(params: Record<string, unknown>, kind: "consult" | "chat" 
 }
 
 function isTransport(value: unknown): value is StartRequest["transport"] {
-	return value === "chrome_bridge" || value === "codex" || value === "responses" || value === "oracle_browser" || value === "oracle_api";
+	return value === "chrome_bridge" || value === "oracle_browser" || value === "oracle_api";
 }
 
 function runText(run: RunRecord): string {
@@ -209,7 +209,7 @@ function commonParameters(Type: TypeBuilder): Record<string, Record<string, unkn
 	return {
 		conversation_id: Type.Optional(Type.String({ description: "Wrapper-owned conversation id for a follow-up." })),
 		files: Type.Optional(Type.Array(Type.String())),
-		transport: Type.Optional(Type.Union([Type.Literal("chrome_bridge"), Type.Literal("codex"), Type.Literal("responses"), Type.Literal("oracle_browser"), Type.Literal("oracle_api")])),
+		transport: Type.Optional(Type.Union([Type.Literal("chrome_bridge"), Type.Literal("oracle_browser"), Type.Literal("oracle_api")])),
 		model: Type.Optional(Type.String()),
 		workspace_root: Type.Optional(Type.String({ description: "Boundary for attachments; defaults to the process working directory." })),
 		allow_outside_workspace: Type.Optional(Type.Boolean()),

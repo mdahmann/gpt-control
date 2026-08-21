@@ -1,20 +1,22 @@
 ---
 name: gpt-control
 description: Use when the user asks to get an independent model review, cross-check code or a plan, continue a GPT-Control conversation, inspect a model run, or generate or iterate on an image through Chrome Bridge. Not for facts the working tree or a local test can answer directly.
-version: 0.2.0
+version: 0.2.1
 ---
 
 # GPT-Control
-
-GPT-Control is a cross-model review broker, not a generic browser wrapper.
+GPT-Control lets any OMP, Pi, MCP, or other compatible harness control the
+signed-in ChatGPT web experience. The calling harness can use any model; the
+tool always talks to the ChatGPT website.
 
 ## Choose a transport
 
-- `chrome_bridge`: signed-in ChatGPT in an inactive tab. If the bridge is leased or unavailable, retry; GPT-Control will not open another browser.
-- `codex`: official Codex SDK in a read-only sandbox. Default when Chrome Bridge is not installed.
-- `responses`: official Responses API. Paid; requires `api_confirmed=true`.
+- `chrome_bridge`: default. Signed-in ChatGPT in an inactive tab. If the bridge is leased or unavailable, retry; GPT-Control will not open another browser.
 - `oracle_browser`: explicit legacy fallback. It can take focus and requires `allow_focus_steal=true`.
 - `oracle_api`: explicit paid legacy fallback.
+
+Do not route through Codex or the Responses API. The harness already has its own
+model access, and those paths do not control the ChatGPT web UI.
 
 ## IDs and tools
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1] - 2026-08-21
+
+### Changed
+
+- Returned GPT-Control to its actual product boundary: any compatible CLI harness can control the signed-in ChatGPT web UI through Chrome Bridge.
+- Removed the Codex SDK and Responses API adapters and dependencies. They duplicated model access already present in the calling harness and did not control the ChatGPT website.
+- Chrome Bridge is again the only default transport. An outage or lease returns a retryable error; Oracle browser mode remains explicit and focus-steal-gated.
+- Retained the durable parts that serve web control: separate conversation and run IDs, locks, attachment manifests, structured reviews, receipts, image iteration, OMP/Pi extension loading, and MCP.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

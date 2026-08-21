@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { AttachmentManifest, AttachmentReceipt } from "./domain";
 
@@ -69,14 +69,6 @@ export async function buildAttachmentManifest(paths: readonly string[], options:
 	return { workspaceRoot, files, totalBytes, sha256: manifestHash.digest("hex") };
 }
 
-export async function renderAttachments(manifest: AttachmentManifest): Promise<string> {
-	if (manifest.files.length === 0) return "";
-	const sections: string[] = [];
-	for (const file of manifest.files) {
-		sections.push(`\n--- FILE: ${file.relativePath} (${file.size} bytes, sha256:${file.sha256}) ---\n${await readFile(file.path, "utf8")}`);
-	}
-	return sections.join("\n");
-}
 
 export function isSensitive(path: string): boolean {
 	const normalized = path.toLowerCase().replaceAll("\\", "/");

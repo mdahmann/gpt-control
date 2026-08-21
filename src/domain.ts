@@ -4,7 +4,7 @@ export const PACKAGE_NAME = "gpt-control";
 export const PACKAGE_VERSION = "0.2.0";
 export const STORAGE_VERSION = 1;
 
-export type Provider = "chrome_bridge" | "codex" | "responses" | "oracle_browser" | "oracle_api";
+export type Provider = "chrome_bridge" | "oracle_browser" | "oracle_api";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "needs_user";
 export type RunKind = "consult" | "chat" | "image";
 export type Verdict = "approve" | "request_changes" | "inconclusive";

@@ -22,7 +22,6 @@ import {
 	waitForNewAssistantTurn,
 } from "./chatgpt";
 import {
-	PACKAGE_VERSION,
 	STORAGE_VERSION,
 	nowIso,
 	opaqueId,
@@ -35,13 +34,22 @@ import {
 } from "./domain";
 import { buildAttachmentManifest } from "./files";
 import { runOracle } from "./oracle";
-import { runCodexTurn, runResponsesTurn, type ProviderTurnResult } from "./providers";
 import { buildReviewPrompt, parseReviewReport } from "./review";
 import { RunStore } from "./store";
 import type { Exec } from "./types";
 
 const activeRuns = new Map<string, AbortController>();
 const TERMINAL = new Set(["completed", "failed", "cancelled", "needs_user"]);
+
+interface ProviderTurnResult {
+	provider: Provider;
+	text: string;
+	providerConversationId?: string;
+	providerRunId?: string;
+	model?: string;
+	transportVersion?: string;
+	imageUrls?: string[];
+}
 
 export interface StartRequest {
 	kind: RunKind;
@@ -256,12 +264,6 @@ export class GptControlService {
 		prompt: string,
 		signal: AbortSignal,
 	): Promise<ProviderTurnResult> {
-		if (conversation.provider === "codex") {
-			return runCodexTurn({ kind: run.kind, prompt, manifest: run.attachmentManifest, providerConversationId: conversation.providerConversationId, model: request.model, signal });
-		}
-		if (conversation.provider === "responses") {
-			return runResponsesTurn({ kind: run.kind, prompt, manifest: run.attachmentManifest, providerConversationId: conversation.providerConversationId, model: request.model, signal });
-		}
 		const capabilities = await resolveCapabilities(this.exec);
 		if (conversation.provider === "chrome_bridge") {
 			const bridge = capabilities.bridge;

@@ -8,8 +8,7 @@ import {
 	type ConversationRecord,
 	type RunRecord,
 } from "./domain";
-
-const ProviderSchema = z.enum(["chrome_bridge", "codex", "responses", "oracle_browser", "oracle_api"]);
+const ProviderSchema = z.enum(["chrome_bridge", "oracle_browser", "oracle_api"]);
 const RunStatusSchema = z.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 const AttachmentSchema = z.object({ path: z.string(), relativePath: z.string(), size: z.number(), sha256: z.string() });
 const ManifestSchema = z.object({ workspaceRoot: z.string(), files: z.array(AttachmentSchema), totalBytes: z.number(), sha256: z.string() });

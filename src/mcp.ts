@@ -5,7 +5,7 @@ import { z } from "zod";
 import { fallbackExec } from "./host";
 import { GptControlService } from "./service";
 
-const TransportSchema = z.enum(["chrome_bridge", "codex", "responses", "oracle_browser", "oracle_api"]);
+const TransportSchema = z.enum(["chrome_bridge", "oracle_browser", "oracle_api"]);
 const CommonSchema = {
 	conversation_id: z.string().optional(),
 	files: z.array(z.string()).optional(),
@@ -74,7 +74,7 @@ function toRequest(params: Record<string, unknown>, kind: "consult" | "chat", pr
 		prompt,
 		files: params.files as string[] | undefined,
 		conversationId: params.conversation_id as string | undefined,
-		transport: params.transport as "chrome_bridge" | "codex" | "responses" | "oracle_browser" | "oracle_api" | undefined,
+		transport: params.transport as "chrome_bridge" | "oracle_browser" | "oracle_api" | undefined,
 		model: params.model as string | undefined,
 		workspaceRoot: params.workspace_root as string | undefined,
 		allowOutsideWorkspace: params.allow_outside_workspace === true,
