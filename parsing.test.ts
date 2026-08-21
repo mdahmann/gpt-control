@@ -127,7 +127,6 @@ describe("policy denial translation", () => {
 		expect(translatePolicyDenial(error)).toBe(error);
 	});
 });
-
 describe("tab id extraction", () => {
 	test("finds the id across the shapes the bridge returns", () => {
 		expect(extractTabId({ tabId: 7 })).toBe(7);
@@ -148,9 +147,13 @@ describe("oracle fallback", () => {
 		expect(extractOracleAnswer({ text: "   " })).toBeUndefined();
 	});
 
-	test("builds argv with engine, model, files, and followup", () => {
+	test("builds root argv without --json, which the root command rejects", () => {
 		expect(
-			buildOracleArgs({ prompt: "why", engine: "api", model: "gpt-5.5", files: ["/a.ts"], conversationUrl: "https://chatgpt.com/c/1" }),
-		).toEqual(["--engine", "api", "--json", "--prompt", "why", "--model", "gpt-5.5", "--file", "/a.ts", "--followup", "https://chatgpt.com/c/1"]);
+			buildOracleArgs({ prompt: "why", engine: "api", model: "gpt-5.5", files: ["/a.ts"], followup: "sess_123" }),
+		).toEqual(["--engine", "api", "--prompt", "why", "--model", "gpt-5.5", "--file", "/a.ts", "--followup", "sess_123"]);
+	});
+
+	test("omits every optional flag when it was not asked for", () => {
+		expect(buildOracleArgs({ prompt: "why", engine: "browser" })).toEqual(["--engine", "browser", "--prompt", "why"]);
 	});
 });

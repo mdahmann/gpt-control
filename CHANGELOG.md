@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1] - 2026-08-21
+
+### Fixed
+
+- Continuing a conversation no longer destroys it. `chatgpt_chat` with a `job_id` navigated the session to the ChatGPT root URL, and because Chrome Bridge reuses a task session's single tab, that replaced the conversation it was meant to continue. A continuation now resolves the session's live tab and submits into it without navigating. A session whose tab is gone reports that instead of silently answering in a new conversation.
+- The Oracle fallback no longer passes `--json`, which the root command rejects with `unknown option '--json'`. Several Oracle subcommands accept the flag, which makes it look universal in the source. `--followup` is also documented as taking an Oracle session id rather than a conversation URL.
+
 ## [0.1.0] - 2026-08-21
 
 ### Added

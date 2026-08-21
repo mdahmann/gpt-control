@@ -41,16 +41,24 @@ export interface OracleRequest {
 	model?: string;
 	/** `api` bills the user's OpenAI key; `browser` drives Oracle's own Chrome. */
 	engine: "api" | "browser";
-	conversationUrl?: string;
+	/** Oracle session or response id from a previous run, not a conversation URL. */
+	followup?: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 }
 
+/**
+ * Builds argv for Oracle's root one-shot.
+ *
+ * No `--json`: the root command does not accept it. Several Oracle
+ * subcommands do, which makes the flag look universal in the source, and the
+ * mistake surfaces only as `unknown option '--json'` at runtime.
+ */
 export function buildOracleArgs(request: OracleRequest): string[] {
-	const args = ["--engine", request.engine, "--json", "--prompt", request.prompt];
+	const args = ["--engine", request.engine, "--prompt", request.prompt];
 	if (request.model) args.push("--model", request.model);
 	for (const file of request.files ?? []) args.push("--file", file);
-	if (request.conversationUrl) args.push("--followup", request.conversationUrl);
+	if (request.followup) args.push("--followup", request.followup);
 	return args;
 }
 

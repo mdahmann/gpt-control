@@ -1,7 +1,7 @@
 ---
 name: chatgpt-control
 description: This skill should be used when the user asks to "ask ChatGPT", "get a second opinion", "have another model review this", "check this with GPT", "generate an image", "iterate on that image", "continue my ChatGPT conversation", or "which ChatGPT transport is active". Not for ordinary web browsing, and not as a substitute for verifying code by running it locally.
-version: 0.1.0
+version: 0.1.1
 ---
 
 # ChatGPT Control

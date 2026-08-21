@@ -23,6 +23,7 @@ import {
 	readAssistantTurn,
 	showSession,
 	submitPrompt,
+	tabIdFromSession,
 	tabUrl,
 	waitForStableText,
 } from "./chatgpt";
@@ -117,8 +118,13 @@ async function runBrowserTurn(
 		signal?: AbortSignal;
 	},
 ): Promise<BrowserTurn> {
+	// Navigating an existing session reuses its one tab, so sending the session
+	// back to the root URL would replace the very conversation being continued.
+	// A continuation therefore resolves the live tab and submits into it.
 	const sessionId = options.sessionId ?? (await createSession(exec, route.launcher, sessionName(options.kind), options.signal));
-	const tabId = await openChat(exec, route.launcher, sessionId, CHATGPT_ORIGIN, options.signal);
+	const tabId = options.sessionId
+		? resolveContinuationTab(await showSession(exec, route.launcher, options.sessionId, options.signal), options.sessionId)
+		: await openChat(exec, route.launcher, sessionId, CHATGPT_ORIGIN, options.signal);
 	await attachFiles(exec, route.launcher, tabId, options.files, options.signal);
 	await submitPrompt(exec, route.launcher, tabId, options.prompt, options.signal);
 
@@ -340,7 +346,7 @@ export default function chatgptControl(pi: ExtensionAPI): void {
 				}
 
 				const session = await showSession(exec, launcher, jobId, signal);
-				const tabId = firstTabId(session);
+				const tabId = tabIdFromSession(session);
 				if (tabId === undefined) return textResult(`Job ${jobId} owns no open tab.`, { jobId, session }, true);
 
 				const turn = await readAssistantTurn(exec, launcher, tabId, signal);
@@ -367,20 +373,23 @@ export default function chatgptControl(pi: ExtensionAPI): void {
 	});
 }
 
-function firstTabId(session: Record<string, unknown>): number | undefined {
-	const tabs = session.tabIds ?? session.tabs;
-	if (!Array.isArray(tabs)) return undefined;
-	for (const entry of tabs) {
-		if (typeof entry === "number") return entry;
-		if (typeof entry === "object" && entry !== null && "id" in entry && typeof entry.id === "number") return entry.id;
+/**
+ * Resolves the tab a continuation must submit into.
+ *
+ * Failing loudly matters here: silently opening a fresh tab would answer in a
+ * new conversation while still reporting the old job id.
+ */
+function resolveContinuationTab(session: Record<string, unknown>, jobId: string): number {
+	const tabId = tabIdFromSession(session);
+	if (tabId === undefined) {
+		throw new Error(`Job ${jobId} owns no open tab, so its conversation cannot be continued. Omit job_id to start a new one.`);
 	}
-	return undefined;
+	return tabId;
 }
 
 /**
- * Downloads each generated image, returning it inline. Chrome Bridge gates
- * downloads behind a confirmation by default, so a screenshot of the tab is
- * kept as the fallback artifact rather than failing the request.
+ * Saves each generated image and returns it inline, falling back to a
+ * screenshot of the tab when the fetch is refused.
  */
 async function imageResult(
 	exec: Exec,

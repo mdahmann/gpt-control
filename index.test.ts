@@ -245,11 +245,41 @@ describe("chrome bridge path", () => {
 		expect(calls.some((args) => args[0] === "extractText")).toBe(false);
 	});
 
-	test("continues an existing conversation instead of opening a new one", async () => {
+	test("continues in the session's own tab and never navigates it away", async () => {
 		process.env.CHATGPT_CONTROL_BRIDGE = "chrome-bridge";
-		const { tools, calls } = harness(bridgeResponder(html));
+		const base = bridgeResponder(html);
+		// `show` reports a different tab than `navigate` would return, so the
+		// assertions can tell which one the turn was actually submitted into.
+		const { tools, calls } = harness((args) => {
+			if (args[0] === "taskSession" && args[1] === "show") {
+				return ok({ success: true, result: { sessionId: "sess-1", state: "working", name: "chatgpt-control:chat:x", tabIds: [77] } });
+			}
+			return base(args);
+		});
 		await tools.get("chatgpt_chat")!.execute("c", { prompt: "next turn", job_id: "sess-1" });
+
 		expect(calls.some((args) => args[0] === "taskSession" && args[1] === "create")).toBe(false);
+		// Navigating reuses the session's single tab, which would replace the
+		// conversation being continued with a fresh one.
+		expect(calls.some((args) => args[0] === "taskSession" && args[1] === "navigate")).toBe(false);
+		expect(calls).toContainEqual(["fill", "77", "#prompt-textarea", "next turn"]);
+		expect(calls.some((args) => args[0] === "fill" && args[1] === "42")).toBe(false);
+	});
+
+	test("refuses to continue a session whose tab is gone rather than answering elsewhere", async () => {
+		process.env.CHATGPT_CONTROL_BRIDGE = "chrome-bridge";
+		const base = bridgeResponder(html);
+		const { tools, calls } = harness((args) => {
+			if (args[0] === "taskSession" && args[1] === "show") {
+				return ok({ success: true, result: { sessionId: "sess-1", state: "completed", name: "chatgpt-control:chat:x", tabIds: [] } });
+			}
+			return base(args);
+		});
+		const result = await tools.get("chatgpt_chat")!.execute("c", { prompt: "next turn", job_id: "sess-1" });
+
+		expect(result.isError).toBe(true);
+		expect(textOf(result)).toContain("owns no open tab");
+		expect(calls.some((args) => args[0] === "fill")).toBe(false);
 	});
 
 	test("falls back through composer selectors when the first one is gone", async () => {

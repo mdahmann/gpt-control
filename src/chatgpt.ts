@@ -87,6 +87,18 @@ export function translatePolicyDenial(error: unknown): unknown {
 	);
 }
 
+/** Reads the tab a task session owns, across the shapes `show` returns. */
+export function tabIdFromSession(session: Record<string, unknown>): number | undefined {
+	const tabs = session.tabIds ?? session.tabs;
+	if (!Array.isArray(tabs)) return undefined;
+	for (const entry of tabs) {
+		if (typeof entry === "number") return entry;
+		const id = readNumber(entry, "id") ?? readNumber(entry, "tabId");
+		if (id !== undefined) return id;
+	}
+	return undefined;
+}
+
 function resultOf(payload: Record<string, unknown>): unknown {
 	return payload.result ?? payload;
 }

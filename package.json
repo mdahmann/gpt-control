@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-control",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Typed ChatGPT web control for coding agents: independent second-model review, durable conversations, and image iteration through the Chrome you are already signed into",
   "type": "module",
   "license": "MIT",
