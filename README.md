@@ -1,228 +1,189 @@
 # GPT-Control
 
-Let any CLI agent harness control the signed-in ChatGPT web UI through a pluggable browser driver.
+GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
+signed-in ChatGPT website through one secure browser-driver protocol. Version
+0.3.1 adds exact-conversation ownership, crash-safe durable runs, truthful live
+Pro-model evidence, immutable attachment snapshots, and up to three independent
+ChatGPT Pro workers with one completion or blocker result each.
 
-GPT-Control gives OMP, Pi, MCP clients, and other compatible harnesses a small typed tool surface for ChatGPT conversations, structured reviews, and image iteration. The harness can run whatever model the user prefers. Browser ownership is delegated through a driver interface rather than tied to one private setup.
+The caller remains the orchestrator. GPT-Control does not merge code, widen
+repository authority, infer connected-tool access, launch a paid fallback, or
+open a replacement browser when the configured driver is unavailable.
 
-An unofficial, community-maintained project. It is not affiliated with OpenAI.
+## Core guarantees
 
-## Why this exists
+- **Exact conversation:** driver, session, ownership name, page, origin,
+  canonical `/c/<id>` URL, and assistant-turn baseline are recorded and
+  rechecked.
+- **No ambiguous replay:** plaintext recovery data is removed before the browser
+  click. A restart can observe a submitted turn but cannot resubmit it.
+- **Crash-safe cancellation:** cancellation is terminal and immutable before a
+  best-effort UI stop. Late completion cannot overwrite it.
+- **Truthful model provenance:** ChatGPT Pro is selected and read back from the
+  live composer, then verified again immediately before send.
+- **Immutable attachments:** uploads use private broker-owned snapshots with
+  hashes and line counts, not mutable workspace paths.
+- **No hidden fallback:** the configured secure browser driver either works or
+  the run returns a blocker. Oracle argv transport, paid API fallback, and
+  focus-stealing fallback are disabled.
 
-A user may already have access to powerful web-only ChatGPT models through a subscription. Calling the API or wrapping `codex exec` is a different product and duplicates capabilities the agent harness already has.
+## Browser-driver protocol v2
 
-```text
-any CLI harness
-      │ typed tool call
-      ▼
-GPT-Control core
-      │ WebChatDriver
-      ├── configured external command
-      ├── Chrome Bridge adapter
-      └── future Playwright, CDP, or harness adapters
-      │
-      ▼
-signed-in ChatGPT web UI
-```
+A driver must communicate with JSON requests on stdin (or an equivalent private
+RPC), return strict version-2 envelopes, attest secure input, and implement:
 
-This provides high included web usage without per-call API billing. ChatGPT still applies temporary and plan-level usage limits; GPT-Control does not describe the service as literally unlimited.
+- probe, create, show, navigate;
+- upload and fill as separate preparation steps;
+- live model select and verify;
+- send as a separate crash boundary;
+- observe, recover, set state, close, and screenshot.
 
-## Browser drivers
-
-Set `GPT_CONTROL_BROWSER_DRIVER` to any executable implementing the versioned JSON-stdin/stdout protocol. If no command is configured, GPT-Control autodetects Chrome Bridge as one optional adapter.
-
-Each invocation receives one JSON line on stdin:
-
-```json
-{
-  "version": 1,
-  "action": "create",
-  "params": {
-    "name": "gpt-control:chat:conv_...",
-    "url": "https://chatgpt.com"
-  }
-}
-```
-
-It returns:
-
-```json
-{
-  "version": 1,
-  "ok": true,
-  "result": {
-    "sessionId": "opaque-session",
-    "pageId": "opaque-page",
-    "name": "gpt-control:chat:conv_...",
-    "url": "https://chatgpt.com/c/..."
-  }
-}
-```
-
-Required actions:
-
-| Action | Result |
-| --- | --- |
-| `probe` | `{ ready, driver, reason? }` |
-| `create` | `{ sessionId, pageId, name, url }` |
-| `show` | same session object |
-| `upload` | empty success |
-| `submit` | empty success |
-| `snapshot` | `{ count, text, imageUrls }` |
-| `set_state` | empty success |
-| `close` | empty success |
-| `screenshot` | saved path or empty result |
-
-Prompts and file paths travel through stdin, never process arguments. Driver responses are capped and runtime-validated.
-
-## Focus behavior
-
-A driver outage returns a retryable error. GPT-Control never treats one unavailable driver as permission to launch another browser.
-
-The optional Chrome Bridge adapter opens an inactive, task-owned tab in the existing browser window. Oracle browser mode remains an explicit legacy fallback requiring `allow_focus_steal=true`.
+Set `GPT_CONTROL_BROWSER_DRIVER` to an external protocol-v2 command. When that
+is absent, GPT-Control may use an installed Chrome Bridge adapter, but only when
+its private request-file RPC is available. Prompt text and snapshot paths are
+never passed through child-process argv.
 
 ## Tools
 
-| Tool | Capability | Approval |
-| --- | --- | --- |
-| `gpt_consult` | Structured ChatGPT review with findings, manifest, and receipt | write |
-| `gpt_chat` | Start or continue a ChatGPT web conversation | write |
-| `gpt_run` | Status, wait, or result for one exact submission | read |
-| `gpt_run_cancel` | Cancel an active in-process run | write |
-| `gpt_conversation_close` | Close local state and wrapper-owned browser resources | write |
-| `gpt_image` | Generate or iterate on images | write |
-| `gpt_diagnose` | Report browser driver readiness without starting work | read |
+| Tool | Purpose |
+|---|---|
+| `gpt_consult` | Structured independent review with evidence, manifest, and receipt |
+| `gpt_chat` | Start or continue one exact ChatGPT conversation |
+| `gpt_image` | Generate or iterate on an image with confined local output |
+| `gpt_run` | Read, wait for, or retrieve one durable run |
+| `gpt_run_cancel` | Durably cancel any active run |
+| `gpt_conversation_close` | Close an owned local browser session; provider history remains |
+| `gpt_subagent_run` | Start one independent bounded ChatGPT Pro worker |
+| `gpt_subagent_get` | One reconnect/recovery lookup for a worker |
+| `gpt_subagent_cancel` | Durably cancel a worker |
+| `gpt_subagent_list` | Bounded recovery overview, not a polling loop |
+| `gpt_diagnose` | Passive configuration report; executes nothing discovered |
+| `gpt_diagnose_active` | Explicit active driver smoke test when trusted policy permits |
 
-The core review, conversation, run, close, and diagnosis tools are also available through the bundled MCP server.
+## Codex Pro workers
 
-## Conversations and runs
+`gpt_subagent_run` requires an idempotency key and creates a fresh owned
+conversation. Trusted policy permits at most three simultaneous workers, even
+across broker processes sharing the same state root. A fourth worker queues
+fairly.
 
-```text
-conversation_id → one ChatGPT conversation
-run_id          → one exact submitted prompt
+The MCP server advertises optional task execution through the installed MCP SDK.
+Task-capable clients can use task status/result/cancel. The run is durably bound
+before `taskCreated`, then a short cancellation grace elapses before browser
+execution; normal completion requires no status polling. Clients without task
+support receive one long-running terminal tool response. GPT-Control does not
+assume a task notification can awaken a dormant chat thread; the durable run and
+task IDs are the recovery mechanism.
+
+A worker can request connected tools:
+
+```json
+{
+  "prompt": "Inspect the current pull request and report a blocker or result.",
+  "idempotency_key": "review-pr-184-v1",
+  "connectors": ["GitHub"],
+  "connector_mode": "require"
+}
 ```
 
-Pass `conversation_id` to `gpt_chat`, `gpt_consult`, or `gpt_image` for a follow-up. Pass `run_id` to `gpt_run` for status, wait, or result. Per-conversation locking prevents two turns from interleaving.
+Connector names express intent only. They do not grant permission or prove
+availability. A required unavailable connector must produce a blocker rather
+than invented evidence.
 
-Records live under `~/.gpt-control/` by default.
+## Conversations, runs, and receipts
+
+Each submission has a wrapper-owned `conversation_id` and a distinct `run_id`.
+Provider IDs are recorded separately from local driver/session IDs. A follow-up
+is refused unless the canonical provider conversation and exact local ownership
+tuple can be proven.
+
+Receipts distinguish requested model from observed model and include live model
+evidence, prompt and result hashes, snapshot receipts, provider conversation and
+turn identifiers, timestamps, driver ID, and bounded recovery attempts.
 
 ## Attachment boundary
 
-GPT-Control:
+The trusted workspace defaults to the process working directory. GPT-Control
+realpath-resolves each request, rejects symlinks and non-regular files, opens
+without following links, checks for mutation before and after read, caps count
+and bytes, hashes content, and creates a private mode-0400 snapshot. Only that
+snapshot is uploaded.
 
-- resolves attachment paths through `realpath()`;
-- defaults to regular files inside the workspace;
-- rejects symlink escapes;
-- caps file count and aggregate bytes;
-- blocks obvious credential and private-key paths;
-- hashes every file with SHA-256;
-- returns the exact upload manifest.
-
-Outside-workspace and sensitive-file uploads require separate explicit flags.
-
-## Structured review output
-
-`gpt_consult` asks ChatGPT for a validated object:
-
-```json
-{
-  "verdict": "request_changes",
-  "summary": "The migration is not rollback-safe.",
-  "findings": [
-    {
-      "severity": "high",
-      "claim": "The old schema version is discarded before mutation.",
-      "evidence": {
-        "file": "src/migrate.ts",
-        "lineStart": 81,
-        "lineEnd": 104
-      },
-      "confidence": 0.92,
-      "remediation": "Persist the old schema version before mutation."
-    }
-  ],
-  "openQuestions": []
-}
-```
-
-Each run also records driver identifiers, timestamps, prompt hash, attachment hashes, and result hash.
-
-## Data boundary
-
-Prompts and approved attachments leave the local machine and are uploaded through the selected browser driver.
-
-Closing a GPT-Control conversation closes local state and wrapper-owned browser resources. It does not delete ChatGPT history, memories, conversations, or uploaded files.
+Tool input cannot authorize outside-workspace or sensitive-file access. Set
+trusted environment policy deliberately when such access is required. Files
+leave the local machine and enter the provider conversation; closing local state
+does not delete provider-side history or uploads.
 
 ## Install
 
-### Oh My Pi
+### Bun and dependencies
 
-```sh
-omp install github:wolfiesch/gpt-control
-```
-
-### Pi
-
-```sh
-git clone https://github.com/wolfiesch/gpt-control.git
-cd gpt-control && bun install
-ln -s "$PWD/src/index.ts" ~/.pi/agent/extensions/gpt-control.ts
-```
-
-### MCP
-
-```json
-{
-  "mcpServers": {
-    "gpt-control": {
-      "command": "bun",
-      "args": ["/path/to/gpt-control/src/mcp.ts"]
-    }
-  }
-}
-```
-
-### Browser driver
-
-Configure any protocol-compatible executable:
-
-```sh
-export GPT_CONTROL_BROWSER_DRIVER="/path/to/my-chatgpt-driver"
-```
-
-Chrome Bridge is an optional autodetected adapter:
-
-```sh
-git clone https://github.com/wolfiesch/chrome-bridge.git
-cd chrome-bridge && ./setup.sh
-chrome-bridge ready
-```
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `GPT_CONTROL_HOME` | Local conversations, runs, locks, and generated artifacts |
-| `GPT_CONTROL_BROWSER_DRIVER` | External version-1 driver command |
-| `GPT_CONTROL_BRIDGE` | Optional Chrome Bridge client command |
-| `CHROME_BRIDGE_HOME` | Optional Chrome Bridge checkout containing `test_client.py` |
-| `GPT_CONTROL_PYTHON` | Python used by the Chrome Bridge adapter |
-| `GPT_CONTROL_POLL_MS` | Browser answer poll interval, default 2000 |
-| `GPT_CONTROL_PROBE_MS` | Chrome Bridge readiness budget, default 10000 |
-| `GPT_CONTROL_ORACLE` | Optional explicit Oracle CLI command |
-
-## Credits
-
-- [Kyle McCleary](https://github.com/kmccleary3301) shared the Oracle fork and web/image workflow that prompted the first version.
-- [Oracle](https://github.com/steipete/oracle) by Peter Steinberger remains an explicit legacy fallback.
-- [Chrome Bridge](https://github.com/wolfiesch/chrome-bridge) provides one optional focus-safe browser driver.
-
-## Development
-
-```sh
-bun install
+```bash
+bun install --frozen-lockfile
+bun run build:mcp
 bun run check
 bun test
 ```
+
+The repository commits a reproducible Node-compatible MCP bundle at
+`dist/gpt-control-mcp.js`. Codex plugin snapshots therefore start without
+`node_modules` or an install hook. `bin/gpt-control-mcp` uses `GPT_CONTROL_NODE`
+when explicitly set, otherwise a trusted `node` on PATH. Bun is required only
+to develop, test, and reproduce the committed bundle.
+
+### OMP / Pi
+
+Install or link the package according to the host's extension workflow. Both
+read `src/index.ts` from the `omp`/`pi` package metadata.
+
+### MCP
+
+```bash
+./bin/gpt-control-mcp
+```
+
+For Codex, the repository includes `.codex-plugin/plugin.json`, `.mcp.json`,
+and the committed Node bundle. The MCP server is started from the plugin root
+with a 3,700-second per-tool bound so a one-hour worker can return its terminal
+result. Plugin installation does not run a package manager or trust an
+unverified build step.
+
+## Trusted configuration
+
+| Variable | Meaning |
+|---|---|
+| `GPT_CONTROL_HOME` | Private schema-v3 state root; default `~/.gpt-control/v3` |
+| `GPT_CONTROL_WORKSPACE_ROOT` | Attachment authority root |
+| `GPT_CONTROL_SNAPSHOT_ROOT` | Immutable snapshot root |
+| `GPT_CONTROL_OUTPUT_ROOT` | Generated artifact root |
+| `GPT_CONTROL_BROWSER_DRIVER` | External protocol-v2 command |
+| `GPT_CONTROL_BRIDGE` | Explicit Chrome Bridge launcher |
+| `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
+| `GPT_CONTROL_MAX_PRO_WORKERS` | Integer 1–3; default 3 |
+| `GPT_CONTROL_MAX_ATTACHMENT_FILES` | Trusted file-count cap |
+| `GPT_CONTROL_MAX_ATTACHMENT_BYTES` | Trusted aggregate-byte cap |
+| `GPT_CONTROL_MAX_PROMPT_BYTES` | Trusted prompt-byte cap |
+| `GPT_CONTROL_ALLOW_OUTSIDE_WORKSPACE` | Trusted outside-root authorization (`1`) |
+| `GPT_CONTROL_ALLOW_SENSITIVE_FILES` | Trusted sensitive-file authorization (`1`) |
+| `GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS` | Permit active driver probing (`1`) |
+| `GPT_CONTROL_POLL_MS` | Browser observation interval |
+
+See [SECURITY.md](SECURITY.md), [MIGRATION.md](MIGRATION.md), and
+[docs/CODEX_SUBAGENTS.md](docs/CODEX_SUBAGENTS.md).
+
+## Development
+
+```bash
+bun install --frozen-lockfile
+bun run build:mcp
+bun run check
+bun test
+bash scripts/verify-security.sh
+npm pack --dry-run --json
+```
+
+Live browser validation must use disposable data and a disposable profile or
+session. Follow [docs/MANUAL_CHROME_VALIDATION.md](docs/MANUAL_CHROME_VALIDATION.md).
 
 ## License
 

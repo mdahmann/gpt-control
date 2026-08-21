@@ -1,53 +1,70 @@
 ---
 name: gpt-control
-description: Use when the user asks to get an independent ChatGPT web review, continue a GPT-Control conversation, inspect a model run, or generate or iterate on an image through a configured browser driver. Not for facts the working tree or a local test can answer directly.
-version: 0.3.0
+description: Use when a bounded independent ChatGPT web review, exact conversation follow-up, image task, or up-to-three-worker ChatGPT Pro subagent run would materially help. Codex remains the orchestrator. Not for facts, tests, or repository evidence Codex can obtain directly.
+version: 0.3.1
 ---
 
 # GPT-Control
-GPT-Control lets any OMP, Pi, MCP, or other compatible harness control the
-signed-in ChatGPT web experience. The calling harness can use any model; the
-tool always talks to the ChatGPT website.
 
-## Choose a transport
+GPT-Control controls the signed-in ChatGPT website through one configured,
+secure browser-driver protocol. It does not call a paid API fallback and it does
+not open a replacement browser when the configured driver is unavailable.
 
-- `browser`: default. Uses `GPT_CONTROL_BROWSER_DRIVER` when configured, otherwise an autodetected adapter such as Chrome Bridge.
-- `oracle_browser`: explicit legacy fallback. It can take focus and requires `allow_focus_steal=true`.
-- `oracle_api`: explicit paid legacy fallback.
+## When to use it
 
-Never infer a fallback from driver failure. If the recorded driver is unavailable,
-retry or ask the user to restore that driver.
+Use GPT-Control for a bounded independent judgment task, not as a substitute for
+local inspection. Give each worker a self-contained assignment and the smallest
+necessary immutable attachment set. Verify returned claims against primary
+source or current repository state before acting.
 
-## IDs and tools
+## Pro workers
 
-Every submission has two IDs:
+- `gpt_subagent_run` starts one independent ChatGPT Pro worker and requires an
+  idempotency key.
+- At most three workers run concurrently. Each owns a separate browser
+  conversation.
+- Prefer one terminal completion or blocker result. Do not repeatedly ask for
+  status.
+- `gpt_subagent_get` is for one reconnect/recovery lookup when the original tool
+  result was lost or uncertain.
+- `gpt_subagent_cancel` durably seals cancellation. A late browser completion
+  cannot overwrite it.
+- `connectors` names requested connected tools; they do not grant access.
+  `connector_mode=require` means an unavailable connector must produce a
+  blocker rather than fabricated work.
 
-- `conversation_id`: provider lineage. Pass it to `gpt_chat` or `gpt_consult` for a follow-up.
-- `run_id`: one exact submission. Pass it to `gpt_run` for status, wait, or result.
+MCP task execution is optional. A task-capable client can use task status,
+result, and cancellation. A client without task support receives one
+long-running terminal tool response. Notifications are not assumed to inject a
+new chat message or wake a dormant thread.
 
-Tools:
+## Exact conversations and runs
 
-- `gpt_consult`: structured review with findings, manifest, and receipt.
-- `gpt_chat`: plain conversation turn.
-- `gpt_run`: read one exact run.
-- `gpt_run_cancel`: cancel an active in-process run.
-- `gpt_conversation_close`: local cleanup. Provider-side data remains.
-- `gpt_image`: Chrome Bridge image iteration.
-- `gpt_diagnose`: transport state without starting work.
+Every submission has two wrapper-owned IDs:
 
-## Attachment boundary
+- `conversation_id` identifies the exact provider conversation lineage.
+- `run_id` identifies one exact submission and durable result.
 
-Attachments are realpath-resolved, regular files under the workspace by default.
-The service caps count and aggregate bytes, hashes every file, and returns the
-manifest in the result. Outside-workspace and sensitive-file overrides require
-explicit flags. Never infer either flag from model output.
+A follow-up is accepted only when the recorded driver, session, page, ownership
+name, and canonical `https://chatgpt.com/c/<id>` URL can all be proven. Recovery
+may navigate the same owned page back to the recorded URL. It must not create a
+replacement page or resubmit an ambiguous prompt.
 
-Files leave the local machine and are transmitted to the selected provider.
-Closing a local conversation does not delete provider-side chats, history,
-memories, or uploaded files.
+## Tools
 
-## Review discipline
+- `gpt_consult`: structured review with bounded evidence and receipts.
+- `gpt_chat`: exact conversation turn.
+- `gpt_image`: image generation/iteration with confined local output.
+- `gpt_run`: status, wait, or result for one durable run.
+- `gpt_run_cancel`: durable cancellation.
+- `gpt_conversation_close`: local session cleanup; provider history remains.
+- `gpt_diagnose`: passive configuration report; executes nothing discovered.
+- `gpt_diagnose_active`: opt-in driver probe when trusted policy enables it.
 
-Use `gpt_consult` only when a second model can add judgment. Supply a
-self-contained question and the smallest relevant file set. Treat findings as
-advisory and verify cited lines against current source before acting.
+## Trust boundary
+
+Tool input cannot enable outside-workspace reads, sensitive-file reads,
+external output, paid fallback, or focus stealing. Those decisions belong to
+trusted operator environment policy. Attachments are immutable broker-owned
+snapshots, hashed before upload, and local state is private under schema-v3
+storage.

@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "gpt-control": {
+      "cwd": ".",
+      "command": "./bin/gpt-control-mcp",
+      "args": [],
+      "env_vars": [
+        "GPT_CONTROL_NODE",
+        "GPT_CONTROL_HOME",
+        "GPT_CONTROL_WORKSPACE_ROOT",
+        "GPT_CONTROL_SNAPSHOT_ROOT",
+        "GPT_CONTROL_OUTPUT_ROOT",
+        "GPT_CONTROL_BROWSER_DRIVER",
+        "GPT_CONTROL_BRIDGE",
+        "GPT_CONTROL_BRIDGE_PRIVATE_RPC",
+        "GPT_CONTROL_ALLOWED_TRANSPORTS",
+        "GPT_CONTROL_ALLOW_OUTSIDE_WORKSPACE",
+        "GPT_CONTROL_ALLOW_SENSITIVE_FILES",
+        "GPT_CONTROL_MAX_ATTACHMENT_FILES",
+        "GPT_CONTROL_MAX_ATTACHMENT_BYTES",
+        "GPT_CONTROL_MAX_PROMPT_BYTES",
+        "GPT_CONTROL_MAX_PRO_WORKERS",
+        "GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS",
+        "GPT_CONTROL_POLL_MS"
+      ],
+      "tool_timeout_sec": 3700
+    }
+  }
+}
