@@ -142,6 +142,18 @@ export function runLauncher(
 }
 
 /**
+ * Readiness budget for the bridge probe.
+ *
+ * Chrome's MV3 service worker idles out, so the first `ready` after a quiet
+ * period pays a wake-up cost. Observed times ranged from 435ms to just under
+ * 2s on a healthy install, and a tight budget reports a live bridge as absent.
+ */
+export function probeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = Number(env.CHATGPT_CONTROL_PROBE_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+}
+
+/**
  * Asks Chrome Bridge whether the endpoint, native host, and extension are all
  * live. `ready` exits non-zero when it is not, so the payload is read directly
  * instead of going through the throwing parser.
@@ -150,7 +162,7 @@ export async function probeBridge(
 	exec: Exec,
 	launcher: Launcher,
 	signal?: AbortSignal,
-	timeoutMs = 4000,
+	timeoutMs = probeTimeoutMs(),
 ): Promise<BridgeProbe> {
 	const result = await runLauncher(exec, launcher, ["ready", String(timeoutMs), "250"], { signal, timeout: timeoutMs + 2000 });
 	const stdout = result.stdout.trim();

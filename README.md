@@ -96,6 +96,7 @@ Discovery works without configuration when either client is on `PATH` or checked
 | `CHATGPT_CONTROL_ORACLE` | Full command for the Oracle CLI |
 | `CHATGPT_CONTROL_PYTHON` | Python used to run the bridge client |
 | `CHATGPT_CONTROL_POLL_MS` | Answer-stability poll interval, default 2000 |
+| `CHATGPT_CONTROL_PROBE_MS` | Bridge readiness budget, default 10000 |
 
 ## Example requests
 
