@@ -270,6 +270,38 @@ describe("bounded Pro worker scheduler", () => {
 		expect(terminal.map((run) => run.status)).toEqual(["completed", "completed", "completed", "completed"]);
 	});
 
+	test("restart admits oldest global workers before they take local slots", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(root, workspace, bridge, { maxConcurrentWorkers: 3 });
+		const prepared: Array<{ runId: string; prompt: string; createdAt: string }> = [];
+		for (const index of [1, 2, 3, 4, 5, 6]) {
+			const prompt = `[slow] recovered-global-${index}`;
+			const started = await first.service.start({
+				kind: "subagent",
+				prompt,
+				idempotencyKey: `recovered-global-${index}`,
+				wait: false,
+				timeoutMs: 5000,
+			}, { deferExecution: true });
+			const ready = await first.service.store.updateRun(started.run.id, { executionReady: true });
+			prepared.push({ runId: ready.id, prompt, createdAt: ready.createdAt });
+		}
+		const expectedOrder = prepared.slice().sort((left, right) =>
+			left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId));
+		const second = makeChromeService(root, workspace, bridge, { maxConcurrentWorkers: 3 });
+		const recovery = await second.service.recoverActiveRuns();
+		expect(recovery.resumed).toHaveLength(6);
+		await waitUntil(() => bridge.submittedPrompts.length === 3, 2500);
+		expect(bridge.submittedPrompts.slice().sort()).toEqual(expectedOrder.slice(0, 3).map((entry) => entry.prompt).sort());
+		bridge.release();
+		await waitUntil(() => bridge.submittedPrompts.length === 6, 2500);
+		bridge.release();
+		const terminal = await Promise.all(prepared.map((entry) => second.service.waitForRun(entry.runId, 3000)));
+		expect(terminal.map((run) => run.status)).toEqual(["completed", "completed", "completed", "completed", "completed", "completed"]);
+	});
+
 	test("cancels a locally queued worker without waiting for a slot", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxConcurrentWorkers: 1 });

@@ -258,15 +258,22 @@ export class GptControlService {
 	}
 
 	async waitForRun(runId: string, timeoutMs = 10 * 60_000): Promise<RunRecord> {
+		const deadline = Date.now() + timeoutMs;
 		const active = this.activeRuns.get(runId);
 		if (active) {
-			const result = await Promise.race([
-				active.promise,
-				new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
-			]);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), timeoutMs);
+				timer.unref?.();
+			});
+			let result: RunRecord | undefined;
+			try {
+				result = await Promise.race([active.promise, timeout]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
 			if (result && TERMINAL.has(result.status)) return result;
 		}
-		const deadline = Date.now() + timeoutMs;
 		for (;;) {
 			const run = await this.store.getRun(runId);
 			if (TERMINAL.has(run.status) || Date.now() >= deadline) return run;
@@ -626,10 +633,10 @@ export class GptControlService {
 				{ timeoutMs: Math.max(30_000, (run.timeoutMs ?? 600_000) + 60_000) },
 			);
 			if (run.kind !== "subagent") return work();
-			return this.workerSlots.run(async () => {
-				const admitted = await this.waitForGlobalWorkerTurn(runId, controller.signal);
-				return admitted ? work() : this.store.getRun(runId);
-			}, controller.signal);
+			const admitted = await this.waitForGlobalWorkerTurn(runId, controller.signal);
+			return admitted
+				? this.workerSlots.run(work, controller.signal)
+				: this.store.getRun(runId);
 		})().catch(async (error) => {
 			if (this.cancellationIntents.has(runId)) return this.persistCancellation(runId);
 			const current = await this.store.getRun(runId);
