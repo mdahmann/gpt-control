@@ -235,9 +235,17 @@ function registerSubagentRun(
 			taskStore.setStatusListener(task.taskId, async (updated) => {
 				await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
 			});
-			extra.signal.addEventListener("abort", () => {
-				void taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
-			}, { once: true });
+			const cancelOriginatingTask = () =>
+				taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
+			extra.signal.addEventListener("abort", () => { void cancelOriginatingTask(); }, { once: true });
+			// AbortSignal does not replay an event to a listener installed after the
+			// signal was aborted. Register first, then check explicitly; duplicate
+			// cancellation is monotonic and harmless if the event races this check.
+			if (extra.signal.aborted) {
+				await cancelOriginatingTask();
+				taskStore.removeStatusListener(task.taskId);
+				return { task };
+			}
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
 			try {
 				const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
@@ -685,7 +693,7 @@ async function withMcpRunAccess<T>(
 	const initial = await service.getRun(runId);
 	const legacyTaskOwned = initial.kind === "subagent"
 		&& await taskStore.legacySessionOwnsRun(runId, sessionId);
-	return service.store.withConversationLock(initial.conversationId, async () => {
+	return service.store.withConversationOwnershipLock(initial.conversationId, async () => {
 		const run = await service.getRun(runId);
 		if (run.conversationId !== initial.conversationId) throw new Error("Durable run conversation identity changed.");
 		const conversation = await service.store.getConversation(run.conversationId);

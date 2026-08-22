@@ -207,7 +207,10 @@ export class GptControlService {
 		await this.store.init();
 		const requestHash = startRequestHash(normalized);
 		if (normalized.idempotencyKey) {
-			return this.store.withIdempotencyLock(normalized.idempotencyKey, async (keyHash) => {
+			const scopedIdempotencyKey = options.mcpSessionId
+				? `mcp-${sha256(options.mcpSessionId)}:${normalized.idempotencyKey}`
+				: normalized.idempotencyKey;
+			return this.store.withIdempotencyLock(scopedIdempotencyKey, async (keyHash) => {
 				let binding = await this.store.getIdempotencyByHash(keyHash);
 				if (!binding) {
 					const prepared = await this.store.findRunsByIdempotencyKeyHash(keyHash);
@@ -378,7 +381,7 @@ export class GptControlService {
 			throw new Error(`Exact confirmation required: CLAIM ${runId}`);
 		}
 		const initial = await this.store.getRun(runId);
-		return this.store.withConversationLock(initial.conversationId, async () =>
+		return this.store.withConversationOwnershipLock(initial.conversationId, async () =>
 			this.store.withRunTaskBindingLock(runId, async () => {
 				const run = await this.store.getRun(runId);
 				const conversation = await this.store.getConversation(run.conversationId);
@@ -389,7 +392,7 @@ export class GptControlService {
 	}
 
 	async closeConversation(conversationId: string, mcpSessionId?: string): Promise<ConversationRecord> {
-		return this.store.withConversationLock(conversationId, async () => {
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
 			const ownedConversation = await this.store.getConversation(conversationId);
 			if (mcpSessionId !== undefined && ownedConversation.mcpSessionId !== mcpSessionId) {
 				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
@@ -402,19 +405,21 @@ export class GptControlService {
 				return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
 			});
 			if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-			const conversation = await this.store.getConversation(conversationId);
-			if (conversation.closedAt) return conversation;
-			if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-			if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+			return this.store.withConversationLock(conversationId, async () => {
+				const conversation = await this.store.getConversation(conversationId);
+				if (conversation.closedAt) return conversation;
+				if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+				if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+					return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+				}
+				if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+					throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+				}
+				const { driver, expected } = await this.resolveOwnedDriver(conversation);
+				await assertExactDriverSession(driver, expected);
+				await driver.close(expected.sessionId);
 				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-			}
-			if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
-				throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
-			}
-			const { driver, expected } = await this.resolveOwnedDriver(conversation);
-			await assertExactDriverSession(driver, expected);
-			await driver.close(expected.sessionId);
-			return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+			});
 		});
 	}
 
@@ -559,7 +564,7 @@ export class GptControlService {
 				return { conversation, run };
 			};
 			return request.conversationId
-				? await this.store.withConversationLock(request.conversationId, createForConversation)
+				? await this.store.withConversationOwnershipLock(request.conversationId, createForConversation)
 				: await createForConversation();
 		} catch (error) {
 			if (createdConversationId) {

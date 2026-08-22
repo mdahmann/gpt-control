@@ -591,6 +591,11 @@ export class RunStore {
 		return this.withNamedLock(`conversation-${conversationId}`, work, normalized);
 	}
 
+	async withConversationOwnershipLock<T>(conversationId: string, work: () => Promise<T>): Promise<T> {
+		assertConversationId(conversationId);
+		return this.withNamedLock(`mcp-owner-${conversationId}`, work, { timeoutMs: 30_000 });
+	}
+
 	private async withNamedLock<T>(name: string, work: () => Promise<T>, options: LockOptions): Promise<T> {
 		await this.init();
 		if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`Invalid lock name: ${name}`);

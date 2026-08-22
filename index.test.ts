@@ -175,11 +175,13 @@ describe("MCP plugin contract", () => {
 				arguments: { prompt: "must not continue foreign conversation", conversation_id: conversationId, wait: false },
 			});
 			expect(foreignFollowUp.isError).toBe(true);
-			const foreignIdempotentStart = await clientB.callTool({
+			const independentIdempotentStart = await clientB.callTool({
 				name: "gpt_chat",
-				arguments: { prompt: "session-owned ordinary run", idempotency_key: "ordinary-session-owner", wait: false, timeout_ms: 1000 },
+				arguments: { prompt: "session-b owns the same key text", idempotency_key: "ordinary-session-owner", wait: false, timeout_ms: 1000 },
 			});
-			expect(foreignIdempotentStart.isError).toBe(true);
+			const sessionBConversationId = (independentIdempotentStart.structuredContent as { conversationId?: string } | undefined)?.conversationId;
+			expect(sessionBConversationId).toMatch(/^conv_/);
+			expect((await service.store.getConversation(sessionBConversationId!)).mcpSessionId).toBe("mcp-session-b");
 
 			const legacy = await service.start({
 				kind: "subagent",

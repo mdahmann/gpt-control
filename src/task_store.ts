@@ -361,7 +361,7 @@ export class DurableTaskStore implements TaskStore {
 		if (sessionId === undefined) return operation();
 		if (record.runId) {
 			const run = await this.lockStore.getRun(record.runId);
-			return this.lockStore.withConversationLock(run.conversationId, async () => {
+			return this.lockStore.withConversationOwnershipLock(run.conversationId, async () => {
 				const currentRun = await this.lockStore.getRun(record.runId!);
 				if (currentRun.conversationId !== run.conversationId) throw new Error("Durable task run conversation identity changed.");
 				const conversation = await this.lockStore.getConversation(run.conversationId);

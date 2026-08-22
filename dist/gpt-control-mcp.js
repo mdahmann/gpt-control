@@ -35596,6 +35596,10 @@ class RunStore {
     const normalized = typeof options === "number" ? { timeoutMs: options } : options;
     return this.withNamedLock(`conversation-${conversationId}`, work, normalized);
   }
+  async withConversationOwnershipLock(conversationId, work) {
+    assertConversationId(conversationId);
+    return this.withNamedLock(`mcp-owner-${conversationId}`, work, { timeoutMs: 30000 });
+  }
   async withNamedLock(name, work, options) {
     await this.init();
     if (!/^[A-Za-z0-9._-]+$/.test(name))
@@ -36266,7 +36270,8 @@ class GptControlService {
     await this.store.init();
     const requestHash = startRequestHash(normalized);
     if (normalized.idempotencyKey) {
-      return this.store.withIdempotencyLock(normalized.idempotencyKey, async (keyHash) => {
+      const scopedIdempotencyKey = options.mcpSessionId ? `mcp-${sha256(options.mcpSessionId)}:${normalized.idempotencyKey}` : normalized.idempotencyKey;
+      return this.store.withIdempotencyLock(scopedIdempotencyKey, async (keyHash) => {
         let binding = await this.store.getIdempotencyByHash(keyHash);
         if (!binding) {
           const prepared = await this.store.findRunsByIdempotencyKeyHash(keyHash);
@@ -36438,7 +36443,7 @@ class GptControlService {
       throw new Error(`Exact confirmation required: CLAIM ${runId}`);
     }
     const initial = await this.store.getRun(runId);
-    return this.store.withConversationLock(initial.conversationId, async () => this.store.withRunTaskBindingLock(runId, async () => {
+    return this.store.withConversationOwnershipLock(initial.conversationId, async () => this.store.withRunTaskBindingLock(runId, async () => {
       const run = await this.store.getRun(runId);
       const conversation = await this.store.getConversation(run.conversationId);
       await this.store.claimConversationMcpSession(conversation.id, sessionId, true);
@@ -36446,7 +36451,7 @@ class GptControlService {
     }));
   }
   async closeConversation(conversationId, mcpSessionId) {
-    return this.store.withConversationLock(conversationId, async () => {
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
       const ownedConversation = await this.store.getConversation(conversationId);
       if (mcpSessionId !== undefined && ownedConversation.mcpSessionId !== mcpSessionId) {
         throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
@@ -36459,21 +36464,23 @@ class GptControlService {
       });
       if (active)
         throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-      const conversation = await this.store.getConversation(conversationId);
-      if (conversation.closedAt)
-        return conversation;
-      if (conversation.provider !== "browser")
-        throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-      if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+      return this.store.withConversationLock(conversationId, async () => {
+        const conversation = await this.store.getConversation(conversationId);
+        if (conversation.closedAt)
+          return conversation;
+        if (conversation.provider !== "browser")
+          throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+        if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+          return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+        }
+        if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+          throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+        }
+        const { driver, expected } = await this.resolveOwnedDriver(conversation);
+        await assertExactDriverSession(driver, expected);
+        await driver.close(expected.sessionId);
         return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-      }
-      if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
-        throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
-      }
-      const { driver, expected } = await this.resolveOwnedDriver(conversation);
-      await assertExactDriverSession(driver, expected);
-      await driver.close(expected.sessionId);
-      return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+      });
     });
   }
   async diagnose() {
@@ -36601,7 +36608,7 @@ class GptControlService {
         const run = await this.createRun(request, conversation, manifest, preparedPrompt, idempotencyHash, idempotencyRequestHash, executionReady);
         return { conversation, run };
       };
-      return request.conversationId ? await this.store.withConversationLock(request.conversationId, createForConversation) : await createForConversation();
+      return request.conversationId ? await this.store.withConversationOwnershipLock(request.conversationId, createForConversation) : await createForConversation();
     } catch (error51) {
       if (createdConversationId) {
         await this.store.deleteConversationIfUnreferenced(createdConversationId).catch(() => {
@@ -37965,7 +37972,7 @@ class DurableTaskStore {
       return operation();
     if (record3.runId) {
       const run = await this.lockStore.getRun(record3.runId);
-      return this.lockStore.withConversationLock(run.conversationId, async () => {
+      return this.lockStore.withConversationOwnershipLock(run.conversationId, async () => {
         const currentRun = await this.lockStore.getRun(record3.runId);
         if (currentRun.conversationId !== run.conversationId)
           throw new Error("Durable task run conversation identity changed.");
@@ -38229,9 +38236,15 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
       taskStore.setStatusListener(task.taskId, async (updated) => {
         await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
       });
+      const cancelOriginatingTask = () => taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
       extra.signal.addEventListener("abort", () => {
-        taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
+        cancelOriginatingTask();
       }, { once: true });
+      if (extra.signal.aborted) {
+        await cancelOriginatingTask();
+        taskStore.removeStatusListener(task.taskId);
+        return { task };
+      }
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
       try {
         const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
@@ -38631,7 +38644,7 @@ async function withMcpRunAccess(service, taskStore, runId, sessionId, operation)
     return operation();
   const initial = await service.getRun(runId);
   const legacyTaskOwned = initial.kind === "subagent" && await taskStore.legacySessionOwnsRun(runId, sessionId);
-  return service.store.withConversationLock(initial.conversationId, async () => {
+  return service.store.withConversationOwnershipLock(initial.conversationId, async () => {
     const run = await service.getRun(runId);
     if (run.conversationId !== initial.conversationId)
       throw new Error("Durable run conversation identity changed.");
