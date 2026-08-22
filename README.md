@@ -2,8 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.3 adds shared rate-limit cooldown, ChatGPT project-conversation recovery,
-and bounded Codex callback retry. Version 0.4.2 added immediate-return single
+0.4.4 adds durable model and project catalogs so ordinary catalog reads do not
+open Chrome. Version 0.4.3 added shared rate-limit cooldown, ChatGPT
+project-conversation recovery, and bounded Codex callback retry. Version 0.4.2 added immediate-return single
 and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
 same-conversation required-connector preflight. Version 0.4.0 added live model
 and effort discovery, exact-conversation organization,
@@ -27,6 +28,9 @@ open a replacement browser when the configured driver is unavailable.
 - **Truthful model provenance:** the requested live ChatGPT model and effort are
   selected and read back from the composer, then verified again immediately
   before send.
+- **Quiet catalog reads:** ordinary model and project discovery reads durable
+  cache files and never opens Chrome. Only an explicit `refresh: true` opens and
+  closes one temporary owned tab. Concurrent refreshes are coalesced.
 - **Immutable attachments:** uploads use private broker-owned snapshots with
   hashes and line counts, not mutable workspace paths.
 - **No hidden fallback:** the configured secure browser driver either works or
@@ -55,8 +59,8 @@ never passed through child-process argv.
 |---|---|
 | `gpt_consult` | Structured independent review with evidence, manifest, and receipt |
 | `gpt_chat` | Start or continue one exact ChatGPT conversation |
-| `gpt_models` | Read current ChatGPT model and effort choices without sending a prompt |
-| `gpt_projects` | Read current ChatGPT project names without sending a prompt |
+| `gpt_models` | Read the durable model and effort cache; `refresh: true` explicitly refreshes it |
+| `gpt_projects` | Read the durable project cache; `refresh: true` explicitly refreshes it |
 | `gpt_conversation_attach` | Open an exact existing ChatGPT conversation in a new owned background tab |
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
@@ -91,9 +95,11 @@ for the actual Codex-child workflow.
 Every Worker requires an idempotency key and creates a fresh owned
 conversation. Trusted policy defaults to six simultaneous workers and permits
 an operator-configured limit from one through ten, even across broker processes
-sharing the same state root. Additional workers queue fairly. Use `gpt_models`
-to discover the exact current model and effort labels before a run when the user
-requests a specific selection.
+sharing the same state root. Additional workers queue fairly. Normal
+`gpt_models` calls read the durable cache without touching Chrome. Use
+`refresh: true` only for the first cache fill, a manual refresh, or after a live
+selection mismatch. Real runs always verify the requested live model in their
+already-owned tab before sending.
 
 Workers can set a live `title`. An optional short `project_id` is prefixed to
 that title and verified from ChatGPT read-back, such as

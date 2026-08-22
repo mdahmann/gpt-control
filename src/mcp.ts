@@ -259,15 +259,15 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 
 function registerCoreTools(server: McpServer, service: GptControlService, taskStore: DurableTaskStore): void {
 	server.registerTool("gpt_models", {
-		description: "Read the currently available ChatGPT model and effort choices from the live picker. No prompt is sent and the temporary owned tab is closed.",
-		inputSchema: {},
+		description: "Read the durable ChatGPT model catalog without opening Chrome. Set refresh=true only when an explicit live picker refresh is needed; one temporary owned tab is then opened and closed.",
+		inputSchema: { refresh: z.boolean().optional() },
 		annotations: { readOnlyHint: true },
-	}, async () => toolPayload("Live ChatGPT model catalog.", await service.listModels()));
+	}, async (params) => toolPayload("ChatGPT model catalog.", await service.listModels({ refresh: params.refresh === true })));
 	server.registerTool("gpt_projects", {
-		description: "Read the currently available ChatGPT project names from the live sidebar. No prompt is sent and the temporary owned tab is closed.",
-		inputSchema: {},
+		description: "Read the durable ChatGPT project catalog without opening Chrome. Set refresh=true only when an explicit live sidebar refresh is needed; one temporary owned tab is then opened and closed.",
+		inputSchema: { refresh: z.boolean().optional() },
 		annotations: { readOnlyHint: true },
-	}, async () => toolPayload("Live ChatGPT project catalog.", await service.listProjects()));
+	}, async (params) => toolPayload("ChatGPT project catalog.", await service.listProjects({ refresh: params.refresh === true })));
 
 	server.registerTool("gpt_consult", {
 		description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",

@@ -350,6 +350,10 @@ export class RunStore {
 		return confinedPath(this.root, "provider-throttle.json");
 	}
 
+	private catalogPath(kind: "models" | "projects"): string {
+		return confinedPath(this.root, "catalogs", `${kind}.json`);
+	}
+
 	async init(): Promise<void> {
 		if (!this.legacyStateChecked) {
 			await assertNoLegacySchemaV2State(this.root);
@@ -362,7 +366,27 @@ export class RunStore {
 			secureDirectory(confinedPath(this.root, "locks")),
 			secureDirectory(confinedPath(this.root, "requests")),
 			secureDirectory(confinedPath(this.root, "idempotency")),
+			secureDirectory(confinedPath(this.root, "catalogs")),
 		]);
+	}
+
+	async getCatalogCache(kind: "models" | "projects"): Promise<unknown | undefined> {
+		await this.init();
+		try {
+			return JSON.parse(await safeRead(this.catalogPath(kind))) as unknown;
+		} catch (error) {
+			if (isMissing(error)) return undefined;
+			throw error;
+		}
+	}
+
+	async putCatalogCache(kind: "models" | "projects", record: unknown): Promise<void> {
+		await this.init();
+		await atomicWrite(this.catalogPath(kind), record);
+	}
+
+	async withCatalogRefreshLock<T>(kind: "models" | "projects", work: () => Promise<T>): Promise<T> {
+		return this.withNamedLock(`catalog-refresh-${kind}`, work, { timeoutMs: 90_000 });
 	}
 
 	async getConversation(id: string): Promise<ConversationRecord> {

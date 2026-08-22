@@ -56,6 +56,7 @@ import { passiveTransportDiscovery } from "./transport";
 import type { Exec } from "./types";
 
 const TERMINAL = new Set<RunStatus>(["completed", "failed", "cancelled", "needs_user"]);
+const catalogRefreshes = new Map<string, Promise<unknown>>();
 
 class RestartSuspension extends Error {
 	constructor() { super("GPT-Control monitoring suspended for process restart."); }
@@ -89,6 +90,37 @@ export interface StartRequest {
 	allowSensitiveFiles?: boolean;
 	apiConfirmed?: boolean;
 	allowFocusSteal?: boolean;
+}
+
+export interface ModelCatalogResult {
+	currentModel?: string;
+	currentEffort?: string;
+	models: ChatGptModelCatalog["models"];
+	efforts: ChatGptModelCatalog["efforts"];
+	discoveredAt?: string;
+	browserDriverId: string;
+	cacheStatus: "hit" | "miss" | "refreshed";
+	refreshRequired: boolean;
+	cachedAt?: string;
+	message?: string;
+}
+
+export interface ProjectCatalogResult {
+	projects: ChatGptProjectCatalog["projects"];
+	discoveredAt?: string;
+	browserDriverId: string;
+	cacheStatus: "hit" | "miss" | "refreshed";
+	refreshRequired: boolean;
+	cachedAt?: string;
+	message?: string;
+}
+
+interface CatalogCacheRecord<T> {
+	version: 1;
+	kind: "models" | "projects";
+	cachedAt: string;
+	browserDriverId: string;
+	catalog: T;
 }
 
 export interface StartResult {
@@ -217,36 +249,64 @@ export class GptControlService {
 		this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
 	}
 
-	async listModels(): Promise<ChatGptModelCatalog & { browserDriverId: string }> {
-		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
-		const route = selectRoute(capabilities, { transport: "browser" });
-		assertTransportAllowed(this.policy, route.kind);
-		const name = `gpt-control:catalog:${opaqueId("task")}`;
-		const session = await route.driver.create(name, CHATGPT_ORIGIN);
-		const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-		try {
-			const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
-			const catalog = await route.driver.discoverModels(ready.session);
-			return { ...catalog, browserDriverId: route.driver.id };
-		} finally {
-			await route.driver.close(session.sessionId).catch(() => undefined);
-		}
+	async listModels(options: { refresh?: boolean } = {}): Promise<ModelCatalogResult> {
+		const before = parseModelCatalogCache(await this.store.getCatalogCache("models"));
+		if (!options.refresh) return before ? modelCatalogResult(before, "hit") : missingModelCatalog();
+		return catalogSingleFlight(`${this.store.root}:models`, () => this.store.withCatalogRefreshLock("models", async () => {
+			const after = parseModelCatalogCache(await this.store.getCatalogCache("models"));
+			if (after && after.cachedAt !== before?.cachedAt) return modelCatalogResult(after, "hit");
+			const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+			const route = selectRoute(capabilities, { transport: "browser" });
+			assertTransportAllowed(this.policy, route.kind);
+			const name = `gpt-control:catalog:${opaqueId("task")}`;
+			const session = await route.driver.create(name, CHATGPT_ORIGIN);
+			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+			try {
+				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
+				const catalog = await route.driver.discoverModels(ready.session);
+				const record: CatalogCacheRecord<ChatGptModelCatalog> = {
+					version: 1,
+					kind: "models",
+					cachedAt: nowIso(),
+					browserDriverId: route.driver.id,
+					catalog,
+				};
+				await this.store.putCatalogCache("models", record);
+				return modelCatalogResult(record, "refreshed");
+			} finally {
+				await route.driver.close(session.sessionId).catch(() => undefined);
+			}
+		}));
 	}
 
-	async listProjects(): Promise<ChatGptProjectCatalog & { browserDriverId: string }> {
-		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
-		const route = selectRoute(capabilities, { transport: "browser" });
-		assertTransportAllowed(this.policy, route.kind);
-		const name = `gpt-control:projects:${opaqueId("task")}`;
-		const session = await route.driver.create(name, CHATGPT_ORIGIN);
-		const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-		try {
-			const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
-			const catalog = await route.driver.discoverProjects(ready.session);
-			return { ...catalog, browserDriverId: route.driver.id };
-		} finally {
-			await route.driver.close(session.sessionId).catch(() => undefined);
-		}
+	async listProjects(options: { refresh?: boolean } = {}): Promise<ProjectCatalogResult> {
+		const before = parseProjectCatalogCache(await this.store.getCatalogCache("projects"));
+		if (!options.refresh) return before ? projectCatalogResult(before, "hit") : missingProjectCatalog();
+		return catalogSingleFlight(`${this.store.root}:projects`, () => this.store.withCatalogRefreshLock("projects", async () => {
+			const after = parseProjectCatalogCache(await this.store.getCatalogCache("projects"));
+			if (after && after.cachedAt !== before?.cachedAt) return projectCatalogResult(after, "hit");
+			const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+			const route = selectRoute(capabilities, { transport: "browser" });
+			assertTransportAllowed(this.policy, route.kind);
+			const name = `gpt-control:projects:${opaqueId("task")}`;
+			const session = await route.driver.create(name, CHATGPT_ORIGIN);
+			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+			try {
+				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
+				const catalog = await route.driver.discoverProjects(ready.session);
+				const record: CatalogCacheRecord<ChatGptProjectCatalog> = {
+					version: 1,
+					kind: "projects",
+					cachedAt: nowIso(),
+					browserDriverId: route.driver.id,
+					catalog,
+				};
+				await this.store.putCatalogCache("projects", record);
+				return projectCatalogResult(record, "refreshed");
+			} finally {
+				await route.driver.close(session.sessionId).catch(() => undefined);
+			}
+		}));
 	}
 
 	async manageConversation(
@@ -2314,6 +2374,127 @@ function attachedConversationIdentity(request: AttachConversationRequest): { id:
 	}
 	if (identity.id.length > 256) throw new Error("ChatGPT provider conversation id is too long.");
 	return identity;
+}
+
+async function catalogSingleFlight<T>(key: string, work: () => Promise<T>): Promise<T> {
+	const existing = catalogRefreshes.get(key) as Promise<T> | undefined;
+	if (existing) return existing;
+	const pending = work();
+	catalogRefreshes.set(key, pending);
+	try {
+		return await pending;
+	} finally {
+		if (catalogRefreshes.get(key) === pending) catalogRefreshes.delete(key);
+	}
+}
+
+function modelCatalogResult(
+	record: CatalogCacheRecord<ChatGptModelCatalog>,
+	cacheStatus: "hit" | "refreshed",
+): ModelCatalogResult {
+	return {
+		...record.catalog,
+		browserDriverId: record.browserDriverId,
+		cacheStatus,
+		refreshRequired: false,
+		cachedAt: record.cachedAt,
+	};
+}
+
+function projectCatalogResult(
+	record: CatalogCacheRecord<ChatGptProjectCatalog>,
+	cacheStatus: "hit" | "refreshed",
+): ProjectCatalogResult {
+	return {
+		...record.catalog,
+		browserDriverId: record.browserDriverId,
+		cacheStatus,
+		refreshRequired: false,
+		cachedAt: record.cachedAt,
+	};
+}
+
+function missingModelCatalog(): ModelCatalogResult {
+	return {
+		models: [],
+		efforts: [],
+		browserDriverId: "cache-only",
+		cacheStatus: "miss",
+		refreshRequired: true,
+		message: "No cached ChatGPT model catalog is available. Call gpt_models with refresh=true to perform one explicit live refresh.",
+	};
+}
+
+function missingProjectCatalog(): ProjectCatalogResult {
+	return {
+		projects: [],
+		browserDriverId: "cache-only",
+		cacheStatus: "miss",
+		refreshRequired: true,
+		message: "No cached ChatGPT project catalog is available. Call gpt_projects with refresh=true to perform one explicit live refresh.",
+	};
+}
+
+function parseModelCatalogCache(value: unknown): CatalogCacheRecord<ChatGptModelCatalog> | undefined {
+	if (value === undefined) return undefined;
+	const record = parseCatalogRecord(value, "models");
+	const catalog = record.catalog;
+	if (!isRecord(catalog)
+		|| !validOptionalString(catalog.currentModel)
+		|| !validOptionalString(catalog.currentEffort)
+		|| !validCatalogOptions(catalog.models)
+		|| !validCatalogOptions(catalog.efforts)
+		|| !validTimestamp(catalog.discoveredAt)) {
+		throw new Error("Invalid cached ChatGPT model catalog.");
+	}
+	return record as CatalogCacheRecord<ChatGptModelCatalog>;
+}
+
+function parseProjectCatalogCache(value: unknown): CatalogCacheRecord<ChatGptProjectCatalog> | undefined {
+	if (value === undefined) return undefined;
+	const record = parseCatalogRecord(value, "projects");
+	const catalog = record.catalog;
+	if (!isRecord(catalog)
+		|| !Array.isArray(catalog.projects)
+		|| catalog.projects.some((project) => !isRecord(project) || !validBoundedString(project.name))
+		|| !validTimestamp(catalog.discoveredAt)) {
+		throw new Error("Invalid cached ChatGPT project catalog.");
+	}
+	return record as CatalogCacheRecord<ChatGptProjectCatalog>;
+}
+
+function parseCatalogRecord(value: unknown, kind: "models" | "projects"): CatalogCacheRecord<unknown> {
+	if (!isRecord(value)
+		|| value.version !== 1
+		|| value.kind !== kind
+		|| !validTimestamp(value.cachedAt)
+		|| !validBoundedString(value.browserDriverId)
+		|| !("catalog" in value)) {
+		throw new Error(`Invalid cached ChatGPT ${kind} catalog record.`);
+	}
+	return value as unknown as CatalogCacheRecord<unknown>;
+}
+
+function validCatalogOptions(value: unknown): boolean {
+	return Array.isArray(value) && value.every((option) => isRecord(option)
+		&& validBoundedString(option.label)
+		&& validOptionalString(option.note));
+}
+
+function validOptionalString(value: unknown): boolean {
+	return value === undefined || validBoundedString(value);
+}
+
+function validBoundedString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 1024;
+}
+
+function validTimestamp(value: unknown): value is string {
+	return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function sha256(value: string): string {

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.4] - 2026-08-22
+
+- Changed ordinary `gpt_models` and `gpt_projects` calls to read durable cache
+  files without opening Chrome or contacting ChatGPT.
+- Added explicit `refresh: true` catalog refreshes. Each refresh uses one
+  temporary owned tab and closes it after verified discovery.
+- Coalesced simultaneous refreshes in one process and across broker processes
+  sharing the same secure state root.
+- Kept live per-run model selection and immediate pre-send verification inside
+  each real Chat or Worker tab.
+
 ## [0.4.3] - 2026-08-22
 
 - Detects and safely dismisses visible ChatGPT rate-limit notices, records a

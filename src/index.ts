@@ -96,15 +96,17 @@ function registerCatalogTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptC
 	pi.registerTool({
 		name: "gpt_models",
 		label: "GPT Models",
-		description: "Read the live ChatGPT model and effort choices. No prompt is sent and the temporary owned tab is closed.",
+		description: "Read the durable ChatGPT model catalog without opening Chrome. Use refresh only for an explicit live picker refresh.",
 		loadMode: "discoverable",
 		approval: "read",
 		strict: true,
-		parameters: Type.Object({}),
-		execute: async () => {
+		parameters: Type.Object({
+			refresh: Type.Optional(Type.Boolean({ description: "Open one temporary ChatGPT tab, refresh the cache from the live picker, and close it. Default false." })),
+		}),
+		execute: async (_id, params) => {
 			try {
-				const catalog = await service.listModels();
-				return textResult("Live ChatGPT model catalog.", catalog);
+				const catalog = await service.listModels({ refresh: params.refresh === true });
+				return textResult("ChatGPT model catalog.", catalog);
 			} catch (error) {
 				return describeError(error);
 			}
@@ -113,15 +115,17 @@ function registerCatalogTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptC
 	pi.registerTool({
 		name: "gpt_projects",
 		label: "GPT Projects",
-		description: "Read the live ChatGPT project names. No prompt is sent and the temporary owned tab is closed.",
+		description: "Read the durable ChatGPT project catalog without opening Chrome. Use refresh only for an explicit live sidebar refresh.",
 		loadMode: "discoverable",
 		approval: "read",
 		strict: true,
-		parameters: Type.Object({}),
-		execute: async () => {
+		parameters: Type.Object({
+			refresh: Type.Optional(Type.Boolean({ description: "Open one temporary ChatGPT tab, refresh the cache from the live sidebar, and close it. Default false." })),
+		}),
+		execute: async (_id, params) => {
 			try {
-				const catalog = await service.listProjects();
-				return textResult("Live ChatGPT project catalog.", catalog);
+				const catalog = await service.listProjects({ refresh: params.refresh === true });
+				return textResult("ChatGPT project catalog.", catalog);
 			} catch (error) {
 				return describeError(error);
 			}

@@ -459,9 +459,89 @@ describe("ChatGPT organization controls", () => {
 	test("discovers the live project names without sending a prompt", async () => {
 		const bridge = new FakeChromeBridge({ availableProjects: ["Health", "Zenbox", "Sequence"] });
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
-		const result = await service.listProjects();
+		const result = await service.listProjects({ refresh: true });
 		expect(result.projects).toEqual([{ name: "Health" }, { name: "Zenbox" }, { name: "Sequence" }]);
+		expect(result.cacheStatus).toBe("refreshed");
 		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("ordinary catalog reads use durable cache without opening ChatGPT", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const firstBridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.6 Spark"],
+			availableEfforts: ["High", "Pro"],
+			availableProjects: ["Sequence", "Zenbox"],
+		});
+		const first = makeChromeService(root, workspace, firstBridge).service;
+		const modelRefresh = await first.listModels({ refresh: true });
+		const projectRefresh = await first.listProjects({ refresh: true });
+		expect(modelRefresh.cacheStatus).toBe("refreshed");
+		expect(projectRefresh.cacheStatus).toBe("refreshed");
+
+		const secondBridge = new FakeChromeBridge();
+		const second = makeChromeService(root, workspace, secondBridge).service;
+		const cachedModels = await second.listModels();
+		const cachedProjects = await second.listProjects();
+		expect(cachedModels).toMatchObject({
+			cacheStatus: "hit",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.6 Spark" }],
+			efforts: [{ label: "High" }, { label: "Pro" }],
+		});
+		expect(cachedProjects).toMatchObject({
+			cacheStatus: "hit",
+			projects: [{ name: "Sequence" }, { name: "Zenbox" }],
+		});
+		expect(secondBridge.calls).toEqual([]);
+		expect(secondBridge.activeTabs()).toEqual([]);
+	});
+
+	test("a cache miss is explicit and does not open ChatGPT", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		expect(await service.listModels()).toMatchObject({
+			cacheStatus: "miss",
+			refreshRequired: true,
+			models: [],
+			efforts: [],
+		});
+		expect(await service.listProjects()).toMatchObject({
+			cacheStatus: "miss",
+			refreshRequired: true,
+			projects: [],
+		});
+		expect(bridge.calls).toEqual([]);
+		expect(bridge.activeTabs()).toEqual([]);
+	});
+
+	test("coalesces simultaneous explicit model refreshes into one temporary tab", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const catalogOptions = {
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol"],
+			availableEfforts: ["High", "Pro"],
+		};
+		const bridgeA = new FakeChromeBridge(catalogOptions);
+		const bridgeB = new FakeChromeBridge(catalogOptions);
+		const serviceA = makeChromeService(root, workspace, bridgeA).service;
+		const serviceB = makeChromeService(root, workspace, bridgeB).service;
+		const [first, second] = await Promise.all([
+			serviceA.listModels({ refresh: true }),
+			serviceB.listModels({ refresh: true }),
+		]);
+		expect(first.cacheStatus).toBe("refreshed");
+		expect(second.cacheStatus).toBe("refreshed");
+		const creates = [...bridgeA.calls, ...bridgeB.calls]
+			.filter((call) => call.args[0] === "taskSession" && call.args[1] === "create");
+		expect(creates).toHaveLength(1);
+		expect(bridgeA.activeTabs()).toEqual([]);
+		expect(bridgeB.activeTabs()).toEqual([]);
 	});
 
 	test("pins, renames, moves, and archives one exact owned conversation with read-back", async () => {

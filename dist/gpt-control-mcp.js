@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.4.3";
+var PACKAGE_VERSION = "0.4.4";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.4.3";
+var PACKAGE_VERSION2 = "0.4.4";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -36167,6 +36167,9 @@ class RunStore {
   providerThrottlePath() {
     return confinedPath(this.root, "provider-throttle.json");
   }
+  catalogPath(kind) {
+    return confinedPath(this.root, "catalogs", `${kind}.json`);
+  }
   async init() {
     if (!this.legacyStateChecked) {
       await assertNoLegacySchemaV2State(this.root);
@@ -36178,8 +36181,26 @@ class RunStore {
       secureDirectory(confinedPath(this.root, "runs")),
       secureDirectory(confinedPath(this.root, "locks")),
       secureDirectory(confinedPath(this.root, "requests")),
-      secureDirectory(confinedPath(this.root, "idempotency"))
+      secureDirectory(confinedPath(this.root, "idempotency")),
+      secureDirectory(confinedPath(this.root, "catalogs"))
     ]);
+  }
+  async getCatalogCache(kind) {
+    await this.init();
+    try {
+      return JSON.parse(await safeRead(this.catalogPath(kind)));
+    } catch (error51) {
+      if (isMissing(error51))
+        return;
+      throw error51;
+    }
+  }
+  async putCatalogCache(kind, record3) {
+    await this.init();
+    await atomicWrite(this.catalogPath(kind), record3);
+  }
+  async withCatalogRefreshLock(kind, work) {
+    return this.withNamedLock(`catalog-refresh-${kind}`, work, { timeoutMs: 90000 });
   }
   async getConversation(id) {
     await this.init();
@@ -37130,6 +37151,7 @@ function stripFence(value) {
 
 // src/service.ts
 var TERMINAL2 = new Set(["completed", "failed", "cancelled", "needs_user"]);
+var catalogRefreshes = new Map;
 
 class RestartSuspension extends Error {
   constructor() {
@@ -37208,39 +37230,71 @@ class GptControlService {
     this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
     this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
   }
-  async listModels() {
-    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
-    const route = selectRoute(capabilities, { transport: "browser" });
-    assertTransportAllowed(this.policy, route.kind);
-    const name = `gpt-control:catalog:${opaqueId("task")}`;
-    const session = await route.driver.create(name, CHATGPT_ORIGIN);
-    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-    try {
-      const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
-      const catalog = await route.driver.discoverModels(ready.session);
-      return { ...catalog, browserDriverId: route.driver.id };
-    } finally {
-      await route.driver.close(session.sessionId).catch(() => {
-        return;
-      });
-    }
+  async listModels(options = {}) {
+    const before = parseModelCatalogCache(await this.store.getCatalogCache("models"));
+    if (!options.refresh)
+      return before ? modelCatalogResult(before, "hit") : missingModelCatalog();
+    return catalogSingleFlight(`${this.store.root}:models`, () => this.store.withCatalogRefreshLock("models", async () => {
+      const after = parseModelCatalogCache(await this.store.getCatalogCache("models"));
+      if (after && after.cachedAt !== before?.cachedAt)
+        return modelCatalogResult(after, "hit");
+      const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+      const route = selectRoute(capabilities, { transport: "browser" });
+      assertTransportAllowed(this.policy, route.kind);
+      const name = `gpt-control:catalog:${opaqueId("task")}`;
+      const session = await route.driver.create(name, CHATGPT_ORIGIN);
+      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+      try {
+        const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
+        const catalog = await route.driver.discoverModels(ready.session);
+        const record3 = {
+          version: 1,
+          kind: "models",
+          cachedAt: nowIso(),
+          browserDriverId: route.driver.id,
+          catalog
+        };
+        await this.store.putCatalogCache("models", record3);
+        return modelCatalogResult(record3, "refreshed");
+      } finally {
+        await route.driver.close(session.sessionId).catch(() => {
+          return;
+        });
+      }
+    }));
   }
-  async listProjects() {
-    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
-    const route = selectRoute(capabilities, { transport: "browser" });
-    assertTransportAllowed(this.policy, route.kind);
-    const name = `gpt-control:projects:${opaqueId("task")}`;
-    const session = await route.driver.create(name, CHATGPT_ORIGIN);
-    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-    try {
-      const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
-      const catalog = await route.driver.discoverProjects(ready.session);
-      return { ...catalog, browserDriverId: route.driver.id };
-    } finally {
-      await route.driver.close(session.sessionId).catch(() => {
-        return;
-      });
-    }
+  async listProjects(options = {}) {
+    const before = parseProjectCatalogCache(await this.store.getCatalogCache("projects"));
+    if (!options.refresh)
+      return before ? projectCatalogResult(before, "hit") : missingProjectCatalog();
+    return catalogSingleFlight(`${this.store.root}:projects`, () => this.store.withCatalogRefreshLock("projects", async () => {
+      const after = parseProjectCatalogCache(await this.store.getCatalogCache("projects"));
+      if (after && after.cachedAt !== before?.cachedAt)
+        return projectCatalogResult(after, "hit");
+      const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+      const route = selectRoute(capabilities, { transport: "browser" });
+      assertTransportAllowed(this.policy, route.kind);
+      const name = `gpt-control:projects:${opaqueId("task")}`;
+      const session = await route.driver.create(name, CHATGPT_ORIGIN);
+      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+      try {
+        const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
+        const catalog = await route.driver.discoverProjects(ready.session);
+        const record3 = {
+          version: 1,
+          kind: "projects",
+          cachedAt: nowIso(),
+          browserDriverId: route.driver.id,
+          catalog
+        };
+        await this.store.putCatalogCache("projects", record3);
+        return projectCatalogResult(record3, "refreshed");
+      } finally {
+        await route.driver.close(session.sessionId).catch(() => {
+          return;
+        });
+      }
+    }));
   }
   async manageConversation(conversationId, action, mcpSessionId) {
     return this.store.withConversationOwnershipLock(conversationId, async () => {
@@ -39111,6 +39165,97 @@ function attachedConversationIdentity(request) {
     throw new Error("ChatGPT provider conversation id is too long.");
   return identity;
 }
+async function catalogSingleFlight(key, work) {
+  const existing = catalogRefreshes.get(key);
+  if (existing)
+    return existing;
+  const pending = work();
+  catalogRefreshes.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    if (catalogRefreshes.get(key) === pending)
+      catalogRefreshes.delete(key);
+  }
+}
+function modelCatalogResult(record3, cacheStatus) {
+  return {
+    ...record3.catalog,
+    browserDriverId: record3.browserDriverId,
+    cacheStatus,
+    refreshRequired: false,
+    cachedAt: record3.cachedAt
+  };
+}
+function projectCatalogResult(record3, cacheStatus) {
+  return {
+    ...record3.catalog,
+    browserDriverId: record3.browserDriverId,
+    cacheStatus,
+    refreshRequired: false,
+    cachedAt: record3.cachedAt
+  };
+}
+function missingModelCatalog() {
+  return {
+    models: [],
+    efforts: [],
+    browserDriverId: "cache-only",
+    cacheStatus: "miss",
+    refreshRequired: true,
+    message: "No cached ChatGPT model catalog is available. Call gpt_models with refresh=true to perform one explicit live refresh."
+  };
+}
+function missingProjectCatalog() {
+  return {
+    projects: [],
+    browserDriverId: "cache-only",
+    cacheStatus: "miss",
+    refreshRequired: true,
+    message: "No cached ChatGPT project catalog is available. Call gpt_projects with refresh=true to perform one explicit live refresh."
+  };
+}
+function parseModelCatalogCache(value) {
+  if (value === undefined)
+    return;
+  const record3 = parseCatalogRecord(value, "models");
+  const catalog = record3.catalog;
+  if (!isRecord2(catalog) || !validOptionalString(catalog.currentModel) || !validOptionalString(catalog.currentEffort) || !validCatalogOptions(catalog.models) || !validCatalogOptions(catalog.efforts) || !validTimestamp(catalog.discoveredAt)) {
+    throw new Error("Invalid cached ChatGPT model catalog.");
+  }
+  return record3;
+}
+function parseProjectCatalogCache(value) {
+  if (value === undefined)
+    return;
+  const record3 = parseCatalogRecord(value, "projects");
+  const catalog = record3.catalog;
+  if (!isRecord2(catalog) || !Array.isArray(catalog.projects) || catalog.projects.some((project) => !isRecord2(project) || !validBoundedString(project.name)) || !validTimestamp(catalog.discoveredAt)) {
+    throw new Error("Invalid cached ChatGPT project catalog.");
+  }
+  return record3;
+}
+function parseCatalogRecord(value, kind) {
+  if (!isRecord2(value) || value.version !== 1 || value.kind !== kind || !validTimestamp(value.cachedAt) || !validBoundedString(value.browserDriverId) || !("catalog" in value)) {
+    throw new Error(`Invalid cached ChatGPT ${kind} catalog record.`);
+  }
+  return value;
+}
+function validCatalogOptions(value) {
+  return Array.isArray(value) && value.every((option) => isRecord2(option) && validBoundedString(option.label) && validOptionalString(option.note));
+}
+function validOptionalString(value) {
+  return value === undefined || validBoundedString(value);
+}
+function validBoundedString(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 1024;
+}
+function validTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 function sha256(value) {
   return createHash6("sha256").update(value).digest("hex");
 }
@@ -39961,15 +40106,15 @@ function createMcpServer(serviceOrOptions = {}) {
 }
 function registerCoreTools(server, service, taskStore) {
   server.registerTool("gpt_models", {
-    description: "Read the currently available ChatGPT model and effort choices from the live picker. No prompt is sent and the temporary owned tab is closed.",
-    inputSchema: {},
+    description: "Read the durable ChatGPT model catalog without opening Chrome. Set refresh=true only when an explicit live picker refresh is needed; one temporary owned tab is then opened and closed.",
+    inputSchema: { refresh: exports_external.boolean().optional() },
     annotations: { readOnlyHint: true }
-  }, async () => toolPayload("Live ChatGPT model catalog.", await service.listModels()));
+  }, async (params) => toolPayload("ChatGPT model catalog.", await service.listModels({ refresh: params.refresh === true })));
   server.registerTool("gpt_projects", {
-    description: "Read the currently available ChatGPT project names from the live sidebar. No prompt is sent and the temporary owned tab is closed.",
-    inputSchema: {},
+    description: "Read the durable ChatGPT project catalog without opening Chrome. Set refresh=true only when an explicit live sidebar refresh is needed; one temporary owned tab is then opened and closed.",
+    inputSchema: { refresh: exports_external.boolean().optional() },
     annotations: { readOnlyHint: true }
-  }, async () => toolPayload("Live ChatGPT project catalog.", await service.listProjects()));
+  }, async (params) => toolPayload("ChatGPT project catalog.", await service.listProjects({ refresh: params.refresh === true })));
   server.registerTool("gpt_consult", {
     description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",
     inputSchema: { question: exports_external.string().min(1), ...CommonSchema },

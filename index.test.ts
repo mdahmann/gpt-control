@@ -75,6 +75,10 @@ describe("public extension contract", () => {
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");
 		expect(tools.find((tool) => tool.name === "gpt_diagnose_active")?.approval).toBe("exec");
+		const models = tools.find((tool) => tool.name === "gpt_models")!;
+		const projects = tools.find((tool) => tool.name === "gpt_projects")!;
+		expect((models.parameters as { properties: Record<string, SchemaNode> }).properties).toHaveProperty("refresh");
+		expect((projects.parameters as { properties: Record<string, SchemaNode> }).properties).toHaveProperty("refresh");
 	});
 
 	test("model input cannot widen workspace, sensitive-file, paid, focus, endpoint, or output authority", () => {
@@ -172,6 +176,8 @@ describe("MCP plugin contract", () => {
 			expect(detachedBatch?.inputSchema.properties).toHaveProperty("callback_thread_id");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_models");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_projects");
+			expect(listed.tools.find((tool) => tool.name === "gpt_models")?.inputSchema.properties).toHaveProperty("refresh");
+			expect(listed.tools.find((tool) => tool.name === "gpt_projects")?.inputSchema.properties).toHaveProperty("refresh");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_conversation_manage");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_abandon_pending");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_claim");
