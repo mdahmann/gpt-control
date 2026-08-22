@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.2] - 2026-08-22
+
+### Added
+
+- Event-driven Codex parent callbacks for durable Pro workers through `codex queue`, using only the runtime-provided trusted `CODEX_THREAD_ID`.
+- Durable, coalesced completion receipts that carry task/run IDs and terminal status without prompt or result text.
+
+### Security
+
+- Parent callback targets cannot be supplied by model tool arguments. Callback attempts are marked before the external queue command, preventing automatic duplicate wakes across restart or an ambiguous command boundary.
+- A missing thread identity, unavailable Codex executable, or failed callback does not alter the immutable worker result. Durable task/run lookup remains authoritative.
+
 ## [0.3.1] - 2026-08-21
 
 ### Added

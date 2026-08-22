@@ -21,9 +21,25 @@ The same tool remains usable as one long-running call. It waits for one terminal
 completion or blocker and returns once. This is the compatibility path for a
 client that cannot negotiate MCP tasks.
 
-A task notification is a protocol event. GPT-Control does not claim that it can
-inject a new model-visible chat message or wake a dormant Codex thread. Recovery
-uses the durable task/run IDs, not conversational polling.
+A task notification is a protocol event and is not itself treated as a
+model-visible callback. In Codex 0.149 or newer, the plugin can also bind a task
+to the trusted `CODEX_THREAD_ID` supplied by the runtime. When that task becomes
+terminal, GPT-Control stages a compact receipt and invokes `codex queue` for the
+bound parent. The parent then reads the authoritative result with
+`gpt_subagent_get`; no repeated polling is required.
+
+Nearby terminal receipts for one parent are coalesced into one queued message.
+The receipt contains only task/run IDs and statuses, never the worker prompt or
+result body. GPT-Control durably marks the callback attempted before invoking
+the external command. This gives restart-safe at-most-once automatic delivery:
+an ambiguous crash can lose a wake-up, but it cannot automatically send a
+duplicate. Durable task/run lookup remains the recovery path.
+
+The parent target is never accepted from a model-facing tool argument. If
+`CODEX_THREAD_ID` is missing or invalid, or the trusted Codex executable cannot
+be found, only the callback is disabled; the worker and its durable result still
+operate normally. This release uses the local `codex queue` route and does not
+configure a remote app-server callback.
 
 ## Concurrency
 

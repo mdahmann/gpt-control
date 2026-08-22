@@ -10,6 +10,7 @@ import { CHATGPT_ORIGIN } from "./src/chatgpt";
 import { idempotencyKeyHash } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
 import { FakeChromeBridge, makeChromeService, TEST_OPERATOR_ABANDON_TOKEN } from "./test_helpers";
+import type { Exec } from "./src/types";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -553,14 +554,27 @@ interface McpHarness {
 	close: () => Promise<void>;
 }
 
-async function connectMcp(options: { taskSupport?: boolean; clientTasks?: boolean; bridge?: FakeChromeBridge; root?: string; recover?: boolean } = {}): Promise<McpHarness> {
+async function connectMcp(options: {
+	taskSupport?: boolean;
+	clientTasks?: boolean;
+	bridge?: FakeChromeBridge;
+	root?: string;
+	recover?: boolean;
+	codexCallback?: false | { threadId: string; command: string; exec: Exec; delayMs?: number };
+} = {}): Promise<McpHarness> {
 	const root = options.root ?? scratch();
 	const workspace = join(root, "workspace");
 	mkdirSync(workspace, { recursive: true });
 	const bridge = options.bridge ?? new FakeChromeBridge();
 	const { service } = makeChromeService(join(root, "state"), workspace, bridge);
 	const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
-	const server = createMcpServer({ service, taskStore, recover: options.recover ?? false, taskSupport: options.taskSupport });
+	const server = createMcpServer({
+		service,
+		taskStore,
+		recover: options.recover ?? false,
+		taskSupport: options.taskSupport,
+		codexCallback: options.codexCallback ?? false,
+	});
 	const client = new Client({ name: "codex-fixture", version: "1" }, options.clientTasks === false ? {} : {
 		capabilities: { tasks: { requests: { tools: { call: {} } } } },
 	});
@@ -759,6 +773,149 @@ describe("MCP task delivery", () => {
 			expect(run.receipt).toMatchObject({ observedModel: "Pro", modelVerified: true });
 		} finally {
 			await harness.close();
+		}
+	});
+
+	test("queues one compact completion receipt to the trusted Codex parent thread", async () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const threadId = "019c8f58-41ac-72b0-a9f6-43653b3ea80c";
+		const harness = await connectMcp({
+			codexCallback: { threadId, command: "/trusted/bin/codex", exec, delayMs: 1 },
+		});
+		try {
+			const events = await collectTask(harness.client, "wake the parent", "wake-the-parent");
+			const taskId = taskIdFrom(events);
+			await waitUntil(() => calls.length === 1);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(calls).toHaveLength(1);
+			expect(calls[0].command).toBe("/trusted/bin/codex");
+			expect(calls[0].args.slice(0, 4)).toEqual(["queue", "--thread", threadId, "--message"]);
+			const message = calls[0].args[4] ?? "";
+			expect(message).toContain("A ChatGPT Pro worker finished");
+			expect(message).toContain(taskId);
+			expect(message).toContain("gpt_subagent_get");
+			expect(message).not.toContain("wake the parent");
+		} finally {
+			await harness.close();
+		}
+	});
+
+	test("recovers an unqueued completion receipt after the MCP server restarts", async () => {
+		const root = scratch();
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const callback = {
+			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+			command: "/trusted/bin/codex",
+			exec,
+		};
+		const first = await connectMcp({ root, codexCallback: { ...callback, delayMs: 60_000 } });
+		await collectTask(first.client, "finish before restart", "finish-before-restart");
+		expect(calls).toEqual([]);
+		await first.close();
+
+		const second = await connectMcp({ root, recover: true, codexCallback: { ...callback, delayMs: 1 } });
+		try {
+			await waitUntil(() => calls.length === 1);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(calls).toHaveLength(1);
+			expect(calls[0].args[4]).toContain("completed");
+		} finally {
+			await second.close();
+		}
+	});
+
+	test("coalesces nearby worker completions into one parent wake-up", async () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const harness = await connectMcp({
+			codexCallback: {
+				threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+				command: "/trusted/bin/codex",
+				exec,
+				delayMs: 50,
+			},
+		});
+		try {
+			const completed = await Promise.all([
+				collectTask(harness.client, "first nearby worker", "first-nearby-worker"),
+				collectTask(harness.client, "second nearby worker", "second-nearby-worker"),
+			]);
+			await waitUntil(() => calls.length === 1);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(calls).toHaveLength(1);
+			const message = calls[0].args[4] ?? "";
+			expect(message).toContain("2 ChatGPT Pro workers finished");
+			expect(message).toContain(taskIdFrom(completed[0]));
+			expect(message).toContain(taskIdFrom(completed[1]));
+		} finally {
+			await harness.close();
+		}
+	});
+
+	test("does not queue a delivered completion receipt again after restart", async () => {
+		const root = scratch();
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const callback = {
+			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+			command: "/trusted/bin/codex",
+			exec,
+			delayMs: 1,
+		};
+		const first = await connectMcp({ root, codexCallback: callback });
+		await collectTask(first.client, "deliver once", "deliver-once");
+		await waitUntil(() => calls.length === 1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await first.close();
+
+		const second = await connectMcp({ root, recover: true, codexCallback: callback });
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(calls).toHaveLength(1);
+		} finally {
+			await second.close();
+		}
+	});
+
+	test("does not retry an ambiguous failed queue command after restart", async () => {
+		const root = scratch();
+		let attempts = 0;
+		const exec: Exec = async () => {
+			attempts += 1;
+			return { stdout: "", stderr: "ambiguous queue failure", code: 1, killed: false };
+		};
+		const callback = {
+			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+			command: "/trusted/bin/codex",
+			exec,
+			delayMs: 1,
+		};
+		const first = await connectMcp({ root, codexCallback: callback });
+		await collectTask(first.client, "ambiguous callback", "ambiguous-callback");
+		await waitUntil(() => attempts === 1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await first.close();
+
+		const second = await connectMcp({ root, recover: true, codexCallback: callback });
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(attempts).toBe(1);
+		} finally {
+			await second.close();
 		}
 	});
 

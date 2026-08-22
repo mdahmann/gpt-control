@@ -590,6 +590,14 @@ export class RunStore {
 		return this.withNamedLock(`mcp-run-${runId}`, work, { timeoutMs: 30_000 });
 	}
 
+	async withCodexCallbackLock<T>(threadId: string, work: () => Promise<T>): Promise<T> {
+		if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+			throw new Error("Invalid Codex parent thread id.");
+		}
+		const identityHash = createHash("sha256").update(threadId.toLowerCase(), "utf8").digest("hex");
+		return this.withNamedLock(`codex-callback-${identityHash}`, work, { timeoutMs: 30_000 });
+	}
+
 	async withConversationLock<T>(
 		conversationId: string,
 		work: () => Promise<T>,

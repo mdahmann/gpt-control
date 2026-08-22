@@ -6633,8 +6633,8 @@ var require_dist = __commonJS(function(exports, module) {
 });
 
 // src/mcp.ts
-import { join as join6, resolve as resolve8 } from "path";
-import { fileURLToPath as fileURLToPath2 } from "url";
+import { join as join7, resolve as resolve9 } from "path";
+import { fileURLToPath as fileURLToPath3 } from "url";
 
 // node_modules/zod/v3/helpers/util.js
 var util;
@@ -29319,7 +29319,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.3.1";
+var PACKAGE_VERSION = "0.3.2";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33761,7 +33761,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.3.1";
+var PACKAGE_VERSION2 = "0.3.2";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35787,6 +35787,13 @@ class RunStore {
   async withRunTaskBindingLock(runId, work) {
     assertRunId(runId);
     return this.withNamedLock(`mcp-run-${runId}`, work, { timeoutMs: 30000 });
+  }
+  async withCodexCallbackLock(threadId, work) {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+      throw new Error("Invalid Codex parent thread id.");
+    }
+    const identityHash = createHash3("sha256").update(threadId.toLowerCase(), "utf8").digest("hex");
+    return this.withNamedLock(`codex-callback-${identityHash}`, work, { timeoutMs: 30000 });
   }
   async withConversationLock(conversationId, work, options = {}) {
     assertConversationId(conversationId);
@@ -38131,6 +38138,108 @@ class DurableTaskStore {
       });
     });
   }
+  async bindCodexParent(taskId, threadId) {
+    assertCodexThreadId(threadId);
+    await this.mutate(taskId, (record3) => {
+      if (record3.parentCallback) {
+        if (record3.parentCallback.threadId !== threadId) {
+          throw new Error(`Task ${taskId} is already bound to another Codex parent thread.`);
+        }
+        return record3;
+      }
+      record3.parentCallback = { threadId, state: "waiting", createdAt: nowIso() };
+      return record3;
+    });
+  }
+  async stageCodexCallback(taskId, runId, status) {
+    let pending = false;
+    await this.mutate(taskId, (record3) => {
+      const callback = record3.parentCallback;
+      if (!callback)
+        return record3;
+      if (callback.state === "pending") {
+        pending = true;
+        return record3;
+      }
+      if (callback.state !== "waiting")
+        return record3;
+      if (!TERMINAL3.has(record3.task.status)) {
+        throw new Error(`Task ${taskId} cannot queue a parent callback before terminal state.`);
+      }
+      const terminalStatus = record3.task.status === "completed" ? "completed" : record3.task.status === "cancelled" ? "cancelled" : status === "needs_user" ? "needs_user" : "failed";
+      const timestamp = nowIso();
+      record3.parentCallback = { ...callback, state: "pending", runId, terminalStatus, pendingAt: timestamp };
+      pending = true;
+      return record3;
+    });
+    return pending;
+  }
+  async reconcileCodexCallbacks(threadId) {
+    assertCodexThreadId(threadId);
+    await this.init();
+    const names = (await readdir2(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
+    let pending = 0;
+    for (const name of names) {
+      const taskId = name.slice(0, -5);
+      const record3 = await this.readRecord(taskId);
+      if (record3.parentCallback?.threadId !== threadId)
+        continue;
+      if (record3.parentCallback.state === "pending") {
+        pending += 1;
+        continue;
+      }
+      if (record3.parentCallback.state !== "waiting" || !TERMINAL3.has(record3.task.status))
+        continue;
+      let status = callbackStatus(record3.task.status, record3.runId);
+      if (record3.runId) {
+        const run = await this.lockStore.getRun(record3.runId);
+        if (run.status === "needs_user")
+          status = "needs_user";
+      }
+      if (await this.stageCodexCallback(taskId, record3.runId, status))
+        pending += 1;
+    }
+    return pending;
+  }
+  async claimPendingCodexCallbacks(threadId) {
+    assertCodexThreadId(threadId);
+    return this.lockStore.withCodexCallbackLock(threadId, async () => {
+      await this.init();
+      const names = (await readdir2(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
+      const receipts = [];
+      for (const name of names) {
+        const taskId = name.slice(0, -5);
+        let claimed;
+        await this.mutate(taskId, (record3) => {
+          const callback = record3.parentCallback;
+          if (callback?.threadId !== threadId || callback.state !== "pending" || !callback.terminalStatus)
+            return record3;
+          claimed = { taskId, threadId, runId: callback.runId, status: callback.terminalStatus };
+          record3.parentCallback = { ...callback, state: "attempted", attemptedAt: nowIso() };
+          return record3;
+        });
+        if (claimed)
+          receipts.push(claimed);
+      }
+      return receipts;
+    });
+  }
+  async finishCodexCallbacks(taskIds, delivered, error51) {
+    for (const taskId of taskIds) {
+      await this.mutate(taskId, (record3) => {
+        const callback = record3.parentCallback;
+        if (!callback || callback.state !== "attempted")
+          return record3;
+        record3.parentCallback = {
+          ...callback,
+          state: delivered ? "delivered" : "failed",
+          finishedAt: nowIso(),
+          error: delivered ? undefined : error51
+        };
+        return record3;
+      });
+    }
+  }
   async getRunId(taskId, sessionId) {
     const record3 = await this.readRecord(taskId);
     return this.withSessionAccess(record3, sessionId, async () => record3.runId);
@@ -38280,7 +38389,33 @@ function validateRecord(value, expectedId) {
     throw new Error(`Invalid task status for ${expectedId}.`);
   if (!Array.isArray(record3.statusHistory))
     throw new Error(`Invalid task status history for ${expectedId}.`);
+  if (record3.parentCallback)
+    validateCodexParentCallback(record3.parentCallback, expectedId);
   return record3;
+}
+function validateCodexParentCallback(callback, taskId) {
+  assertCodexThreadId(callback.threadId);
+  if (!new Set(["waiting", "pending", "attempted", "delivered", "failed"]).has(callback.state)) {
+    throw new Error(`Invalid Codex callback state for ${taskId}.`);
+  }
+  if (callback.terminalStatus && !new Set(["completed", "failed", "cancelled", "needs_user"]).has(callback.terminalStatus)) {
+    throw new Error(`Invalid Codex callback terminal status for ${taskId}.`);
+  }
+  if (callback.state !== "waiting" && !callback.terminalStatus) {
+    throw new Error(`Codex callback ${taskId} is missing terminal status.`);
+  }
+}
+function assertCodexThreadId(threadId) {
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+    throw new Error("Invalid Codex parent thread id.");
+  }
+}
+function callbackStatus(status, runId) {
+  if (status === "completed" || status === "cancelled")
+    return status;
+  if (status === "failed")
+    return "failed";
+  throw new Error(`Task ${runId ?? "without a run"} is not terminal for a Codex callback.`);
 }
 async function atomicWrite2(path, value, createOnly) {
   await secureDirectory(dirname4(path));
@@ -38338,6 +38473,35 @@ function isMissing2(error51) {
   return error51 instanceof Error && "code" in error51 && error51.code === "ENOENT";
 }
 
+// src/transport.ts
+import { accessSync as accessSync2, constants as constants5, realpathSync as realpathSync2 } from "node:fs";
+import { basename as basename4, delimiter as delimiter2, dirname as dirname5, isAbsolute as isAbsolute3, join as join6, resolve as resolve8 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+var BRIDGE_RPC_HELPERS2 = [
+  fileURLToPath2(new URL("./bridge_rpc.py", import.meta.url)),
+  fileURLToPath2(new URL("../src/bridge_rpc.py", import.meta.url))
+];
+function isExecutable2(path) {
+  try {
+    accessSync2(path, constants5.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function findOnPath2(name, env = process.env) {
+  if (name.includes("/"))
+    return isExecutable2(name) ? name : undefined;
+  for (const dir of (env.PATH ?? "").split(delimiter2)) {
+    if (dir === "")
+      continue;
+    const candidate = join6(dir, name);
+    if (isExecutable2(candidate))
+      return candidate;
+  }
+  return;
+}
+
 // src/mcp.ts
 var TransportSchema = exports_external.literal("browser");
 var ChatGptModelSchema = exports_external.literal("pro");
@@ -38364,15 +38528,109 @@ var SubagentSchema = {
   connector_mode: ConnectorModeSchema.optional(),
   timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
 };
+function codexCallbackOptionsFromEnv(env = process.env, exec = fallbackExec) {
+  const threadId = env.CODEX_THREAD_ID?.trim();
+  if (!threadId)
+    return false;
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+    console.error("GPT-Control parent callbacks are disabled because CODEX_THREAD_ID is not a UUID.");
+    return false;
+  }
+  const requestedCommand = env.GPT_CONTROL_CODEX_CLI?.trim() || "codex";
+  const command = findOnPath2(requestedCommand, env);
+  if (!command) {
+    console.error(`GPT-Control parent callbacks are disabled because the trusted Codex CLI was not found: ${requestedCommand}`);
+    return false;
+  }
+  return { threadId, command, exec };
+}
+
+class CodexCallbackCoordinator {
+  options;
+  taskStore;
+  timer;
+  constructor(options, taskStore) {
+    this.options = options;
+    this.taskStore = taskStore;
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.threadId)) {
+      throw new Error("Trusted CODEX_THREAD_ID must be a UUID before parent callbacks can be enabled.");
+    }
+    if (options.command.trim() === "")
+      throw new Error("Trusted Codex callback command is empty.");
+  }
+  async register(taskId) {
+    try {
+      await this.taskStore.bindCodexParent(taskId, this.options.threadId);
+    } catch (error51) {
+      console.error(`GPT-Control could not bind parent callback for ${taskId}: ${callbackErrorDetail(errorMessage3(error51))}`);
+    }
+  }
+  async recover() {
+    try {
+      if (await this.taskStore.reconcileCodexCallbacks(this.options.threadId) > 0)
+        this.schedule();
+    } catch (error51) {
+      console.error(`GPT-Control could not recover parent callbacks: ${callbackErrorDetail(errorMessage3(error51))}`);
+    }
+  }
+  async queue(taskId, runId, status) {
+    try {
+      if (await this.taskStore.stageCodexCallback(taskId, runId, status))
+        this.schedule();
+    } catch (error51) {
+      console.error(`GPT-Control could not stage parent callback for ${taskId}: ${callbackErrorDetail(errorMessage3(error51))}`);
+    }
+  }
+  schedule() {
+    if (this.timer)
+      return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.flush().catch((error51) => {
+        console.error(`GPT-Control parent callback flush failed: ${callbackErrorDetail(errorMessage3(error51))}`);
+      });
+    }, Math.max(0, this.options.delayMs ?? 250));
+    this.timer.unref?.();
+  }
+  async flush() {
+    const receipts = await this.taskStore.claimPendingCodexCallbacks(this.options.threadId);
+    if (receipts.length === 0)
+      return;
+    const noun = receipts.length === 1 ? "worker" : "workers";
+    const identities = receipts.map((receipt) => `${receipt.taskId}${receipt.runId ? ` (${receipt.runId})` : ""}: ${receipt.status}`).join(", ");
+    const message = `${receipts.length === 1 ? "A" : receipts.length} ChatGPT Pro ${noun} finished. ` + `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_subagent_get and update the user. ${identities}`;
+    let result;
+    try {
+      result = await this.options.exec(this.options.command, [
+        "queue",
+        "--thread",
+        this.options.threadId,
+        "--message",
+        message
+      ], { timeout: 30000 });
+    } catch (error51) {
+      const detail2 = callbackErrorDetail(errorMessage3(error51));
+      await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), false, detail2);
+      console.error(`GPT-Control could not queue a parent completion receipt: ${detail2}`);
+      return;
+    }
+    const delivered = result.code === 0 && !result.killed;
+    const detail = delivered ? undefined : callbackErrorDetail(result.stderr || `exit ${result.code}`);
+    await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), delivered, detail);
+    if (!delivered)
+      console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+  }
+}
 function createMcpServer(serviceOrOptions = {}) {
   const options = serviceOrOptions instanceof GptControlService ? { service: serviceOrOptions } : serviceOrOptions;
   const service = options.service ?? new GptControlService(fallbackExec);
-  const taskStore = options.taskStore ?? new DurableTaskStore(join6(service.store.root, "mcp-tasks"), service.store);
+  const taskStore = options.taskStore ?? new DurableTaskStore(join7(service.store.root, "mcp-tasks"), service.store);
   const tasksEnabled = options.taskSupport !== false;
+  const codexCallback = options.codexCallback ? new CodexCallbackCoordinator(options.codexCallback, taskStore) : undefined;
   const monitors = new Map;
   const activationTimers = new Map;
   const protocolTaskStore = new ObservingTaskStore(taskStore, (taskId) => {
-    scheduleTaskActivation(service, taskStore, monitors, activationTimers, taskId);
+    scheduleTaskActivation(service, taskStore, monitors, activationTimers, taskId, codexCallback);
   });
   const server = new McpServer({ name: "gpt-control", version: PACKAGE_VERSION }, {
     taskStore: protocolTaskStore,
@@ -38385,7 +38643,9 @@ function createMcpServer(serviceOrOptions = {}) {
     if (runId)
       await service.cancelRun(runId);
   });
-  const recoveryReady = options.recover === false ? Promise.resolve() : resumeDurableSubagents(service, taskStore, monitors).catch((error51) => {
+  const recoveryReady = options.recover === false ? Promise.resolve() : resumeDurableSubagents(service, taskStore, monitors, codexCallback).then(async () => {
+    await codexCallback?.recover();
+  }).catch((error51) => {
     console.error(`GPT-Control task recovery failed: ${errorMessage3(error51)}`);
     throw error51;
   });
@@ -38393,8 +38653,8 @@ function createMcpServer(serviceOrOptions = {}) {
     return;
   });
   registerCoreTools(server, service, taskStore);
-  registerSubagentRecoveryTools(server, service, taskStore, monitors);
-  registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady);
+  registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback);
+  registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
   return server;
 }
 function registerCoreTools(server, service, taskStore) {
@@ -38511,7 +38771,7 @@ function registerCoreTools(server, service, taskStore) {
     annotations: { readOnlyHint: false, destructiveHint: false }
   }, async () => toolPayload("GPT-Control active smoke test.", await service.activeSmokeTest()));
 }
-function registerSubagentRun(server, service, taskStore, monitors, activationTimers, taskSupport, recoveryReady) {
+function registerSubagentRun(server, service, taskStore, monitors, activationTimers, taskSupport, recoveryReady, codexCallback) {
   const config2 = {
     title: "Run ChatGPT Pro worker",
     description: "Start one bounded ChatGPT Pro worker in its own owned browser conversation. Codex remains the orchestrator. Do not poll while the task result is pending.",
@@ -38533,6 +38793,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
     async createTask(params, extra) {
       await recoveryReady;
       const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
+      await codexCallback?.register(task.taskId);
       let preparedRunId;
       const progressToken = readProgressToken(extra._meta?.progressToken);
       taskStore.setStatusListener(task.taskId, async (updated) => {
@@ -38564,7 +38825,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
         } else {
           await taskStore.updateTaskStatus(task.taskId, "working", `Pro worker ${started.run.id} is prepared for activation after the cancellation grace.`);
           await sendProgress(extra.sendNotification, progressToken, 0.1, "Owned worker prepared; browser execution begins after taskCreated and the bounded cancellation grace.");
-          scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId);
+          scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId, codexCallback);
         }
       } catch (error51) {
         const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
@@ -38578,6 +38839,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
           status: "failed",
           reason: errorMessage3(error51)
         }, true));
+        await codexCallback?.queue(task.taskId, preparedRunId, "failed");
         taskStore.removeStatusListener(task.taskId);
       }
       return { task };
@@ -38593,7 +38855,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
     }
   });
 }
-function registerSubagentRecoveryTools(server, service, taskStore, monitors) {
+function registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback) {
   server.registerTool("gpt_subagent_get", {
     description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
     inputSchema: { run_id: exports_external.string().optional(), task_id: exports_external.string().optional() },
@@ -38606,7 +38868,7 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors) {
     }
     const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
     if (taskId)
-      await activateTaskIfPending(service, taskStore, monitors, taskId);
+      await activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback);
     const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
     const run = runId ? await service.getRun(runId) : undefined;
     if (!task && !run)
@@ -38691,12 +38953,12 @@ class ObservingTaskStore {
     return this.delegate.listTasks(cursor, sessionId);
   }
 }
-function scheduleTaskActivation(service, taskStore, monitors, timers, taskId) {
+function scheduleTaskActivation(service, taskStore, monitors, timers, taskId, codexCallback) {
   if (timers.has(taskId) || monitors.has(taskId))
     return;
   const timer = setTimeout(() => {
     timers.delete(taskId);
-    activateTaskIfPending(service, taskStore, monitors, taskId).catch(async (error51) => {
+    activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback).catch(async (error51) => {
       await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker activation failed: ${errorMessage3(error51)}`, {
         taskId,
         status: "failed",
@@ -38704,12 +38966,15 @@ function scheduleTaskActivation(service, taskStore, monitors, timers, taskId) {
       }, true)).catch(() => {
         return;
       });
+      await codexCallback?.queue(taskId, await taskStore.getRunId(taskId).catch(() => {
+        return;
+      }), "failed");
     });
   }, SUBAGENT_ACTIVATION_GRACE_MS);
   timer.unref();
   timers.set(taskId, timer);
 }
-async function activateTaskIfPending(service, taskStore, monitors, taskId) {
+async function activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback) {
   const task = await taskStore.getTask(taskId);
   if (!task || task.status !== "working")
     return;
@@ -38718,7 +38983,7 @@ async function activateTaskIfPending(service, taskStore, monitors, taskId) {
     return;
   const run = await service.getRun(runId);
   if (run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "needs_user") {
-    startTaskMonitor(service, taskStore, monitors, taskId, runId);
+    startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
     return;
   }
   const currentTask = await taskStore.getTask(taskId);
@@ -38731,13 +38996,13 @@ async function activateTaskIfPending(service, taskStore, monitors, taskId) {
     return;
   }
   await taskStore.updateTaskStatus(taskId, "working", `Pro worker ${runId} is running in an owned browser conversation.`);
-  startTaskMonitor(service, taskStore, monitors, taskId, runId);
+  startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
 }
-function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgress) {
+function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgress, codexCallback) {
   const existing = monitors.get(taskId);
   if (existing)
     return existing;
-  const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress).catch(async (error51) => {
+  const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress, codexCallback).catch(async (error51) => {
     await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker monitor failed: ${errorMessage3(error51)}`, {
       taskId,
       runId,
@@ -38746,6 +39011,7 @@ function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgr
     }, true)).catch(() => {
       return;
     });
+    await codexCallback?.queue(taskId, runId, "failed");
   }).finally(() => {
     taskStore.removeStatusListener(taskId);
     monitors.delete(taskId);
@@ -38753,7 +39019,7 @@ function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgr
   monitors.set(taskId, monitor);
   return monitor;
 }
-async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
+async function monitorTask(service, taskStore, taskId, runId, emitProgress, codexCallback) {
   const initial = await service.getRun(runId);
   await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
   let run = await service.waitForRun(runId, (initial.timeoutMs ?? 600000) + 120000);
@@ -38766,6 +39032,7 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
   if (run.status === "completed") {
     await emitProgress?.(1, "Stable final assistant turn verified.");
     await taskStore.storeTaskResult(taskId, "completed", subagentResult(taskId, run));
+    await codexCallback?.queue(taskId, runId, "completed");
     return;
   }
   if (run.status === "needs_user") {
@@ -38776,6 +39043,7 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
     if (current?.status === "cancelled")
       return;
     await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run, "input_required"));
+    await codexCallback?.queue(taskId, runId, "needs_user");
     return;
   }
   if (run.status === "cancelled") {
@@ -38783,8 +39051,9 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress) {
     return;
   }
   await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run));
+  await codexCallback?.queue(taskId, runId, "failed");
 }
-async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
+async function resumeDurableSubagents(service, taskStore, monitors = new Map, codexCallback) {
   await taskStore.init();
   const stopRecovery = await service.retryRequestedProviderStops();
   if (stopRecovery.blocked.length > 0) {
@@ -38828,7 +39097,7 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
       continue;
     }
     await service.schedulePreparedRun(runId);
-    startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId);
+    startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
   }
 }
 function subagentRequest(params, wait) {
@@ -38969,18 +39238,22 @@ async function sendProgress(sendNotification, progressToken, progress, message) 
   } catch {}
 }
 function delay(ms) {
-  return new Promise((resolve9) => setTimeout(resolve9, ms));
+  return new Promise((resolve10) => setTimeout(resolve10, ms));
 }
 function errorMessage3(error51) {
   return error51 instanceof Error ? error51.message : String(error51);
 }
+function callbackErrorDetail(value) {
+  const normalized = value.trim() || "Codex queue command failed without an error message.";
+  return normalized.slice(0, 2048);
+}
 function isDirectExecution() {
   const entry = process.argv[1];
-  return typeof entry === "string" && resolve8(entry) === fileURLToPath2(import.meta.url);
+  return typeof entry === "string" && resolve9(entry) === fileURLToPath3(import.meta.url);
 }
 if (isDirectExecution()) {
   const service = new GptControlService(fallbackExec);
-  const server = createMcpServer({ service });
+  const server = createMcpServer({ service, codexCallback: codexCallbackOptionsFromEnv(process.env, fallbackExec) });
   await server.connect(new StdioServerTransport);
   let shuttingDown = false;
   const shutdown = async (signal) => {
@@ -38999,6 +39272,7 @@ if (isDirectExecution()) {
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
 }
 export {
+  codexCallbackOptionsFromEnv,
   createMcpServer,
   resumeDurableSubagents
 };

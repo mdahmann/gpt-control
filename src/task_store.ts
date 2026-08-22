@@ -26,7 +26,27 @@ interface DurableTaskRecord {
 	runId?: string;
 	result?: Result;
 	resultHash?: string;
+	parentCallback?: CodexParentCallback;
 	statusHistory: Array<{ status: Task["status"]; at: string; message?: string }>;
+}
+
+export interface CodexParentCallback {
+	threadId: string;
+	state: "waiting" | "pending" | "attempted" | "delivered" | "failed";
+	runId?: string;
+	terminalStatus?: "completed" | "failed" | "cancelled" | "needs_user";
+	createdAt: string;
+	pendingAt?: string;
+	attemptedAt?: string;
+	finishedAt?: string;
+	error?: string;
+}
+
+export interface CodexCallbackReceipt {
+	taskId: string;
+	threadId: string;
+	runId?: string;
+	status: "completed" | "failed" | "cancelled" | "needs_user";
 }
 
 export type TaskStatusListener = (task: Task) => void | Promise<void>;
@@ -232,6 +252,112 @@ export class DurableTaskStore implements TaskStore {
 		});
 	}
 
+	async bindCodexParent(taskId: string, threadId: string): Promise<void> {
+		assertCodexThreadId(threadId);
+		await this.mutate(taskId, (record) => {
+			if (record.parentCallback) {
+				if (record.parentCallback.threadId !== threadId) {
+					throw new Error(`Task ${taskId} is already bound to another Codex parent thread.`);
+				}
+				return record;
+			}
+			record.parentCallback = { threadId, state: "waiting", createdAt: nowIso() };
+			return record;
+		});
+	}
+
+	async stageCodexCallback(
+		taskId: string,
+		runId: string | undefined,
+		status: CodexCallbackReceipt["status"],
+	): Promise<boolean> {
+		let pending = false;
+		await this.mutate(taskId, (record) => {
+			const callback = record.parentCallback;
+			if (!callback) return record;
+			if (callback.state === "pending") {
+				pending = true;
+				return record;
+			}
+			if (callback.state !== "waiting") return record;
+			if (!TERMINAL.has(record.task.status)) {
+				throw new Error(`Task ${taskId} cannot queue a parent callback before terminal state.`);
+			}
+			const terminalStatus = record.task.status === "completed"
+				? "completed"
+				: record.task.status === "cancelled"
+					? "cancelled"
+					: status === "needs_user" ? "needs_user" : "failed";
+			const timestamp = nowIso();
+			record.parentCallback = { ...callback, state: "pending", runId, terminalStatus, pendingAt: timestamp };
+			pending = true;
+			return record;
+		});
+		return pending;
+	}
+
+	async reconcileCodexCallbacks(threadId: string): Promise<number> {
+		assertCodexThreadId(threadId);
+		await this.init();
+		const names = (await readdir(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
+		let pending = 0;
+		for (const name of names) {
+			const taskId = name.slice(0, -5);
+			const record = await this.readRecord(taskId);
+			if (record.parentCallback?.threadId !== threadId) continue;
+			if (record.parentCallback.state === "pending") {
+				pending += 1;
+				continue;
+			}
+			if (record.parentCallback.state !== "waiting" || !TERMINAL.has(record.task.status)) continue;
+			let status = callbackStatus(record.task.status, record.runId);
+			if (record.runId) {
+				const run = await this.lockStore.getRun(record.runId);
+				if (run.status === "needs_user") status = "needs_user";
+			}
+			if (await this.stageCodexCallback(taskId, record.runId, status)) pending += 1;
+		}
+		return pending;
+	}
+
+	async claimPendingCodexCallbacks(threadId: string): Promise<CodexCallbackReceipt[]> {
+		assertCodexThreadId(threadId);
+		return this.lockStore.withCodexCallbackLock(threadId, async () => {
+			await this.init();
+			const names = (await readdir(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
+			const receipts: CodexCallbackReceipt[] = [];
+			for (const name of names) {
+				const taskId = name.slice(0, -5);
+				let claimed: CodexCallbackReceipt | undefined;
+				await this.mutate(taskId, (record) => {
+					const callback = record.parentCallback;
+					if (callback?.threadId !== threadId || callback.state !== "pending" || !callback.terminalStatus) return record;
+					claimed = { taskId, threadId, runId: callback.runId, status: callback.terminalStatus };
+					record.parentCallback = { ...callback, state: "attempted", attemptedAt: nowIso() };
+					return record;
+				});
+				if (claimed) receipts.push(claimed);
+			}
+			return receipts;
+		});
+	}
+
+	async finishCodexCallbacks(taskIds: readonly string[], delivered: boolean, error?: string): Promise<void> {
+		for (const taskId of taskIds) {
+			await this.mutate(taskId, (record) => {
+				const callback = record.parentCallback;
+				if (!callback || callback.state !== "attempted") return record;
+				record.parentCallback = {
+					...callback,
+					state: delivered ? "delivered" : "failed",
+					finishedAt: nowIso(),
+					error: delivered ? undefined : error,
+				};
+				return record;
+			});
+		}
+	}
+
 	async getRunId(taskId: string, sessionId?: string): Promise<string | undefined> {
 		const record = await this.readRecord(taskId);
 		return this.withSessionAccess(record, sessionId, async () => record.runId);
@@ -395,7 +521,33 @@ function validateRecord(value: unknown, expectedId: string): DurableTaskRecord {
 	}
 	if (!(record.task.status in TRANSITIONS)) throw new Error(`Invalid task status for ${expectedId}.`);
 	if (!Array.isArray(record.statusHistory)) throw new Error(`Invalid task status history for ${expectedId}.`);
+	if (record.parentCallback) validateCodexParentCallback(record.parentCallback, expectedId);
 	return record;
+}
+
+function validateCodexParentCallback(callback: CodexParentCallback, taskId: string): void {
+	assertCodexThreadId(callback.threadId);
+	if (!new Set(["waiting", "pending", "attempted", "delivered", "failed"]).has(callback.state)) {
+		throw new Error(`Invalid Codex callback state for ${taskId}.`);
+	}
+	if (callback.terminalStatus && !new Set(["completed", "failed", "cancelled", "needs_user"]).has(callback.terminalStatus)) {
+		throw new Error(`Invalid Codex callback terminal status for ${taskId}.`);
+	}
+	if (callback.state !== "waiting" && !callback.terminalStatus) {
+		throw new Error(`Codex callback ${taskId} is missing terminal status.`);
+	}
+}
+
+function assertCodexThreadId(threadId: string): void {
+	if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+		throw new Error("Invalid Codex parent thread id.");
+	}
+}
+
+function callbackStatus(status: Task["status"], runId?: string): CodexCallbackReceipt["status"] {
+	if (status === "completed" || status === "cancelled") return status;
+	if (status === "failed") return "failed";
+	throw new Error(`Task ${runId ?? "without a run"} is not terminal for a Codex callback.`);
 }
 
 async function atomicWrite(path: string, value: DurableTaskRecord, createOnly: boolean): Promise<void> {

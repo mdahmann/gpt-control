@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Hardened signed-in ChatGPT web control with exact conversations, durable runs, and bounded Codex Pro workers",
   "type": "module",
   "license": "MIT",

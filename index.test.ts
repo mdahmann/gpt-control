@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import gptControl, { resolveOutputDir } from "./src/index";
-import { createMcpServer } from "./src/mcp";
+import { codexCallbackOptionsFromEnv, createMcpServer } from "./src/mcp";
 import { operatorPolicyFromEnv } from "./src/policy";
 import { secureDirectory } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
@@ -103,6 +103,22 @@ describe("public extension contract", () => {
 });
 
 describe("MCP plugin contract", () => {
+	test("derives the parent callback only from trusted Codex runtime state", () => {
+		const root = scratch();
+		const codex = join(root, "codex");
+		writeFileSync(codex, "#!/bin/sh\nexit 0\n");
+		chmodSync(codex, 0o700);
+		const exec = async () => ({ stdout: "", stderr: "", code: 0, killed: false });
+		const callback = codexCallbackOptionsFromEnv({
+			CODEX_THREAD_ID: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+			PATH: root,
+		}, exec);
+		expect(callback).toMatchObject({
+			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
+			command: codex,
+		});
+	});
+
 	test("advertises optional task execution and omits authority-expanding schemas", async () => {
 		const pluginMcp = JSON.parse(readFileSync(join(import.meta.dir, ".mcp.json"), "utf8")) as {
 			mcpServers: { gpt_control: { command: string; args: string[]; env_vars: string[] } };
@@ -110,6 +126,7 @@ describe("MCP plugin contract", () => {
 		expect(pluginMcp.mcpServers.gpt_control.command).toBe("node");
 		expect(pluginMcp.mcpServers.gpt_control.args).toEqual(["./dist/gpt-control-mcp.js"]);
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
+		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("CODEX_THREAD_ID");
 		const root = scratch();
 		const { service } = makeChromeService(join(root, "state"), join(root, "workspace"), new FakeChromeBridge());
 		mkdirSync(join(root, "workspace"), { recursive: true });
@@ -128,7 +145,7 @@ describe("MCP plugin contract", () => {
 			expect(subagent?.inputSchema.properties).toHaveProperty("connectors");
 			expect(subagent?.inputSchema.properties).toHaveProperty("connector_mode");
 			const properties = subagent?.inputSchema.properties ?? {};
-			for (const field of ["workspace_root", "allow_sensitive_files", "api_confirmed", "allow_focus_steal", "conversation_id", "transport"]) {
+			for (const field of ["workspace_root", "allow_sensitive_files", "api_confirmed", "allow_focus_steal", "conversation_id", "transport", "parent_thread_id"]) {
 				expect(properties).not.toHaveProperty(field);
 			}
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_image");

@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use when a bounded independent ChatGPT web review, exact existing-conversation follow-up, image task, or concurrent ChatGPT Pro subagent run would materially help. Codex remains the orchestrator. Not for facts, tests, or repository evidence Codex can obtain directly.
-version: 0.3.1
+version: 0.3.2
 ---
 
 # GPT-Control
@@ -35,8 +35,11 @@ source or current repository state before acting.
 
 MCP task execution is optional. A task-capable client can use task status,
 result, and cancellation. A client without task support receives one
-long-running terminal tool response. Notifications are not assumed to inject a
-new chat message or wake a dormant thread.
+long-running terminal tool response. In Codex 0.149 or newer, a worker bound to
+the runtime-provided parent thread can queue one compact completion receipt.
+Collect its authoritative result with `gpt_subagent_get`. Do not poll. The
+callback contains no prompt or result body and is attempted at most once across
+restarts; durable task/run lookup remains the fallback.
 
 ## Exact conversations and runs
 

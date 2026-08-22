@@ -1,6 +1,6 @@
 # Security model
 
-GPT-Control 0.3.1 treats the model-facing tool call, browser page, connected
+GPT-Control 0.3.2 treats the model-facing tool call, browser page, connected
 tools, provider output, attachment paths, child-process output, and recovered
 local state as untrusted.
 
@@ -42,6 +42,17 @@ probes this behavior and refuses browser mutation if the Bridge accepts an
 invalid expected target. Each prompt fill, upload, model click, send, recovery
 action, reload, and screenshot carries the exact task-session id, tab id,
 session name, and URL in the same Bridge request as the action.
+
+## Codex parent callbacks
+
+Parent callbacks use only the runtime-provided `CODEX_THREAD_ID` and a trusted
+executable resolved from `GPT_CONTROL_CODEX_CLI` or `PATH`. Model-facing tools
+cannot select the target. The queued message contains task/run IDs and status
+only; prompts and provider results are excluded.
+
+GPT-Control marks a callback attempted before it invokes `codex queue`. An
+ambiguous command boundary can therefore lose a wake-up, but it cannot cause an
+automatic duplicate after restart. The durable task result remains authoritative.
 
 ## Exact conversation ownership
 

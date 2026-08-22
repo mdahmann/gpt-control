@@ -10,6 +10,8 @@ import { fallbackExec } from "./host";
 import { PACKAGE_VERSION, type RunKind, type RunRecord } from "./domain";
 import { GptControlService, type StartRequest } from "./service";
 import { DurableTaskStore } from "./task_store";
+import type { Exec } from "./types";
+import { findOnPath } from "./transport";
 
 const TransportSchema = z.literal("browser");
 const ChatGptModelSchema = z.literal("pro");
@@ -53,6 +55,110 @@ export interface GptMcpOptions {
 	/** Test and compatibility switch. The normal value is true. */
 	taskSupport?: boolean;
 	recover?: boolean;
+	codexCallback?: false | CodexCallbackOptions;
+}
+
+export interface CodexCallbackOptions {
+	/** Trusted runtime identity; never accepted from a model tool argument. */
+	threadId: string;
+	/** Trusted executable selected by the operator/runtime. */
+	command: string;
+	exec: Exec;
+	delayMs?: number;
+}
+
+export function codexCallbackOptionsFromEnv(
+	env: NodeJS.ProcessEnv = process.env,
+	exec: Exec = fallbackExec,
+): false | CodexCallbackOptions {
+	const threadId = env.CODEX_THREAD_ID?.trim();
+	if (!threadId) return false;
+	if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+		console.error("GPT-Control parent callbacks are disabled because CODEX_THREAD_ID is not a UUID.");
+		return false;
+	}
+	const requestedCommand = env.GPT_CONTROL_CODEX_CLI?.trim() || "codex";
+	const command = findOnPath(requestedCommand, env);
+	if (!command) {
+		console.error(`GPT-Control parent callbacks are disabled because the trusted Codex CLI was not found: ${requestedCommand}`);
+		return false;
+	}
+	return { threadId, command, exec };
+}
+
+class CodexCallbackCoordinator {
+	private timer?: ReturnType<typeof setTimeout>;
+
+	constructor(
+		private readonly options: CodexCallbackOptions,
+		private readonly taskStore: DurableTaskStore,
+	) {
+		if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.threadId)) {
+			throw new Error("Trusted CODEX_THREAD_ID must be a UUID before parent callbacks can be enabled.");
+		}
+		if (options.command.trim() === "") throw new Error("Trusted Codex callback command is empty.");
+	}
+
+	async register(taskId: string): Promise<void> {
+		try {
+			await this.taskStore.bindCodexParent(taskId, this.options.threadId);
+		} catch (error) {
+			console.error(`GPT-Control could not bind parent callback for ${taskId}: ${callbackErrorDetail(errorMessage(error))}`);
+		}
+	}
+
+	async recover(): Promise<void> {
+		try {
+			if (await this.taskStore.reconcileCodexCallbacks(this.options.threadId) > 0) this.schedule();
+		} catch (error) {
+			console.error(`GPT-Control could not recover parent callbacks: ${callbackErrorDetail(errorMessage(error))}`);
+		}
+	}
+
+	async queue(taskId: string, runId: string | undefined, status: "completed" | "failed" | "cancelled" | "needs_user"): Promise<void> {
+		try {
+			if (await this.taskStore.stageCodexCallback(taskId, runId, status)) this.schedule();
+		} catch (error) {
+			console.error(`GPT-Control could not stage parent callback for ${taskId}: ${callbackErrorDetail(errorMessage(error))}`);
+		}
+	}
+
+	private schedule(): void {
+		if (this.timer) return;
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			void this.flush().catch((error) => {
+				console.error(`GPT-Control parent callback flush failed: ${callbackErrorDetail(errorMessage(error))}`);
+			});
+		}, Math.max(0, this.options.delayMs ?? 250));
+		this.timer.unref?.();
+	}
+
+	private async flush(): Promise<void> {
+		const receipts = await this.taskStore.claimPendingCodexCallbacks(this.options.threadId);
+		if (receipts.length === 0) return;
+		const noun = receipts.length === 1 ? "worker" : "workers";
+		const identities = receipts.map((receipt) =>
+			`${receipt.taskId}${receipt.runId ? ` (${receipt.runId})` : ""}: ${receipt.status}`,
+		).join(", ");
+		const message = `${receipts.length === 1 ? "A" : receipts.length} ChatGPT Pro ${noun} finished. `
+			+ `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_subagent_get and update the user. ${identities}`;
+		let result;
+		try {
+			result = await this.options.exec(this.options.command, [
+				"queue", "--thread", this.options.threadId, "--message", message,
+			], { timeout: 30_000 });
+		} catch (error) {
+			const detail = callbackErrorDetail(errorMessage(error));
+			await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), false, detail);
+			console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+			return;
+		}
+		const delivered = result.code === 0 && !result.killed;
+		const detail = delivered ? undefined : callbackErrorDetail(result.stderr || `exit ${result.code}`);
+		await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), delivered, detail);
+		if (!delivered) console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+	}
 }
 
 export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOptions = {}): McpServer {
@@ -60,10 +166,11 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 	const service = options.service ?? new GptControlService(fallbackExec);
 	const taskStore = options.taskStore ?? new DurableTaskStore(join(service.store.root, "mcp-tasks"), service.store);
 	const tasksEnabled = options.taskSupport !== false;
+	const codexCallback = options.codexCallback ? new CodexCallbackCoordinator(options.codexCallback, taskStore) : undefined;
 	const monitors = new Map<string, Promise<void>>();
 	const activationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	const protocolTaskStore = new ObservingTaskStore(taskStore, (taskId) => {
-		scheduleTaskActivation(service, taskStore, monitors, activationTimers, taskId);
+		scheduleTaskActivation(service, taskStore, monitors, activationTimers, taskId, codexCallback);
 	});
 	const server = new McpServer(
 		{ name: "gpt-control", version: PACKAGE_VERSION },
@@ -81,15 +188,17 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 	});
 	const recoveryReady = options.recover === false
 		? Promise.resolve()
-		: resumeDurableSubagents(service, taskStore, monitors).catch((error) => {
+		: resumeDurableSubagents(service, taskStore, monitors, codexCallback).then(async () => {
+			await codexCallback?.recover();
+		}).catch((error) => {
 			console.error(`GPT-Control task recovery failed: ${errorMessage(error)}`);
 			throw error;
 		});
 	void recoveryReady.catch(() => undefined);
 
 	registerCoreTools(server, service, taskStore);
-	registerSubagentRecoveryTools(server, service, taskStore, monitors);
-	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady);
+	registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback);
+	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
 	return server;
 }
 
@@ -235,6 +344,7 @@ function registerSubagentRun(
 	activationTimers: Map<string, ReturnType<typeof setTimeout>>,
 	taskSupport: boolean,
 	recoveryReady: Promise<void>,
+	codexCallback?: CodexCallbackCoordinator,
 ): void {
 	const config = {
 		title: "Run ChatGPT Pro worker",
@@ -258,6 +368,7 @@ function registerSubagentRun(
 		async createTask(params: SubagentParams, extra: CreateTaskRequestHandlerExtra) {
 			await recoveryReady;
 			const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
+			await codexCallback?.register(task.taskId);
 			let preparedRunId: string | undefined;
 			const progressToken = readProgressToken(extra._meta?.progressToken);
 			taskStore.setStatusListener(task.taskId, async (updated) => {
@@ -294,7 +405,7 @@ function registerSubagentRun(
 					// the run before any browser submission; no status polling is required.
 					await taskStore.updateTaskStatus(task.taskId, "working", `Pro worker ${started.run.id} is prepared for activation after the cancellation grace.`);
 					await sendProgress(extra.sendNotification, progressToken, 0.1, "Owned worker prepared; browser execution begins after taskCreated and the bounded cancellation grace.");
-					scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId);
+					scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId, codexCallback);
 				}
 			} catch (error) {
 				const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
@@ -308,6 +419,7 @@ function registerSubagentRun(
 					status: "failed",
 					reason: errorMessage(error),
 				}, true));
+				await codexCallback?.queue(task.taskId, preparedRunId, "failed");
 				taskStore.removeStatusListener(task.taskId);
 			}
 			return { task };
@@ -328,6 +440,7 @@ function registerSubagentRecoveryTools(
 	service: GptControlService,
 	taskStore: DurableTaskStore,
 	monitors: Map<string, Promise<void>>,
+	codexCallback?: CodexCallbackCoordinator,
 ): void {
 	server.registerTool("gpt_subagent_get", {
 		description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
@@ -340,7 +453,7 @@ function registerSubagentRecoveryTools(
 			throw new Error("No Pro worker owned by this MCP session matched that run id.");
 		}
 		const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
-		if (taskId) await activateTaskIfPending(service, taskStore, monitors, taskId);
+		if (taskId) await activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback);
 		const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
 		const run = runId ? await service.getRun(runId) : undefined;
 		if (!task && !run) throw new Error("No durable Pro worker matched that identity.");
@@ -432,14 +545,16 @@ function scheduleTaskActivation(
 	monitors: Map<string, Promise<void>>,
 	timers: Map<string, ReturnType<typeof setTimeout>>,
 	taskId: string,
+	codexCallback?: CodexCallbackCoordinator,
 ): void {
 	if (timers.has(taskId) || monitors.has(taskId)) return;
 	const timer = setTimeout(() => {
 		timers.delete(taskId);
-		void activateTaskIfPending(service, taskStore, monitors, taskId).catch(async (error) => {
+		void activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback).catch(async (error) => {
 			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker activation failed: ${errorMessage(error)}`, {
 				taskId, status: "failed", reason: errorMessage(error),
 			}, true)).catch(() => undefined);
+			await codexCallback?.queue(taskId, await taskStore.getRunId(taskId).catch(() => undefined), "failed");
 		});
 	}, SUBAGENT_ACTIVATION_GRACE_MS);
 	timer.unref();
@@ -451,6 +566,7 @@ async function activateTaskIfPending(
 	taskStore: DurableTaskStore,
 	monitors: Map<string, Promise<void>>,
 	taskId: string,
+	codexCallback?: CodexCallbackCoordinator,
 ): Promise<void> {
 	const task = await taskStore.getTask(taskId);
 	if (!task || task.status !== "working") return;
@@ -458,7 +574,7 @@ async function activateTaskIfPending(
 	if (!runId) return;
 	const run = await service.getRun(runId);
 	if (run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "needs_user") {
-		startTaskMonitor(service, taskStore, monitors, taskId, runId);
+		startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
 		return;
 	}
 	const currentTask = await taskStore.getTask(taskId);
@@ -470,7 +586,7 @@ async function activateTaskIfPending(
 		return;
 	}
 	await taskStore.updateTaskStatus(taskId, "working", `Pro worker ${runId} is running in an owned browser conversation.`);
-	startTaskMonitor(service, taskStore, monitors, taskId, runId);
+	startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
 }
 
 function startTaskMonitor(
@@ -480,10 +596,11 @@ function startTaskMonitor(
 	taskId: string,
 	runId: string,
 	emitProgress?: (progress: number, message: string) => Promise<void>,
+	codexCallback?: CodexCallbackCoordinator,
 ): Promise<void> {
 	const existing = monitors.get(taskId);
 	if (existing) return existing;
-	const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress)
+	const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress, codexCallback)
 		.catch(async (error) => {
 			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker monitor failed: ${errorMessage(error)}`, {
 				taskId,
@@ -491,6 +608,7 @@ function startTaskMonitor(
 				status: "failed",
 				reason: errorMessage(error),
 			}, true)).catch(() => undefined);
+			await codexCallback?.queue(taskId, runId, "failed");
 		})
 		.finally(() => {
 			taskStore.removeStatusListener(taskId);
@@ -506,6 +624,7 @@ async function monitorTask(
 	taskId: string,
 	runId: string,
 	emitProgress?: (progress: number, message: string) => Promise<void>,
+	codexCallback?: CodexCallbackCoordinator,
 ): Promise<void> {
 	const initial = await service.getRun(runId);
 	await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
@@ -518,6 +637,7 @@ async function monitorTask(
 	if (run.status === "completed") {
 		await emitProgress?.(1, "Stable final assistant turn verified.");
 		await taskStore.storeTaskResult(taskId, "completed", subagentResult(taskId, run));
+		await codexCallback?.queue(taskId, runId, "completed");
 		return;
 	}
 	if (run.status === "needs_user") {
@@ -529,6 +649,7 @@ async function monitorTask(
 		const current = await taskStore.getTask(taskId);
 		if (current?.status === "cancelled") return;
 		await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run, "input_required"));
+		await codexCallback?.queue(taskId, runId, "needs_user");
 		return;
 	}
 	if (run.status === "cancelled") {
@@ -536,12 +657,14 @@ async function monitorTask(
 		return;
 	}
 	await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run));
+	await codexCallback?.queue(taskId, runId, "failed");
 }
 
 export async function resumeDurableSubagents(
 	service: GptControlService,
 	taskStore: DurableTaskStore,
 	monitors = new Map<string, Promise<void>>(),
+	codexCallback?: CodexCallbackCoordinator,
 ): Promise<void> {
 	await taskStore.init();
 	const stopRecovery = await service.retryRequestedProviderStops();
@@ -588,7 +711,7 @@ export async function resumeDurableSubagents(
 			continue;
 		}
 		await service.schedulePreparedRun(runId);
-		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId);
+		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
 	}
 }
 
@@ -759,6 +882,11 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function callbackErrorDetail(value: string): string {
+	const normalized = value.trim() || "Codex queue command failed without an error message.";
+	return normalized.slice(0, 2048);
+}
+
 function isDirectExecution(): boolean {
 	const entry = process.argv[1];
 	return typeof entry === "string" && resolve(entry) === fileURLToPath(import.meta.url);
@@ -766,7 +894,7 @@ function isDirectExecution(): boolean {
 
 if (isDirectExecution()) {
 	const service = new GptControlService(fallbackExec);
-	const server = createMcpServer({ service });
+	const server = createMcpServer({ service, codexCallback: codexCallbackOptionsFromEnv(process.env, fallbackExec) });
 	await server.connect(new StdioServerTransport());
 	let shuttingDown = false;
 	const shutdown = async (signal: string) => {

@@ -2,9 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.3.1 adds exact-conversation ownership, crash-safe durable runs, truthful live
-Pro-model evidence, immutable attachment snapshots, and up to three independent
-ChatGPT Pro workers with one completion or blocker result each.
+0.3.2 adds exact-conversation ownership, crash-safe durable runs, truthful live
+Pro-model evidence, immutable attachment snapshots, and six independent
+ChatGPT Pro workers by default with an operator ceiling of ten.
 
 The caller remains the orchestrator. GPT-Control does not merge code, widen
 repository authority, infer connected-tool access, launch a paid fallback, or
@@ -91,9 +91,16 @@ The MCP server advertises optional task execution through the installed MCP SDK.
 Task-capable clients can use task status/result/cancel. The run is durably bound
 before `taskCreated`, then a short cancellation grace elapses before browser
 execution; normal completion requires no status polling. Clients without task
-support receive one long-running terminal tool response. GPT-Control does not
-assume a task notification can awaken a dormant chat thread; the durable run and
-task IDs are the recovery mechanism.
+support receive one long-running terminal tool response. Protocol task
+notifications alone are not treated as a model-visible callback.
+
+When Codex starts the plugin with a valid `CODEX_THREAD_ID`, GPT-Control records
+that trusted parent identity with each task. A terminal worker stages one compact
+receipt and uses `codex queue` to wake the parent thread. Nearby completions are
+combined, prompt and result text are excluded from the queued message, and the
+parent collects authoritative results with `gpt_subagent_get`. The automatic
+delivery attempt is durable and at most once across restarts. If it is unavailable
+or ambiguous, the task result remains available by its durable task/run ID.
 
 Multiplexed MCP transports bind task listing, reads, results, and cancellation
 to the creating transport session. Broker-internal restart recovery remains
@@ -197,6 +204,8 @@ unverified build step.
 | `GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS` | Permit active driver probing (`1`) |
 | `GPT_CONTROL_PROVIDER_ABANDON_TOKEN` | Secret operator token, at least 32 characters, required for unresolved provider-turn abandonment |
 | `GPT_CONTROL_POLL_MS` | Browser observation interval |
+| `CODEX_THREAD_ID` | Codex-provided trusted parent identity used for completion callbacks |
+| `GPT_CONTROL_CODEX_CLI` | Optional trusted Codex executable override; otherwise `codex` is resolved on `PATH` |
 
 Schema v3 refuses to start when schema-v2 run or conversation records remain in
 the legacy default state root. Resolve or stop any old provider turns first,
