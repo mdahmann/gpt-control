@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "GPT-Control",
     "shortDescription": "Run exact, durable ChatGPT Pro web workers from Codex",
-    "longDescription": "Use Codex as the orchestrator for signed-in ChatGPT web reviews, exact conversation follow-ups, image work, and up to three independent Pro workers with durable completion, blocker, recovery, and cancellation semantics.",
+      "longDescription": "Use Codex as the orchestrator for signed-in ChatGPT web reviews, exact conversation follow-ups, image work, and durable Pro workers with a default ceiling of six and an operator ceiling of ten.",
     "developerName": "GPT-Control contributors",
     "category": "Developer Tools",
     "capabilities": [
