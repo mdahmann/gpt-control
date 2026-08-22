@@ -16,6 +16,7 @@ import {
 	reloadPage,
 	discoverChatGptModels,
 	discoverChatGptProjects,
+	dismissChatGptRateLimitNotice,
 	manageChatGptConversation,
 	selectAndVerifyChatGptModel,
 	setSessionState,
@@ -74,6 +75,7 @@ export interface WebChatDriver {
 	verifyModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
 	send(session: DriverSession, signal?: AbortSignal): Promise<void>;
 	observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation>;
+	dismissRateLimitNotice?(session: DriverSession, signal?: AbortSignal): Promise<string | undefined>;
 	recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void>;
 	setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void>;
 	close(sessionId: string, signal?: AbortSignal): Promise<void>;
@@ -159,6 +161,7 @@ export async function waitForCompletedDriverTurn(
 			observation: ChatPageObservation,
 		) => Promise<"approved" | "unavailable" | "mismatch">;
 		providerTurnIdentityPersisted?: boolean;
+		onRateLimit?: (message: string) => Promise<void>;
 	},
 ): Promise<DriverCompletionOutcome> {
 	const intervalMs = options.intervalMs ?? browserPollIntervalMs();
@@ -239,6 +242,33 @@ export async function waitForCompletedDriverTurn(
 		}
 
 		let observation = await driver.observe(session, options.signal);
+		if (observation.rateLimited) {
+			const message = observation.rateLimitMessage ?? "ChatGPT reported too many requests.";
+			await options.onRateLimit?.(message);
+			if (!driver.dismissRateLimitNotice) {
+				return needsUser(
+					`ChatGPT is temporarily rate limited and this browser driver cannot dismiss the notice safely: ${message}`,
+					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
+				);
+			}
+			try {
+				await driver.dismissRateLimitNotice(session, options.signal);
+				recoveryAttempts.push({
+					at: nowIso(), action: "dismiss_rate_limit", reason: message, outcome: "recovered",
+				});
+			} catch (error) {
+				recoveryAttempts.push({
+					at: nowIso(), action: "dismiss_rate_limit", reason: message, outcome: "failed", detail: errorMessage(error),
+				});
+				return needsUser(
+					`ChatGPT rate-limit notice could not be dismissed safely: ${errorMessage(error)}`,
+					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
+				);
+			}
+			previous = undefined;
+			steady = 0;
+			continue;
+		}
 		let providerTurnIdentityPending = false;
 		lastObservedUiState = observation.stateSummary;
 		if (observation.snapshot.count > options.baselineCount) latest = observation.snapshot;
@@ -470,10 +500,11 @@ function needsUser(
 }
 
 function requiresRecovery(observation: ChatPageObservation): boolean {
-	return Boolean(observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+	return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 
 function exactNeedsUserReason(observation: ChatPageObservation, prefix: string): string {
+	if (observation.rateLimitMessage) return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
 	if (observation.errorMessage) return `${prefix}: ${observation.errorMessage}`;
 	if (observation.continueAvailable) return `${prefix}: ChatGPT requires Continue generating.`;
 	if (observation.retryAvailable) return `${prefix}: ChatGPT exposes Retry for the current turn.`;
@@ -628,6 +659,13 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
 	}
 
+	async dismissRateLimitNotice(session: DriverSession, signal?: AbortSignal): Promise<string | undefined> {
+		await this.assertActionTarget(session, signal);
+		return dismissChatGptRateLimitNotice(
+			this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session),
+		);
+	}
+
 	async recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void> {
 		await this.assertActionTarget(session, signal);
 		const pageId = numericPageId(session.pageId);
@@ -692,6 +730,8 @@ const ObservationSchema = z.object({
 	}).strict()).default([]),
 	retryAvailable: z.boolean(),
 	continueAvailable: z.boolean(),
+	rateLimited: z.boolean().default(false),
+	rateLimitMessage: z.string().optional(),
 	errorMessage: z.string().optional(),
 	stateSummary: z.string(),
 }).strict();

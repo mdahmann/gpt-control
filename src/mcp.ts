@@ -82,6 +82,7 @@ export interface CodexCallbackOptions {
 	command: string;
 	exec: Exec;
 	delayMs?: number;
+	retryDelayMs?: number;
 }
 
 export function codexCallbackOptionsFromEnv(
@@ -155,7 +156,7 @@ class CodexCallbackCoordinator {
 
 	private schedule(threadId: string): void {
 		this.pendingThreadIds.add(threadId);
-		if (this.timer) return;
+		if (this.timer) clearTimeout(this.timer);
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
 			void this.flush().catch((error) => {
@@ -190,12 +191,27 @@ class CodexCallbackCoordinator {
 			const detail = callbackErrorDetail(errorMessage(error));
 			await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), false, detail);
 			console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+			this.scheduleRetry(threadId);
 			return;
 		}
 		const delivered = result.code === 0 && !result.killed;
 		const detail = delivered ? undefined : callbackErrorDetail(result.stderr || `exit ${result.code}`);
 		await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), delivered, detail);
-		if (!delivered) console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+		if (!delivered) {
+			console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+			this.scheduleRetry(threadId);
+		}
+	}
+
+	private scheduleRetry(threadId: string): void {
+		const timer = setTimeout(() => {
+			void this.taskStore.reconcileCodexCallbacks(threadId).then((pending) => {
+				if (pending > 0) this.schedule(threadId);
+			}).catch((error) => {
+				console.error(`GPT-Control could not retry a parent callback: ${callbackErrorDetail(errorMessage(error))}`);
+			});
+		}, Math.max(1, this.options.retryDelayMs ?? 1_000));
+		timer.unref?.();
 	}
 }
 

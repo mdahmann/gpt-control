@@ -2,8 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.2 adds immediate-return single and batch Worker starts with verified Codex
-callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
+0.4.3 adds shared rate-limit cooldown, ChatGPT project-conversation recovery,
+and bounded Codex callback retry. Version 0.4.2 added immediate-return single
+and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
 same-conversation required-connector preflight. Version 0.4.0 added live model
 and effort discovery, exact-conversation organization,
 crash-safe durable runs, and three clear orchestration routes: GPT Chat, GPT
@@ -16,8 +17,8 @@ open a replacement browser when the configured driver is unavailable.
 ## Core guarantees
 
 - **Exact conversation:** driver, session, ownership name, page, origin,
-  canonical `/c/<id>` URL, and assistant-turn baseline are recorded and
-  rechecked.
+  canonical `/c/<id>` identity, and assistant-turn baseline are recorded and
+  rechecked. A visible `/g/<project>/c/<id>` route resolves to the same identity.
 - **No ambiguous replay:** plaintext recovery data is removed before the browser
   click. A restart can observe a submitted turn but cannot resubmit it.
 - **Crash-safe cancellation:** cancellation is terminal and immutable before a
@@ -231,6 +232,8 @@ unverified build step.
 | `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
 | `GPT_CONTROL_MAX_WORKERS` | Operator-selected GPT Worker ceiling from 1–10; default 6 |
 | `GPT_CONTROL_MAX_PRO_WORKERS` | Legacy alias for `GPT_CONTROL_MAX_WORKERS` |
+| `GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS` | Initial shared ChatGPT cooldown; default 30000 ms |
+| `GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS` | Maximum exponential ChatGPT cooldown; default 300000 ms |
 | `GPT_CONTROL_MAX_ATTACHMENT_FILES` | Trusted file-count cap |
 | `GPT_CONTROL_MAX_ATTACHMENT_BYTES` | Trusted aggregate-byte cap |
 | `GPT_CONTROL_MAX_PROMPT_BYTES` | Trusted prompt-byte cap |

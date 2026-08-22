@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.3] - 2026-08-22
+
+- Detects and safely dismisses visible ChatGPT rate-limit notices, records a
+  shared durable cooldown, and temporarily lowers new Worker concurrency. The
+  limit recovers one slot at a time after successful work.
+- Treats ChatGPT project routes such as `/g/<project>/c/<id>` as the same exact
+  canonical conversation identity as `/c/<id>`.
+- Reuses the live model read-back after required connector preflight instead of
+  repeating full model-catalog selection before the main assignment.
+- Retries failed Codex completion callbacks up to three times with the same
+  durable task and run IDs. Duplicate wake receipts remain possible at an
+  ambiguous delivery boundary, so consumers must collect idempotently by task
+  ID.
+
 ## [0.4.2] - 2026-08-22
 
 - Added immediate-return `gpt_worker_start` and `gpt_worker_start_many` tools so

@@ -66,9 +66,10 @@ no repeated polling is required.
 Nearby terminal receipts for one parent are coalesced into one queued message.
 The receipt contains only task/run IDs and statuses, never the worker prompt or
 result body. GPT-Control durably marks the callback attempted before invoking
-the external command. This gives restart-safe at-most-once automatic delivery:
-an ambiguous crash can lose a wake-up, but it cannot automatically send a
-duplicate. Durable task/run lookup remains the recovery path.
+the external command. Failed delivery is retried at most three times with the
+same task and run IDs. An ambiguous command boundary can therefore produce a
+duplicate wake receipt. The parent must collect idempotently by task ID, and
+durable task/run lookup remains authoritative.
 
 The callback target routes only a fixed, bounded GPT-Control receipt. It cannot
 supply arbitrary callback text or grant repository, connector, browser, or
@@ -85,6 +86,9 @@ claiming that automatic wake-up is available. This release uses the local
 - Each worker receives a new owned browser session and ChatGPT conversation.
 - A durable global ordering prevents separate broker processes from exceeding
   the configured ceiling.
+- A visible ChatGPT rate-limit notice creates one shared durable cooldown and
+  lowers admission for new Workers. Successful work restores one slot at a
+  time, up to the configured ceiling.
 - A submitted turn keeps its slot until completion or a proved inactive Stop;
   timeout alone does not release live provider capacity.
 - Work above the configured ceiling remains queued fairly until a slot opens or

@@ -13,6 +13,7 @@ import {
 	extractComposerModel,
 	fillPrompt,
 	openChat,
+	providerConversationIdentity,
 	selectAndVerifyChatGptModel,
 	tabUrl,
 	verifyChatGptModelBeforeSend,
@@ -44,6 +45,32 @@ async function readyFake(options: ConstructorParameters<typeof FakeChromeBridge>
 }
 
 describe("observed Chrome failures", () => {
+	test("dismisses a visible ChatGPT rate-limit notice, cools down, and submits exactly once", async () => {
+		const bridge = new FakeChromeBridge({
+			rateLimitNotice: true,
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol"],
+			availableEfforts: ["High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge, {
+			rateLimitBaseDelayMs: 1,
+			rateLimitMaxDelayMs: 4,
+		});
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "recover after rate limit",
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "Pro",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(bridge.dismissedRateLimits).toHaveLength(1);
+		expect(bridge.submittedPrompts).toEqual(["recover after rate limit"]);
+		expect(result.run.diagnostics).toMatchObject({ rateLimitEvents: 1 });
+	});
+
 	test("waits through the chrome://newtab first-tab race before any origin-gated action", async () => {
 		const workspace = scratch();
 		const state = scratch();
@@ -113,6 +140,26 @@ describe("observed Chrome failures", () => {
 			outcome: "recovered",
 		}));
 		expect(bridge.submittedPrompts).toEqual(["legacy exact recovery"]);
+	});
+
+	test("accepts a ChatGPT project conversation URL as the same canonical conversation", async () => {
+		const projectUrl = "https://chatgpt.com/g/project-sequence/c/project-conversation-1";
+		expect(providerConversationIdentity(projectUrl)).toEqual({
+			id: "project-conversation-1",
+			url: "https://chatgpt.com/c/project-conversation-1",
+		});
+		const bridge = new FakeChromeBridge({ attachRedirectUrl: projectUrl });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const attached = await service.attachConversation({ conversationUrl: projectUrl, timeoutMs: 200 });
+		const result = await service.start({
+			kind: "chat",
+			conversationId: attached.id,
+			prompt: "follow up in the project chat",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.receipt.providerConversationUrl).toBe("https://chatgpt.com/c/project-conversation-1");
+		expect(bridge.submittedPrompts).toEqual(["follow up in the project chat"]);
 	});
 
 	test("returns needs_user instead of retrying a provider turn that may have external side effects", async () => {

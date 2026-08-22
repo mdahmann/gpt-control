@@ -22,7 +22,7 @@ const McpSessionIdSchema = z.string().min(1).max(512);
 const RunStatusSchema = z.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 const RecoverySchema = z.object({
 	at: z.string(),
-	action: z.enum(["reobserve", "reload", "restore_conversation_url", "retry", "continue", "stop"]),
+	action: z.enum(["reobserve", "reload", "restore_conversation_url", "dismiss_rate_limit", "retry", "continue", "stop"]),
 	reason: z.string(),
 	outcome: z.enum(["recovered", "still_active", "failed", "not_applicable"]),
 	detail: z.string().optional(),
@@ -146,6 +146,10 @@ const RunSchema = z.object({
 		lastObservedUrl: z.string().optional(),
 		lastObservedUiState: z.string().optional(),
 		organizationWarnings: z.array(z.string()).optional(),
+		rateLimitEvents: z.number().int().nonnegative().optional(),
+		lastRateLimitAt: z.string().optional(),
+		providerCooldownUntil: z.string().optional(),
+		providerConcurrencyLimit: z.number().int().positive().max(10).optional(),
 	}).optional(),
 	receipt: ReceiptSchema,
 	error: z.string().optional(),
@@ -173,6 +177,30 @@ const IdempotencyRecordSchema = z.object({
 	conversationId: z.string().regex(CONVERSATION_ID_PATTERN),
 	createdAt: z.string(),
 });
+
+const ProviderThrottleSchema = z.object({
+	version: z.literal(1),
+	reason: z.literal("chatgpt_rate_limit"),
+	firstSeenAt: z.string(),
+	lastSeenAt: z.string(),
+	nextRetryAt: z.string(),
+	consecutiveEvents: z.number().int().positive(),
+	activeLimit: z.number().int().positive().max(10),
+	recoverySuccesses: z.number().int().nonnegative(),
+	messageSha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export interface ProviderThrottleState {
+	version: 1;
+	reason: "chatgpt_rate_limit";
+	firstSeenAt: string;
+	lastSeenAt: string;
+	nextRetryAt: string;
+	consecutiveEvents: number;
+	activeLimit: number;
+	recoverySuccesses: number;
+	messageSha256: string;
+}
 
 export interface DurableRunRequest {
 	version: typeof STORAGE_VERSION;
@@ -316,6 +344,10 @@ export class RunStore {
 	private idempotencyPath(keyHash: string): string {
 		if (!/^[a-f0-9]{64}$/.test(keyHash)) throw new Error("Invalid idempotency key hash.");
 		return confinedPath(this.root, "idempotency", `${keyHash}.json`);
+	}
+
+	private providerThrottlePath(): string {
+		return confinedPath(this.root, "provider-throttle.json");
 	}
 
 	async init(): Promise<void> {
@@ -595,6 +627,73 @@ export class RunStore {
 			return;
 		}
 		await atomicWrite(this.idempotencyPath(record.keyHash), record);
+	}
+
+	async getProviderThrottle(): Promise<ProviderThrottleState | undefined> {
+		await this.init();
+		try {
+			return ProviderThrottleSchema.parse(JSON.parse(await safeRead(this.providerThrottlePath()))) as ProviderThrottleState;
+		} catch (error) {
+			if (isMissing(error)) return undefined;
+			throw error;
+		}
+	}
+
+	async noteProviderRateLimit(options: {
+		maxConcurrentWorkers: number;
+		baseDelayMs: number;
+		maxDelayMs: number;
+		message: string;
+	}): Promise<ProviderThrottleState> {
+		return this.withNamedLock("provider-throttle", async () => {
+			const current = await this.getProviderThrottle();
+			const now = Date.now();
+			const timestamp = new Date(now).toISOString();
+			const consecutiveEvents = (current?.consecutiveEvents ?? 0) + 1;
+			const delayMs = Math.min(options.maxDelayMs, options.baseDelayMs * 2 ** Math.min(consecutiveEvents - 1, 16));
+			const firstLimit = Math.max(1, Math.floor(options.maxConcurrentWorkers / 2));
+			const activeLimit = current
+				? Math.max(1, Math.min(options.maxConcurrentWorkers, current.activeLimit - 1))
+				: firstLimit;
+			const next: ProviderThrottleState = {
+				version: 1,
+				reason: "chatgpt_rate_limit",
+				firstSeenAt: current?.firstSeenAt ?? timestamp,
+				lastSeenAt: timestamp,
+				nextRetryAt: new Date(now + delayMs).toISOString(),
+				consecutiveEvents,
+				activeLimit,
+				recoverySuccesses: 0,
+				messageSha256: createHash("sha256").update(options.message, "utf8").digest("hex"),
+			};
+			ProviderThrottleSchema.parse(next);
+			await atomicWrite(this.providerThrottlePath(), next);
+			return next;
+		}, { timeoutMs: 30_000 });
+	}
+
+	async noteProviderSuccess(maxConcurrentWorkers: number): Promise<ProviderThrottleState | undefined> {
+		return this.withNamedLock("provider-throttle", async () => {
+			const current = await this.getProviderThrottle();
+			if (!current || Date.now() < Date.parse(current.nextRetryAt)) return current;
+			if (current.activeLimit >= maxConcurrentWorkers) {
+				try { await unlink(this.providerThrottlePath()); } catch (error) { if (!isMissing(error)) throw error; }
+				return undefined;
+			}
+			const activeLimit = Math.min(maxConcurrentWorkers, current.activeLimit + 1);
+			if (activeLimit >= maxConcurrentWorkers) {
+				try { await unlink(this.providerThrottlePath()); } catch (error) { if (!isMissing(error)) throw error; }
+				return undefined;
+			}
+			const next: ProviderThrottleState = {
+				...current,
+				activeLimit,
+				recoverySuccesses: current.recoverySuccesses + 1,
+			};
+			ProviderThrottleSchema.parse(next);
+			await atomicWrite(this.providerThrottlePath(), next);
+			return next;
+		}, { timeoutMs: 30_000 });
 	}
 
 	async withIdempotencyLock<T>(key: string, work: (keyHash: string) => Promise<T>): Promise<T> {

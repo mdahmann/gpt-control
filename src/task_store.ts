@@ -8,6 +8,7 @@ import { TASK_ID_PATTERN, nowIso, opaqueId } from "./domain";
 import { assertTaskId, confinedPath, RunStore, secureDirectory } from "./store";
 
 const TERMINAL = new Set<Task["status"]>(["completed", "failed", "cancelled"]);
+const MAX_CODEX_CALLBACK_ATTEMPTS = 3;
 const TRANSITIONS: Record<Task["status"], ReadonlySet<Task["status"]>> = {
 	working: new Set(["working", "input_required", "completed", "failed", "cancelled"]),
 	input_required: new Set(["input_required", "failed", "cancelled"]),
@@ -40,6 +41,7 @@ export interface CodexParentCallback {
 	attemptedAt?: string;
 	finishedAt?: string;
 	error?: string;
+	attemptCount?: number;
 }
 
 export interface CodexCallbackReceipt {
@@ -328,6 +330,19 @@ export class DurableTaskStore implements TaskStore {
 				pending += 1;
 				continue;
 			}
+			if ((record.parentCallback.state === "attempted" || record.parentCallback.state === "failed")
+				&& (record.parentCallback.attemptCount ?? 0) < MAX_CODEX_CALLBACK_ATTEMPTS) {
+				await this.mutate(taskId, (current) => {
+					const callback = current.parentCallback;
+					if (!callback || callback.threadId !== threadId
+						|| (callback.state !== "attempted" && callback.state !== "failed")
+						|| (callback.attemptCount ?? 0) >= MAX_CODEX_CALLBACK_ATTEMPTS) return current;
+					current.parentCallback = { ...callback, state: "pending", pendingAt: nowIso() };
+					return current;
+				});
+				pending += 1;
+				continue;
+			}
 			if (record.parentCallback.state !== "waiting" || !TERMINAL.has(record.task.status)) continue;
 			let status = callbackStatus(record.task.status, record.runId);
 			if (record.runId) {
@@ -352,7 +367,12 @@ export class DurableTaskStore implements TaskStore {
 					const callback = record.parentCallback;
 					if (callback?.threadId !== threadId || callback.state !== "pending" || !callback.terminalStatus) return record;
 					claimed = { taskId, threadId, runId: callback.runId, status: callback.terminalStatus };
-					record.parentCallback = { ...callback, state: "attempted", attemptedAt: nowIso() };
+					record.parentCallback = {
+						...callback,
+						state: "attempted",
+						attemptedAt: nowIso(),
+						attemptCount: (callback.attemptCount ?? 0) + 1,
+					};
 					return record;
 				});
 				if (claimed) receipts.push(claimed);
@@ -554,6 +574,10 @@ function validateCodexParentCallback(callback: CodexParentCallback, taskId: stri
 	}
 	if (callback.state !== "waiting" && !callback.terminalStatus) {
 		throw new Error(`Codex callback ${taskId} is missing terminal status.`);
+	}
+	if (callback.attemptCount !== undefined
+		&& (!Number.isInteger(callback.attemptCount) || callback.attemptCount < 0 || callback.attemptCount > MAX_CODEX_CALLBACK_ATTEMPTS)) {
+		throw new Error(`Codex callback ${taskId} has an invalid attempt count.`);
 	}
 }
 

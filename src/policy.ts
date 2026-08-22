@@ -21,6 +21,8 @@ export interface OperatorPolicy {
 	maxAttachmentBytes?: number;
 	maxPromptBytes: number;
 	maxConcurrentWorkers: number;
+	rateLimitBaseDelayMs: number;
+	rateLimitMaxDelayMs: number;
 	allowActiveDiagnostics: boolean;
 	providerTurnAbandonmentTokenHash?: string;
 	fingerprint: string;
@@ -40,6 +42,8 @@ export interface OperatorPolicyInput {
 	maxAttachmentBytes?: number;
 	maxPromptBytes?: number;
 	maxConcurrentWorkers?: number;
+	rateLimitBaseDelayMs?: number;
+	rateLimitMaxDelayMs?: number;
 	allowActiveDiagnostics?: boolean;
 	providerTurnAbandonmentToken?: string;
 }
@@ -55,6 +59,14 @@ export function operatorPolicyFromEnv(
 	if (abandonmentToken !== undefined && abandonmentToken.length < 32) {
 		throw new Error("GPT_CONTROL_PROVIDER_ABANDON_TOKEN must contain at least 32 characters.");
 	}
+	const rateLimitBaseDelayMs = boundedInteger(
+		overrides.rateLimitBaseDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS) ?? 30_000,
+		1, 10 * 60_000, "rateLimitBaseDelayMs",
+	);
+	const rateLimitMaxDelayMs = boundedInteger(
+		overrides.rateLimitMaxDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS) ?? 5 * 60_000,
+		rateLimitBaseDelayMs, 30 * 60_000, "rateLimitMaxDelayMs",
+	);
 	const value = {
 		workspaceRoot,
 		storageRoot,
@@ -75,6 +87,8 @@ export function operatorPolicyFromEnv(
 				?? 6,
 			1, 10, "maxConcurrentWorkers",
 		),
+		rateLimitBaseDelayMs,
+		rateLimitMaxDelayMs,
 		allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
 		providerTurnAbandonmentTokenHash: abandonmentToken
 			? createHash("sha256").update(abandonmentToken).digest("hex")

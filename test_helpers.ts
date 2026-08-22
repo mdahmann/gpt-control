@@ -40,6 +40,7 @@ export interface FakeBridgeOptions {
 	sendDelayMs?: number;
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
 	responseForPrompt?: (prompt: string) => string | undefined;
+	rateLimitNotice?: boolean;
 }
 
 interface FakeTurn {
@@ -82,6 +83,7 @@ interface FakeTab {
 	archived: boolean;
 	project?: string;
 	conversationMenu?: "header" | "sidebar" | "move" | "rename";
+	rateLimited: boolean;
 }
 
 export class FakeChromeBridge {
@@ -106,6 +108,7 @@ export class FakeChromeBridge {
 	private nextSession = 1;
 	private readonly sessionNames = new Map<string, string>();
 	readonly stopClicks: number[] = [];
+	readonly dismissedRateLimits: number[] = [];
 
 	constructor(readonly options: FakeBridgeOptions = {}) {}
 
@@ -321,9 +324,10 @@ export class FakeChromeBridge {
 				pendingAttachments: [],
 				name: this.sessionNames.get(sessionId) ?? "",
 				title: "Fake conversation",
-				pinned: false,
-				archived: false,
-			});
+					pinned: false,
+					archived: false,
+					rateLimited: this.options.rateLimitNotice === true,
+				});
 			return ok({ tabId: id });
 		}
 		if (operation === "show") {
@@ -353,6 +357,14 @@ export class FakeChromeBridge {
 
 	private handleClick(tabId: number, selector: string): ExecResult {
 		const tab = this.requireTab(tabId);
+		if (selector === "role=button[name=Got it]" || selector === '[aria-label="Got it"]') {
+			tab.rateLimited = false;
+			this.dismissedRateLimits.push(tabId);
+			return ok({ success: true });
+		}
+		if (tab.rateLimited && (selector.includes("model") || selector.includes("picker") || selector.includes("advanced"))) {
+			return failed("rate-limit dialog blocks the requested control");
+		}
 		if (selector === '[data-testid="conversation-options-button"]') {
 			tab.conversationMenu = "header";
 			return ok({ success: true });
@@ -432,7 +444,9 @@ export class FakeChromeBridge {
 			const userPrompt = tab.filled;
 			const prompt = stripRunProof(userPrompt);
 			this.submittedPrompts.push(prompt);
+			const projectMatch = /^https:\/\/chatgpt\.com\/g\/[^/?#]+\/c\/([^/?#]+)$/.exec(tab.url);
 			const conversationId = /^https:\/\/chatgpt\.com\/c\/([^/?#]+)$/.exec(tab.url)?.[1]
+				?? projectMatch?.[1]
 				?? `fake-${tab.id}-${tab.turns.length + 1}`;
 			const messageIdentity = `${conversationId}-turn-${tab.turns.length + 1}`;
 			tab.turns.push({
@@ -448,7 +462,7 @@ export class FakeChromeBridge {
 				identityDelayReadsRemaining: this.options.postSendIdentityDelayReads,
 				attachmentNames: [...tab.pendingAttachments],
 			});
-			tab.url = `https://chatgpt.com/c/${conversationId}`;
+			tab.url = projectMatch ? tab.url : `https://chatgpt.com/c/${conversationId}`;
 			tab.filled = "";
 			tab.pendingAttachments = [];
 			return ok({ success: true });
@@ -563,7 +577,10 @@ export class FakeChromeBridge {
 				this.options.mutateRenderedPrompt === true,
 				this.options.injectEnvelopeInstruction === true,
 			)}${index === tab.turns.length - 1 ? this.turnHtml(turn, true) : this.finalAssistant(turn)}`).join("");
-		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}</main>`;
+		const rateLimitNotice = tab.rateLimited
+			? '<div role="dialog"><div role="alert">Too many requests. Please try again later.</div><button role="button">Got it</button></div>'
+			: "";
+		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}${rateLimitNotice}</main>`;
 	}
 
 	private turnHtml(turn: FakeTurn, current: boolean): string {
@@ -711,7 +728,7 @@ function canonicalFakeUrl(raw: string): string {
 }
 
 function providerConversationIdentityForFake(raw: string): string | undefined {
-	return /^https:\/\/chatgpt\.com\/c\/([^/?#]+)$/.exec(raw)?.[1];
+	return /^https:\/\/chatgpt\.com\/(?:g\/[^/?#]+\/)?c\/([^/?#]+)$/.exec(raw)?.[1];
 }
 
 function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {

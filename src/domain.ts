@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.4.2";
+export const PACKAGE_VERSION = "0.4.3";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -81,7 +81,7 @@ export interface ReviewReport {
 
 export interface RecoveryAttempt {
 	at: string;
-	action: "reobserve" | "reload" | "restore_conversation_url" | "retry" | "continue" | "stop";
+	action: "reobserve" | "reload" | "restore_conversation_url" | "dismiss_rate_limit" | "retry" | "continue" | "stop";
 	reason: string;
 	outcome: "recovered" | "still_active" | "failed" | "not_applicable";
 	detail?: string;
@@ -94,6 +94,10 @@ export interface RunDiagnostics {
 	lastObservedUrl?: string;
 	lastObservedUiState?: string;
 	organizationWarnings?: string[];
+	rateLimitEvents?: number;
+	lastRateLimitAt?: string;
+	providerCooldownUntil?: string;
+	providerConcurrencyLimit?: number;
 }
 
 export interface ReviewReceipt {

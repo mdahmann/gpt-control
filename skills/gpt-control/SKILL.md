@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.4.2
+version: 0.4.3
 ---
 
 # GPT-Control
@@ -125,8 +125,9 @@ also hide that lifecycle and return only the final result. For detached work,
 use the immediate-return start tools instead. In Codex 0.149 or newer, a Worker
 with a verified callback binding queues one compact completion receipt through
 `codex queue`. Collect its authoritative result with `gpt_worker_get`. The
-callback contains no prompt or result body and is attempted at most once across
-restarts; durable task/run lookup remains the fallback.
+callback contains no prompt or result body. Failed delivery is retried at most
+three times with the same task and run IDs. A duplicate wake receipt is possible
+at an ambiguous delivery boundary, so collect idempotently by task ID.
 
 ## Exact conversations and runs
 
@@ -136,8 +137,9 @@ Every submission has two wrapper-owned IDs:
 - `run_id` identifies one exact submission and durable result.
 
 A follow-up is accepted only when the recorded driver, session, page, ownership
-name, and canonical `https://chatgpt.com/c/<id>` URL can all be proven. Recovery
-may navigate the same owned page back to the recorded URL. It must not create a
+name, and canonical `https://chatgpt.com/c/<id>` identity can all be proven.
+ChatGPT project routes such as `/g/<project>/c/<id>` resolve to that same exact
+identity. Recovery may navigate the same owned page back to the recorded URL. It must not create a
 replacement page or resubmit an ambiguous prompt.
 
 To continue an existing provider conversation, call

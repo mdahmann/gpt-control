@@ -110,8 +110,17 @@ export interface ChatPageObservation {
 	visibleToolCards: Array<{ label: string; sha256: string }>;
 	retryAvailable: boolean;
 	continueAvailable: boolean;
+	rateLimited?: boolean;
+	rateLimitMessage?: string;
 	errorMessage?: string;
 	stateSummary: string;
+}
+
+export class ChatGptRateLimitError extends Error {
+	constructor(readonly notice: string) {
+		super(`ChatGPT is temporarily rate limited: ${notice}`);
+		this.name = "ChatGptRateLimitError";
+	}
 }
 
 export function canonicalPromptObservationText(value: string): string {
@@ -1254,6 +1263,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	const retryAvailable = controlLabels.some((label) => /^retry(?:\b|$)/i.test(label));
 	const continueAvailable = controlLabels.some((label) => /continue generating|continue response|^continue$/i.test(label));
 	const statusNodes = uniqueElements([
+		...root.querySelectorAll('[role="dialog"]'),
 		...root.querySelectorAll('[role="status"]'),
 		...root.querySelectorAll('[role="alert"]'),
 		...root.querySelectorAll('[aria-live="assertive"]'),
@@ -1266,6 +1276,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		.filter((label) => label.length > 0 && label.length <= 256)
 		.map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
 	const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
+	const rateLimitMessage = statusTexts.find(isRateLimitText);
 	const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
 	const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
 	const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
@@ -1275,6 +1286,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		toolRunning ? "tool_running" : undefined,
 		retryAvailable ? "retry" : undefined,
 		continueAvailable ? "continue" : undefined,
+		rateLimitMessage ? "rate_limited" : undefined,
 		errorText ? `error:${errorText.slice(0, 160)}` : undefined,
 		`snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`,
 	].filter(Boolean);
@@ -1290,9 +1302,32 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		visibleToolCards,
 		retryAvailable,
 		continueAvailable,
+		rateLimited: Boolean(rateLimitMessage),
+		rateLimitMessage,
 		errorMessage: errorText,
 		stateSummary: states.join(","),
 	};
+}
+
+export async function dismissChatGptRateLimitNotice(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<string | undefined> {
+	const initial = findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal));
+	if (!initial) return undefined;
+	if (!initial.dismissSelector) {
+		throw new ChatGptRateLimitError(`${initial.message} The notice has no safe dismiss control.`);
+	}
+	await pickerAction(exec, launcher, "click", tabId, initial.dismissSelector, signal, expectedTarget);
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		await sleep(Math.min(pollIntervalMs(), 200));
+		if (!findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal))) return initial.message;
+	}
+	throw new ChatGptRateLimitError(`${initial.message} The notice remained visible after dismissal.`);
 }
 
 export async function readAssistantSnapshot(
@@ -1496,9 +1531,14 @@ export function providerConversationIdentity(raw: string): { id: string; url: st
 	let url: URL;
 	try { url = new URL(raw); } catch { return undefined; }
 	if (url.origin !== CHATGPT_ORIGIN) return undefined;
-	const match = /^\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname);
-	if (!match) return undefined;
-	return { id: match[1], url: `${url.origin}/c/${match[1]}` };
+	const direct = /^\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname);
+	const project = /^\/g\/[A-Za-z0-9_-]+\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname);
+	const id = direct?.[1] ?? project?.[1];
+	if (!id) return undefined;
+	// A ChatGPT project can change only the route for a conversation. Keep one
+	// stable provider identity so /c/<id> and /g/<project>/c/<id> cannot be
+	// mistaken for two chats or force a replacement tab during recovery.
+	return { id, url: `${url.origin}/c/${id}` };
 }
 
 async function recoverSameConversation(
@@ -1565,10 +1605,11 @@ async function recoverSameConversation(
 }
 
 function requiresRecovery(observation: ChatPageObservation): boolean {
-	return Boolean(observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+	return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 
 function exactNeedsUserReason(observation: ChatPageObservation, prefix: string): string {
+	if (observation.rateLimitMessage) return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
 	if (observation.errorMessage) return `${prefix}: ${observation.errorMessage}`;
 	if (observation.continueAvailable) return `${prefix}: ChatGPT requires Continue generating.`;
 	if (observation.retryAvailable) return `${prefix}: ChatGPT exposes Retry for the current turn.`;
@@ -1597,10 +1638,12 @@ async function openAdvancedPicker(
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<AdvancedPickerState> {
 	let html = await readPageHtml(exec, launcher, tabId, signal);
+	throwIfRateLimited(html);
 	let composer = extractComposerModel(html);
 	while (!composer && Date.now() < deadline) {
 		await sleep(Math.min(pollIntervalMs(), 200));
 		html = await readPageHtml(exec, launcher, tabId, signal);
+		throwIfRateLimited(html);
 		composer = extractComposerModel(html);
 	}
 	if (!composer) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
@@ -1610,6 +1653,7 @@ async function openAdvancedPicker(
 	}
 	for (;;) {
 		html = await readPageHtml(exec, launcher, tabId, signal);
+		throwIfRateLimited(html);
 		state = extractAdvancedPickerState(html, composer.selector);
 		if (state?.modelSelector || state?.effortSelector) return state;
 		const controls = extractCurrentEffortPickerControls(html);
@@ -1620,6 +1664,33 @@ async function openAdvancedPicker(
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
+}
+
+function throwIfRateLimited(html: string): void {
+	const notice = findRateLimitNotice(html);
+	if (notice) throw new ChatGptRateLimitError(notice.message);
+}
+
+function findRateLimitNotice(html: string): { message: string; dismissSelector?: string } | undefined {
+	const root = parse(html);
+	const candidates = uniqueElements([
+		...root.querySelectorAll('[role="dialog"]'),
+		...root.querySelectorAll('[role="alert"]'),
+		...root.querySelectorAll('[role="status"]'),
+		...root.querySelectorAll('[aria-live="assertive"]'),
+	]);
+	const notice = candidates.find((node) => isRateLimitText(nodeLabel(node)));
+	if (!notice) return undefined;
+	const dismiss = notice.querySelectorAll('button, [role="button"]')
+		.find((node) => /^(?:got it|dismiss|close)$/i.test(nodeLabel(node)));
+	return {
+		message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500),
+		dismissSelector: dismiss ? exactNodeSelector(dismiss) : undefined,
+	};
+}
+
+function isRateLimitText(text: string): boolean {
+	return /too many requests|rate limit(?:ed| reached)?|try again later|temporarily restricted/i.test(text);
 }
 
 async function openPickerOptions(

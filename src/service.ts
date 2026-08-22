@@ -19,6 +19,7 @@ import {
 } from "./browser-driver";
 import {
 	CHATGPT_ORIGIN,
+	ChatGptRateLimitError,
 	canonicalPromptObservationText,
 	providerConversationIdentity,
 	type ChatGptModelCatalog,
@@ -906,6 +907,21 @@ export class GptControlService {
 			if (signal.aborted) throw signal.reason ?? new Error("Worker admission was cancelled.");
 			const current = await this.store.getRun(runId);
 			if (TERMINAL.has(current.status)) return false;
+			const throttle = await this.store.getProviderThrottle();
+			const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
+			if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
+				const deadline = Date.parse(current.deadlineAt ?? "");
+				if (Number.isFinite(deadline) && cooldownUntil >= deadline) {
+					await this.store.updateRun(runId, {
+						status: "needs_user", completedAt: nowIso(),
+						error: "ChatGPT rate-limit cooldown extends beyond this GPT Worker's bounded deadline. The assignment was not sent.",
+					});
+					return false;
+				}
+				await abortableSleep(Math.min(250, cooldownUntil - Date.now()), signal);
+				continue;
+			}
+			const effectiveLimit = Math.min(this.policy.maxConcurrentWorkers, throttle?.activeLimit ?? this.policy.maxConcurrentWorkers);
 			const contenders = (await this.store.listRuns({ limit: null }))
 				.filter((run) => run.kind === "subagent" && (
 					run.providerTurnPending === true
@@ -915,7 +931,7 @@ export class GptControlService {
 				))
 				.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
 			const position = contenders.findIndex((run) => run.id === runId);
-			if (position >= 0 && position < this.policy.maxConcurrentWorkers) return true;
+			if (position >= 0 && position < effectiveLimit) return true;
 			const deadline = Date.parse(current.deadlineAt ?? "");
 			if (Number.isFinite(deadline) && Date.now() >= deadline) {
 				await this.store.updateRun(runId, {
@@ -926,6 +942,77 @@ export class GptControlService {
 			}
 			await abortableSleep(100, signal);
 		}
+	}
+
+	private async withProviderRateLimitRecovery<T>(
+		driver: WebChatDriver,
+		expected: ExpectedDriverSession,
+		initialRun: RunRecord,
+		signal: AbortSignal,
+		action: (session: Awaited<ReturnType<WebChatDriver["show"]>>) => Promise<T>,
+	): Promise<{ run: RunRecord; session: Awaited<ReturnType<WebChatDriver["show"]>>; value: T }> {
+		let run = initialRun;
+		for (;;) {
+			const deadline = Date.parse(run.deadlineAt ?? "");
+			if (Number.isFinite(deadline) && Date.now() >= deadline) {
+				throw new Error("ChatGPT remained rate limited until the GPT Worker deadline. The assignment was not sent again.");
+			}
+			const throttle = await this.store.getProviderThrottle();
+			const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
+			if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
+				await abortableSleep(Math.min(250, cooldownUntil - Date.now()), signal);
+				continue;
+			}
+			const session = await assertExactDriverSession(driver, expected, signal);
+			const observation = await driver.observe(session, signal);
+			if (observation.rateLimited) {
+				run = await this.handleProviderRateLimit(
+					driver, session, run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.", signal,
+				);
+				continue;
+			}
+			try {
+				return { run, session, value: await action(session) };
+			} catch (error) {
+				if (!(error instanceof ChatGptRateLimitError)) throw error;
+				run = await this.handleProviderRateLimit(driver, session, run, error.notice, signal);
+			}
+		}
+	}
+
+	private async handleProviderRateLimit(
+		driver: WebChatDriver,
+		session: Awaited<ReturnType<WebChatDriver["show"]>>,
+		run: RunRecord,
+		message: string,
+		signal: AbortSignal,
+	): Promise<RunRecord> {
+		const updated = await this.recordProviderRateLimit(run, message);
+		if (!driver.dismissRateLimitNotice) {
+			throw new Error(`ChatGPT is temporarily rate limited and the active browser driver cannot dismiss its notice safely: ${message}`);
+		}
+		await driver.dismissRateLimitNotice(session, signal);
+		return updated;
+	}
+
+	private async recordProviderRateLimit(run: RunRecord, message: string): Promise<RunRecord> {
+		const throttle = await this.store.noteProviderRateLimit({
+			maxConcurrentWorkers: this.policy.maxConcurrentWorkers,
+			baseDelayMs: this.policy.rateLimitBaseDelayMs,
+			maxDelayMs: this.policy.rateLimitMaxDelayMs,
+			message,
+		});
+		const current = await this.store.getRun(run.id);
+		const updated = await this.store.updateRun(run.id, {
+			diagnostics: {
+				...(current.diagnostics ?? {}),
+				rateLimitEvents: (current.diagnostics?.rateLimitEvents ?? 0) + 1,
+				lastRateLimitAt: throttle.lastSeenAt,
+				providerCooldownUntil: throttle.nextRetryAt,
+				providerConcurrencyLimit: throttle.activeLimit,
+			},
+		});
+		return updated;
 	}
 
 	private async executeRun(runId: string, signal: AbortSignal, recovery: boolean): Promise<RunRecord> {
@@ -968,6 +1055,7 @@ export class GptControlService {
 				result: report,
 				artifactUrls: result.imageUrls,
 				diagnostics: {
+					...(run.diagnostics ?? {}),
 					recoveryAttempts: result.recoveryAttempts,
 					localAssistantTurnCount: result.localAssistantTurnCount,
 					lastObservedUrl: result.lastObservedUrl,
@@ -992,6 +1080,7 @@ export class GptControlService {
 					completedAt,
 				},
 			});
+			await this.store.noteProviderSuccess(this.policy.maxConcurrentWorkers);
 			return run;
 		} catch (error) {
 			resetCapabilityCache();
@@ -1115,7 +1204,15 @@ export class GptControlService {
 			const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro"
 				? { ...(requestedModel !== "pro" ? { model: requestedModel } : {}), ...(request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {}) }
 				: requestedModel;
-			const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+			const selection = await this.withProviderRateLimitRecovery(
+				driver, expected, run, signal,
+				(session) => run.connectorPreflight?.status === "passed"
+					? driver.verifyModel(session, requestedSelection, signal)
+					: driver.selectModel(session, requestedSelection, signal),
+			);
+			run = selection.run;
+			const activeSession = selection.session;
+			const selected = selection.value;
 			observedModel = selected.observedModel;
 			observedEffort = selected.observedEffort;
 			modelVerified = true;
@@ -1135,9 +1232,14 @@ export class GptControlService {
 					modelVerifiedAt,
 				},
 			});
-			await driver.upload(ready.session, run.attachmentManifest.files.map((file) => file.path), signal);
-			await driver.fill(ready.session, request.prompt, signal);
-			const verified = await driver.verifyModel(ready.session, requestedSelection, signal);
+			await driver.upload(activeSession, run.attachmentManifest.files.map((file) => file.path), signal);
+			await driver.fill(activeSession, request.prompt, signal);
+			const verification = await this.withProviderRateLimitRecovery(
+				driver, expected, run, signal,
+				(session) => driver.verifyModel(session, requestedSelection, signal),
+			);
+			run = verification.run;
+			const verified = verification.value;
 			observedModel = verified.observedModel;
 			observedEffort = verified.observedEffort;
 			modelVerifiedAt = verified.modelVerifiedAt;
@@ -1169,8 +1271,8 @@ export class GptControlService {
 				await this.store.clearProviderTurnState(run.id);
 				throw new Error("Run became terminal before the browser send boundary.");
 			}
-			const preSendObservation = await driver.observe(ready.session, signal);
-			await driver.send(ready.session, signal);
+			const preSendObservation = await driver.observe(verification.session, signal);
+			await driver.send(verification.session, signal);
 			const identityStartedAt = Date.now();
 			const runDeadline = Date.parse(run.deadlineAt ?? "");
 			// After the irreversible send boundary, reserve a short bounded grace
@@ -1355,6 +1457,9 @@ export class GptControlService {
 				conversation = persisted.conversation;
 				return "approved";
 			},
+			onRateLimit: async (message) => {
+				run = await this.recordProviderRateLimit(run, message);
+			},
 		});
 		if (outcome.terminalStatus === "needs_user") {
 			await driver.setState(expected.sessionId, "needs_user", signal).catch(() => undefined);
@@ -1435,7 +1540,13 @@ export class GptControlService {
 			const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro"
 				? { ...(requestedModel !== "pro" ? { model: requestedModel } : {}), ...(request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {}) }
 				: requestedModel;
-			const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+			const selection = await this.withProviderRateLimitRecovery(
+				driver, expected, run, signal,
+				(session) => driver.selectModel(session, requestedSelection, signal),
+			);
+			run = selection.run;
+			const activeSession = selection.session;
+			const selected = selection.value;
 			run = await this.store.updateRun(run.id, {
 				receipt: {
 					...run.receipt,
@@ -1450,14 +1561,18 @@ export class GptControlService {
 				},
 			});
 			const prompt = connectorPreflightPrompt(intent.names);
-			await driver.fill(ready.session, prompt, signal);
-			await driver.verifyModel(ready.session, requestedSelection, signal);
+			await driver.fill(activeSession, prompt, signal);
+			const verification = await this.withProviderRateLimitRecovery(
+				driver, expected, run, signal,
+				(session) => driver.verifyModel(session, requestedSelection, signal),
+			);
+			run = verification.run;
 			run = await this.store.updateRun(run.id, {
 				providerTurnPending: true,
 				connectorPreflight: { status: "submitting", baselineMessageCount: baseline },
 			});
-			const beforeSend = await driver.observe(ready.session, signal);
-			await driver.send(ready.session, signal);
+			const beforeSend = await driver.observe(verification.session, signal);
+			await driver.send(verification.session, signal);
 			const deadline = Date.now() + Math.min(15_000, request.timeoutMs);
 			let bound = false;
 			while (Date.now() < deadline) {
@@ -1513,6 +1628,9 @@ export class GptControlService {
 				if (!exact || exact.url !== identity.url) return "mismatch";
 				if (!observation.latestUserMessageId) return "unavailable";
 				return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+			},
+			onRateLimit: async (message) => {
+				run = await this.recordProviderRateLimit(run, message);
 			},
 		});
 		if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
@@ -2192,7 +2310,7 @@ function attachedConversationIdentity(request: AttachConversationRequest): { id:
 	let parsed: URL;
 	try { parsed = new URL(raw); } catch { throw new Error("Invalid ChatGPT conversation URL."); }
 	if (!identity || parsed.username || parsed.password || parsed.search || parsed.hash) {
-		throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> conversation without query or fragment data.");
+		throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> or https://chatgpt.com/g/<project>/c/<id> conversation without query or fragment data.");
 	}
 	if (identity.id.length > 256) throw new Error("ChatGPT provider conversation id is too long.");
 	return identity;

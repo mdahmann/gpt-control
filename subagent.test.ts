@@ -136,6 +136,41 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(new Set(terminal.map((run) => run.conversationId)).size).toBe(4);
 	});
 
+	test("shares a provider cooldown and reduces new worker concurrency after rate limiting", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge, {
+			maxConcurrentWorkers: 3,
+			rateLimitBaseDelayMs: 30,
+			rateLimitMaxDelayMs: 30,
+		});
+		const throttle = await store.noteProviderRateLimit({
+			maxConcurrentWorkers: 3,
+			baseDelayMs: 30,
+			maxDelayMs: 30,
+			message: "Too many requests. Please try again later.",
+		});
+		expect(throttle.activeLimit).toBe(1);
+
+		const first = await service.start({
+			kind: "subagent", prompt: "[slow] throttled-1", idempotencyKey: "throttled-1", wait: false, timeoutMs: 2000,
+		});
+		const second = await service.start({
+			kind: "subagent", prompt: "[slow] throttled-2", idempotencyKey: "throttled-2", wait: false, timeoutMs: 2000,
+		});
+		await Bun.sleep(10);
+		expect(bridge.submittedPrompts).toEqual([]);
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		expect(bridge.submittedPrompts).toEqual(["[slow] throttled-1"]);
+		bridge.release();
+		await waitUntil(() => bridge.submittedPrompts.length === 2);
+		bridge.release();
+		const terminal = await Promise.all([
+			service.waitForRun(first.run.id, 2500),
+			service.waitForRun(second.run.id, 2500),
+		]);
+		expect(terminal.map((run) => run.status)).toEqual(["completed", "completed"]);
+	});
+
 	test("one worker can fail while two independent workers continue", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -708,7 +743,7 @@ describe("MCP task delivery", () => {
 		const threadId = "019c8f58-41ac-72b0-a9f6-43653b3ea80c";
 		const harness = await connectMcp({
 			bridge,
-			codexCallback: { command: "/trusted/bin/codex", exec, delayMs: 50 },
+			codexCallback: { command: "/trusted/bin/codex", exec, delayMs: 300 },
 		});
 		try {
 			const started = await harness.client.callTool({
@@ -1008,7 +1043,9 @@ describe("MCP task delivery", () => {
 				threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
 				command: "/trusted/bin/codex",
 				exec,
-				delayMs: 50,
+				// The task status poll interval is 100 ms; keep the coalescing window
+				// above that public delivery cadence so both terminal receipts can stage.
+				delayMs: 200,
 			},
 		});
 		try {
@@ -1056,29 +1093,36 @@ describe("MCP task delivery", () => {
 		}
 	});
 
-	test("does not retry an ambiguous failed queue command after restart", async () => {
+	test("retries a failed Codex queue callback with the same durable task receipt", async () => {
 		const root = scratch();
 		let attempts = 0;
-		const exec: Exec = async () => {
+		const messages: string[] = [];
+		const exec: Exec = async (_command, args) => {
 			attempts += 1;
-			return { stdout: "", stderr: "ambiguous queue failure", code: 1, killed: false };
+			messages.push(args[4] ?? "");
+			return attempts === 1
+				? { stdout: "", stderr: "app server unavailable", code: 1, killed: false }
+				: { stdout: "queued\n", stderr: "", code: 0, killed: false };
 		};
 		const callback = {
 			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
 			command: "/trusted/bin/codex",
 			exec,
 			delayMs: 1,
+			retryDelayMs: 1,
 		};
 		const first = await connectMcp({ root, codexCallback: callback });
 		await collectTask(first.client, "ambiguous callback", "ambiguous-callback");
-		await waitUntil(() => attempts === 1);
+		await waitUntil(() => attempts === 2);
 		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(attempts).toBe(2);
+		expect(messages[0]).toBe(messages[1]);
 		await first.close();
 
 		const second = await connectMcp({ root, recover: true, codexCallback: callback });
 		try {
 			await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(attempts).toBe(1);
+			expect(attempts).toBe(2);
 		} finally {
 			await second.close();
 		}

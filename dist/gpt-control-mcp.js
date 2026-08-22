@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.4.2";
+var PACKAGE_VERSION = "0.4.3";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.4.2";
+var PACKAGE_VERSION2 = "0.4.3";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -33784,6 +33784,15 @@ var FILE_INPUT_SELECTOR = 'input[type="file"]';
 var USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
 var EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 var TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
+
+class ChatGptRateLimitError extends Error {
+  notice;
+  constructor(notice) {
+    super(`ChatGPT is temporarily rate limited: ${notice}`);
+    this.notice = notice;
+    this.name = "ChatGptRateLimitError";
+  }
+}
 function canonicalPromptObservationText(value) {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -34458,6 +34467,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
   const retryAvailable = controlLabels.some((label) => /^retry(?:\b|$)/i.test(label));
   const continueAvailable = controlLabels.some((label) => /continue generating|continue response|^continue$/i.test(label));
   const statusNodes = uniqueElements([
+    ...root.querySelectorAll('[role="dialog"]'),
     ...root.querySelectorAll('[role="status"]'),
     ...root.querySelectorAll('[role="alert"]'),
     ...root.querySelectorAll('[aria-live="assertive"]'),
@@ -34467,6 +34477,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
   ]);
   const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]')).map((node) => nodeLabel(node).replace(/\s+/g, " ").trim()).filter((label) => label.length > 0 && label.length <= 256).map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
   const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
+  const rateLimitMessage = statusTexts.find(isRateLimitText);
   const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
   const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
   const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
@@ -34476,6 +34487,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
     toolRunning ? "tool_running" : undefined,
     retryAvailable ? "retry" : undefined,
     continueAvailable ? "continue" : undefined,
+    rateLimitMessage ? "rate_limited" : undefined,
     errorText ? `error:${errorText.slice(0, 160)}` : undefined,
     `snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`
   ].filter(Boolean);
@@ -34491,9 +34503,27 @@ ${proofMatch?.[0].trim() ?? ""}`);
     visibleToolCards,
     retryAvailable,
     continueAvailable,
+    rateLimited: Boolean(rateLimitMessage),
+    rateLimitMessage,
     errorMessage: errorText,
     stateSummary: states.join(",")
   };
+}
+async function dismissChatGptRateLimitNotice(exec, launcher, tabId, signal, expectedTarget) {
+  const initial = findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal));
+  if (!initial)
+    return;
+  if (!initial.dismissSelector) {
+    throw new ChatGptRateLimitError(`${initial.message} The notice has no safe dismiss control.`);
+  }
+  await pickerAction(exec, launcher, "click", tabId, initial.dismissSelector, signal, expectedTarget);
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(pollIntervalMs(), 200));
+    if (!findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal)))
+      return initial.message;
+  }
+  throw new ChatGptRateLimitError(`${initial.message} The notice remained visible after dismissal.`);
 }
 async function readPageHtml(exec, launcher, tabId, signal) {
   const directory = join2(tmpdir2(), `gpt-control-html-${randomUUID2()}`);
@@ -34583,17 +34613,21 @@ function providerConversationIdentity(raw) {
   }
   if (url2.origin !== CHATGPT_ORIGIN)
     return;
-  const match = /^\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url2.pathname);
-  if (!match)
+  const direct = /^\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url2.pathname);
+  const project = /^\/g\/[A-Za-z0-9_-]+\/c\/([A-Za-z0-9_-]+)\/?$/.exec(url2.pathname);
+  const id = direct?.[1] ?? project?.[1];
+  if (!id)
     return;
-  return { id: match[1], url: `${url2.origin}/c/${match[1]}` };
+  return { id, url: `${url2.origin}/c/${id}` };
 }
 async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget) {
   let html = await readPageHtml(exec, launcher, tabId, signal);
+  throwIfRateLimited(html);
   let composer = extractComposerModel(html);
   while (!composer && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs(), 200));
     html = await readPageHtml(exec, launcher, tabId, signal);
+    throwIfRateLimited(html);
     composer = extractComposerModel(html);
   }
   if (!composer)
@@ -34604,6 +34638,7 @@ async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expec
   }
   for (;; ) {
     html = await readPageHtml(exec, launcher, tabId, signal);
+    throwIfRateLimited(html);
     state = extractAdvancedPickerState(html, composer.selector);
     if (state?.modelSelector || state?.effortSelector)
       return state;
@@ -34616,6 +34651,31 @@ async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expec
     await sleep(Math.min(pollIntervalMs(), 200));
   }
   throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
+}
+function throwIfRateLimited(html) {
+  const notice = findRateLimitNotice(html);
+  if (notice)
+    throw new ChatGptRateLimitError(notice.message);
+}
+function findRateLimitNotice(html) {
+  const root = parse6(html);
+  const candidates = uniqueElements([
+    ...root.querySelectorAll('[role="dialog"]'),
+    ...root.querySelectorAll('[role="alert"]'),
+    ...root.querySelectorAll('[role="status"]'),
+    ...root.querySelectorAll('[aria-live="assertive"]')
+  ]);
+  const notice = candidates.find((node) => isRateLimitText(nodeLabel(node)));
+  if (!notice)
+    return;
+  const dismiss = notice.querySelectorAll('button, [role="button"]').find((node) => /^(?:got it|dismiss|close)$/i.test(nodeLabel(node)));
+  return {
+    message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500),
+    dismissSelector: dismiss ? exactNodeSelector(dismiss) : undefined
+  };
+}
+function isRateLimitText(text) {
+  return /too many requests|rate limit(?:ed| reached)?|try again later|temporarily restricted/i.test(text);
 }
 async function openPickerOptions(exec, launcher, tabId, selector, deadline, signal, expectedTarget) {
   await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
@@ -35071,6 +35131,34 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
       }
     }
     let observation = await driver.observe(session, options.signal);
+    if (observation.rateLimited) {
+      const message = observation.rateLimitMessage ?? "ChatGPT reported too many requests.";
+      await options.onRateLimit?.(message);
+      if (!driver.dismissRateLimitNotice) {
+        return needsUser(`ChatGPT is temporarily rate limited and this browser driver cannot dismiss the notice safely: ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
+      }
+      try {
+        await driver.dismissRateLimitNotice(session, options.signal);
+        recoveryAttempts.push({
+          at: nowIso(),
+          action: "dismiss_rate_limit",
+          reason: message,
+          outcome: "recovered"
+        });
+      } catch (error51) {
+        recoveryAttempts.push({
+          at: nowIso(),
+          action: "dismiss_rate_limit",
+          reason: message,
+          outcome: "failed",
+          detail: errorMessage(error51)
+        });
+        return needsUser(`ChatGPT rate-limit notice could not be dismissed safely: ${errorMessage(error51)}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
+      }
+      previous = undefined;
+      steady = 0;
+      continue;
+    }
     let providerTurnIdentityPending = false;
     lastObservedUiState = observation.stateSummary;
     if (observation.snapshot.count > options.baselineCount)
@@ -35254,9 +35342,11 @@ function needsUser(reason, snapshot, providerConversationId, providerConversatio
   };
 }
 function requiresRecovery(observation) {
-  return Boolean(observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+  return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 function exactNeedsUserReason(observation, prefix) {
+  if (observation.rateLimitMessage)
+    return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
   if (observation.errorMessage)
     return `${prefix}: ${observation.errorMessage}`;
   if (observation.continueAvailable)
@@ -35389,6 +35479,10 @@ class ChromeBridgeBrowserDriver {
   async observe(session, signal) {
     return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
+  async dismissRateLimitNotice(session, signal) {
+    await this.assertActionTarget(session, signal);
+    return dismissChatGptRateLimitNotice(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
+  }
   async recover(session, action, signal) {
     await this.assertActionTarget(session, signal);
     const pageId = numericPageId(session.pageId);
@@ -35448,6 +35542,8 @@ var ObservationSchema = exports_external.object({
   }).strict()).default([]),
   retryAvailable: exports_external.boolean(),
   continueAvailable: exports_external.boolean(),
+  rateLimited: exports_external.boolean().default(false),
+  rateLimitMessage: exports_external.string().optional(),
   errorMessage: exports_external.string().optional(),
   stateSummary: exports_external.string()
 }).strict();
@@ -35795,7 +35891,7 @@ var McpSessionIdSchema = exports_external.string().min(1).max(512);
 var RunStatusSchema = exports_external.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 var RecoverySchema = exports_external.object({
   at: exports_external.string(),
-  action: exports_external.enum(["reobserve", "reload", "restore_conversation_url", "retry", "continue", "stop"]),
+  action: exports_external.enum(["reobserve", "reload", "restore_conversation_url", "dismiss_rate_limit", "retry", "continue", "stop"]),
   reason: exports_external.string(),
   outcome: exports_external.enum(["recovered", "still_active", "failed", "not_applicable"]),
   detail: exports_external.string().optional()
@@ -35918,7 +36014,11 @@ var RunSchema = exports_external.object({
     localAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
     lastObservedUrl: exports_external.string().optional(),
     lastObservedUiState: exports_external.string().optional(),
-    organizationWarnings: exports_external.array(exports_external.string()).optional()
+    organizationWarnings: exports_external.array(exports_external.string()).optional(),
+    rateLimitEvents: exports_external.number().int().nonnegative().optional(),
+    lastRateLimitAt: exports_external.string().optional(),
+    providerCooldownUntil: exports_external.string().optional(),
+    providerConcurrencyLimit: exports_external.number().int().positive().max(10).optional()
   }).optional(),
   receipt: ReceiptSchema,
   error: exports_external.string().optional(),
@@ -35943,6 +36043,17 @@ var IdempotencyRecordSchema = exports_external.object({
   runId: exports_external.string().regex(RUN_ID_PATTERN),
   conversationId: exports_external.string().regex(CONVERSATION_ID_PATTERN),
   createdAt: exports_external.string()
+});
+var ProviderThrottleSchema = exports_external.object({
+  version: exports_external.literal(1),
+  reason: exports_external.literal("chatgpt_rate_limit"),
+  firstSeenAt: exports_external.string(),
+  lastSeenAt: exports_external.string(),
+  nextRetryAt: exports_external.string(),
+  consecutiveEvents: exports_external.number().int().positive(),
+  activeLimit: exports_external.number().int().positive().max(10),
+  recoverySuccesses: exports_external.number().int().nonnegative(),
+  messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
 });
 var TERMINAL = new Set(["completed", "failed", "cancelled", "needs_user"]);
 var TRANSITIONS = {
@@ -36052,6 +36163,9 @@ class RunStore {
     if (!/^[a-f0-9]{64}$/.test(keyHash))
       throw new Error("Invalid idempotency key hash.");
     return confinedPath(this.root, "idempotency", `${keyHash}.json`);
+  }
+  providerThrottlePath() {
+    return confinedPath(this.root, "provider-throttle.json");
   }
   async init() {
     if (!this.legacyStateChecked) {
@@ -36319,6 +36433,75 @@ class RunStore {
       return;
     }
     await atomicWrite(this.idempotencyPath(record3.keyHash), record3);
+  }
+  async getProviderThrottle() {
+    await this.init();
+    try {
+      return ProviderThrottleSchema.parse(JSON.parse(await safeRead(this.providerThrottlePath())));
+    } catch (error51) {
+      if (isMissing(error51))
+        return;
+      throw error51;
+    }
+  }
+  async noteProviderRateLimit(options) {
+    return this.withNamedLock("provider-throttle", async () => {
+      const current = await this.getProviderThrottle();
+      const now = Date.now();
+      const timestamp = new Date(now).toISOString();
+      const consecutiveEvents = (current?.consecutiveEvents ?? 0) + 1;
+      const delayMs = Math.min(options.maxDelayMs, options.baseDelayMs * 2 ** Math.min(consecutiveEvents - 1, 16));
+      const firstLimit = Math.max(1, Math.floor(options.maxConcurrentWorkers / 2));
+      const activeLimit = current ? Math.max(1, Math.min(options.maxConcurrentWorkers, current.activeLimit - 1)) : firstLimit;
+      const next = {
+        version: 1,
+        reason: "chatgpt_rate_limit",
+        firstSeenAt: current?.firstSeenAt ?? timestamp,
+        lastSeenAt: timestamp,
+        nextRetryAt: new Date(now + delayMs).toISOString(),
+        consecutiveEvents,
+        activeLimit,
+        recoverySuccesses: 0,
+        messageSha256: createHash3("sha256").update(options.message, "utf8").digest("hex")
+      };
+      ProviderThrottleSchema.parse(next);
+      await atomicWrite(this.providerThrottlePath(), next);
+      return next;
+    }, { timeoutMs: 30000 });
+  }
+  async noteProviderSuccess(maxConcurrentWorkers) {
+    return this.withNamedLock("provider-throttle", async () => {
+      const current = await this.getProviderThrottle();
+      if (!current || Date.now() < Date.parse(current.nextRetryAt))
+        return current;
+      if (current.activeLimit >= maxConcurrentWorkers) {
+        try {
+          await unlink(this.providerThrottlePath());
+        } catch (error51) {
+          if (!isMissing(error51))
+            throw error51;
+        }
+        return;
+      }
+      const activeLimit = Math.min(maxConcurrentWorkers, current.activeLimit + 1);
+      if (activeLimit >= maxConcurrentWorkers) {
+        try {
+          await unlink(this.providerThrottlePath());
+        } catch (error51) {
+          if (!isMissing(error51))
+            throw error51;
+        }
+        return;
+      }
+      const next = {
+        ...current,
+        activeLimit,
+        recoverySuccesses: current.recoverySuccesses + 1
+      };
+      ProviderThrottleSchema.parse(next);
+      await atomicWrite(this.providerThrottlePath(), next);
+      return next;
+    }, { timeoutMs: 30000 });
   }
   async withIdempotencyLock(key, work) {
     return this.withIdempotencyHashLock(idempotencyKeyHash(key), work);
@@ -36791,6 +36974,8 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
   if (abandonmentToken !== undefined && abandonmentToken.length < 32) {
     throw new Error("GPT_CONTROL_PROVIDER_ABANDON_TOKEN must contain at least 32 characters.");
   }
+  const rateLimitBaseDelayMs = boundedInteger(overrides.rateLimitBaseDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS) ?? 30000, 1, 10 * 60000, "rateLimitBaseDelayMs");
+  const rateLimitMaxDelayMs = boundedInteger(overrides.rateLimitMaxDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS) ?? 5 * 60000, rateLimitBaseDelayMs, 30 * 60000, "rateLimitMaxDelayMs");
   const value = {
     workspaceRoot,
     storageRoot: storageRoot2,
@@ -36805,6 +36990,8 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
     maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 6, 1, 10, "maxConcurrentWorkers"),
+    rateLimitBaseDelayMs,
+    rateLimitMaxDelayMs,
     allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
     providerTurnAbandonmentTokenHash: abandonmentToken ? createHash5("sha256").update(abandonmentToken).digest("hex") : undefined
   };
@@ -37683,9 +37870,25 @@ class GptControlService {
       const current = await this.store.getRun(runId);
       if (TERMINAL2.has(current.status))
         return false;
+      const throttle = await this.store.getProviderThrottle();
+      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
+      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
+        const deadline2 = Date.parse(current.deadlineAt ?? "");
+        if (Number.isFinite(deadline2) && cooldownUntil >= deadline2) {
+          await this.store.updateRun(runId, {
+            status: "needs_user",
+            completedAt: nowIso(),
+            error: "ChatGPT rate-limit cooldown extends beyond this GPT Worker's bounded deadline. The assignment was not sent."
+          });
+          return false;
+        }
+        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
+        continue;
+      }
+      const effectiveLimit = Math.min(this.policy.maxConcurrentWorkers, throttle?.activeLimit ?? this.policy.maxConcurrentWorkers);
       const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
       const position = contenders.findIndex((run) => run.id === runId);
-      if (position >= 0 && position < this.policy.maxConcurrentWorkers)
+      if (position >= 0 && position < effectiveLimit)
         return true;
       const deadline = Date.parse(current.deadlineAt ?? "");
       if (Number.isFinite(deadline) && Date.now() >= deadline) {
@@ -37698,6 +37901,61 @@ class GptControlService {
       }
       await abortableSleep2(100, signal);
     }
+  }
+  async withProviderRateLimitRecovery(driver, expected, initialRun, signal, action) {
+    let run = initialRun;
+    for (;; ) {
+      const deadline = Date.parse(run.deadlineAt ?? "");
+      if (Number.isFinite(deadline) && Date.now() >= deadline) {
+        throw new Error("ChatGPT remained rate limited until the GPT Worker deadline. The assignment was not sent again.");
+      }
+      const throttle = await this.store.getProviderThrottle();
+      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
+      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
+        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
+        continue;
+      }
+      const session = await assertExactDriverSession(driver, expected, signal);
+      const observation = await driver.observe(session, signal);
+      if (observation.rateLimited) {
+        run = await this.handleProviderRateLimit(driver, session, run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.", signal);
+        continue;
+      }
+      try {
+        return { run, session, value: await action(session) };
+      } catch (error51) {
+        if (!(error51 instanceof ChatGptRateLimitError))
+          throw error51;
+        run = await this.handleProviderRateLimit(driver, session, run, error51.notice, signal);
+      }
+    }
+  }
+  async handleProviderRateLimit(driver, session, run, message, signal) {
+    const updated = await this.recordProviderRateLimit(run, message);
+    if (!driver.dismissRateLimitNotice) {
+      throw new Error(`ChatGPT is temporarily rate limited and the active browser driver cannot dismiss its notice safely: ${message}`);
+    }
+    await driver.dismissRateLimitNotice(session, signal);
+    return updated;
+  }
+  async recordProviderRateLimit(run, message) {
+    const throttle = await this.store.noteProviderRateLimit({
+      maxConcurrentWorkers: this.policy.maxConcurrentWorkers,
+      baseDelayMs: this.policy.rateLimitBaseDelayMs,
+      maxDelayMs: this.policy.rateLimitMaxDelayMs,
+      message
+    });
+    const current = await this.store.getRun(run.id);
+    const updated = await this.store.updateRun(run.id, {
+      diagnostics: {
+        ...current.diagnostics ?? {},
+        rateLimitEvents: (current.diagnostics?.rateLimitEvents ?? 0) + 1,
+        lastRateLimitAt: throttle.lastSeenAt,
+        providerCooldownUntil: throttle.nextRetryAt,
+        providerConcurrencyLimit: throttle.activeLimit
+      }
+    });
+    return updated;
   }
   async executeRun(runId, signal, recovery) {
     let run = await this.store.getRun(runId);
@@ -37748,6 +38006,7 @@ class GptControlService {
         result: report,
         artifactUrls: result.imageUrls,
         diagnostics: {
+          ...run.diagnostics ?? {},
           recoveryAttempts: result.recoveryAttempts,
           localAssistantTurnCount: result.localAssistantTurnCount,
           lastObservedUrl: result.lastObservedUrl,
@@ -37772,6 +38031,7 @@ class GptControlService {
           completedAt
         }
       });
+      await this.store.noteProviderSuccess(this.policy.maxConcurrentWorkers);
       return run;
     } catch (error51) {
       resetCapabilityCache();
@@ -37885,7 +38145,10 @@ class GptControlService {
       baselineCount = ready.observation.snapshot.count;
       const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
       const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro" ? { ...requestedModel !== "pro" ? { model: requestedModel } : {}, ...request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {} } : requestedModel;
-      const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+      const selection = await this.withProviderRateLimitRecovery(driver, expected, run, signal, (session) => run.connectorPreflight?.status === "passed" ? driver.verifyModel(session, requestedSelection, signal) : driver.selectModel(session, requestedSelection, signal));
+      run = selection.run;
+      const activeSession = selection.session;
+      const selected = selection.value;
       observedModel = selected.observedModel;
       observedEffort = selected.observedEffort;
       modelVerified = true;
@@ -37905,9 +38168,11 @@ class GptControlService {
           modelVerifiedAt
         }
       });
-      await driver.upload(ready.session, run.attachmentManifest.files.map((file2) => file2.path), signal);
-      await driver.fill(ready.session, request.prompt, signal);
-      const verified = await driver.verifyModel(ready.session, requestedSelection, signal);
+      await driver.upload(activeSession, run.attachmentManifest.files.map((file2) => file2.path), signal);
+      await driver.fill(activeSession, request.prompt, signal);
+      const verification = await this.withProviderRateLimitRecovery(driver, expected, run, signal, (session) => driver.verifyModel(session, requestedSelection, signal));
+      run = verification.run;
+      const verified = verification.value;
       observedModel = verified.observedModel;
       observedEffort = verified.observedEffort;
       modelVerifiedAt = verified.modelVerifiedAt;
@@ -37937,8 +38202,8 @@ class GptControlService {
         await this.store.clearProviderTurnState(run.id);
         throw new Error("Run became terminal before the browser send boundary.");
       }
-      const preSendObservation = await driver.observe(ready.session, signal);
-      await driver.send(ready.session, signal);
+      const preSendObservation = await driver.observe(verification.session, signal);
+      await driver.send(verification.session, signal);
       const identityStartedAt = Date.now();
       const runDeadline = Date.parse(run.deadlineAt ?? "");
       const identityDeadline = Math.min(identityStartedAt + 15000, Math.max(identityStartedAt + 1000, Number.isFinite(runDeadline) ? runDeadline : identityStartedAt + 15000));
@@ -38083,6 +38348,9 @@ class GptControlService {
         run = persisted.run;
         conversation = persisted.conversation;
         return "approved";
+      },
+      onRateLimit: async (message) => {
+        run = await this.recordProviderRateLimit(run, message);
       }
     });
     if (outcome.terminalStatus === "needs_user") {
@@ -38158,7 +38426,10 @@ class GptControlService {
       const baseline = ready.observation.snapshot.count;
       const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
       const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro" ? { ...requestedModel !== "pro" ? { model: requestedModel } : {}, ...request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {} } : requestedModel;
-      const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+      const selection = await this.withProviderRateLimitRecovery(driver, expected, run, signal, (session) => driver.selectModel(session, requestedSelection, signal));
+      run = selection.run;
+      const activeSession = selection.session;
+      const selected = selection.value;
       run = await this.store.updateRun(run.id, {
         receipt: {
           ...run.receipt,
@@ -38173,14 +38444,15 @@ class GptControlService {
         }
       });
       const prompt = connectorPreflightPrompt(intent.names);
-      await driver.fill(ready.session, prompt, signal);
-      await driver.verifyModel(ready.session, requestedSelection, signal);
+      await driver.fill(activeSession, prompt, signal);
+      const verification = await this.withProviderRateLimitRecovery(driver, expected, run, signal, (session) => driver.verifyModel(session, requestedSelection, signal));
+      run = verification.run;
       run = await this.store.updateRun(run.id, {
         providerTurnPending: true,
         connectorPreflight: { status: "submitting", baselineMessageCount: baseline }
       });
-      const beforeSend = await driver.observe(ready.session, signal);
-      await driver.send(ready.session, signal);
+      const beforeSend = await driver.observe(verification.session, signal);
+      await driver.send(verification.session, signal);
       const deadline = Date.now() + Math.min(15000, request.timeoutMs);
       let bound = false;
       while (Date.now() < deadline) {
@@ -38235,6 +38507,9 @@ class GptControlService {
         if (!observation.latestUserMessageId)
           return "unavailable";
         return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+      },
+      onRateLimit: async (message) => {
+        run = await this.recordProviderRateLimit(run, message);
       }
     });
     if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
@@ -38830,7 +39105,7 @@ function attachedConversationIdentity(request) {
     throw new Error("Invalid ChatGPT conversation URL.");
   }
   if (!identity || parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> conversation without query or fragment data.");
+    throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> or https://chatgpt.com/g/<project>/c/<id> conversation without query or fragment data.");
   }
   if (identity.id.length > 256)
     throw new Error("ChatGPT provider conversation id is too long.");
@@ -38878,6 +39153,7 @@ import { createHash as createHash7, randomUUID as randomUUID5 } from "node:crypt
 import { lstat as lstat3, open as open4, readdir as readdir2, rename as rename2 } from "node:fs/promises";
 import { dirname as dirname4, resolve as resolve7 } from "node:path";
 var TERMINAL3 = new Set(["completed", "failed", "cancelled"]);
+var MAX_CODEX_CALLBACK_ATTEMPTS = 3;
 var TRANSITIONS2 = {
   working: new Set(["working", "input_required", "completed", "failed", "cancelled"]),
   input_required: new Set(["input_required", "failed", "cancelled"]),
@@ -39142,6 +39418,17 @@ class DurableTaskStore {
         pending += 1;
         continue;
       }
+      if ((record3.parentCallback.state === "attempted" || record3.parentCallback.state === "failed") && (record3.parentCallback.attemptCount ?? 0) < MAX_CODEX_CALLBACK_ATTEMPTS) {
+        await this.mutate(taskId, (current) => {
+          const callback = current.parentCallback;
+          if (!callback || callback.threadId !== threadId || callback.state !== "attempted" && callback.state !== "failed" || (callback.attemptCount ?? 0) >= MAX_CODEX_CALLBACK_ATTEMPTS)
+            return current;
+          current.parentCallback = { ...callback, state: "pending", pendingAt: nowIso() };
+          return current;
+        });
+        pending += 1;
+        continue;
+      }
       if (record3.parentCallback.state !== "waiting" || !TERMINAL3.has(record3.task.status))
         continue;
       let status = callbackStatus(record3.task.status, record3.runId);
@@ -39169,7 +39456,12 @@ class DurableTaskStore {
           if (callback?.threadId !== threadId || callback.state !== "pending" || !callback.terminalStatus)
             return record3;
           claimed = { taskId, threadId, runId: callback.runId, status: callback.terminalStatus };
-          record3.parentCallback = { ...callback, state: "attempted", attemptedAt: nowIso() };
+          record3.parentCallback = {
+            ...callback,
+            state: "attempted",
+            attemptedAt: nowIso(),
+            attemptCount: (callback.attemptCount ?? 0) + 1
+          };
           return record3;
         });
         if (claimed)
@@ -39357,6 +39649,9 @@ function validateCodexParentCallback(callback, taskId) {
   }
   if (callback.state !== "waiting" && !callback.terminalStatus) {
     throw new Error(`Codex callback ${taskId} is missing terminal status.`);
+  }
+  if (callback.attemptCount !== undefined && (!Number.isInteger(callback.attemptCount) || callback.attemptCount < 0 || callback.attemptCount > MAX_CODEX_CALLBACK_ATTEMPTS)) {
+    throw new Error(`Codex callback ${taskId} has an invalid attempt count.`);
   }
 }
 function assertCodexThreadId(threadId) {
@@ -39567,7 +39862,7 @@ class CodexCallbackCoordinator {
   schedule(threadId) {
     this.pendingThreadIds.add(threadId);
     if (this.timer)
-      return;
+      clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = undefined;
       this.flush().catch((error51) => {
@@ -39604,13 +39899,27 @@ class CodexCallbackCoordinator {
       const detail2 = callbackErrorDetail(errorMessage3(error51));
       await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), false, detail2);
       console.error(`GPT-Control could not queue a parent completion receipt: ${detail2}`);
+      this.scheduleRetry(threadId);
       return;
     }
     const delivered = result.code === 0 && !result.killed;
     const detail = delivered ? undefined : callbackErrorDetail(result.stderr || `exit ${result.code}`);
     await this.taskStore.finishCodexCallbacks(receipts.map((receipt) => receipt.taskId), delivered, detail);
-    if (!delivered)
+    if (!delivered) {
       console.error(`GPT-Control could not queue a parent completion receipt: ${detail}`);
+      this.scheduleRetry(threadId);
+    }
+  }
+  scheduleRetry(threadId) {
+    const timer = setTimeout(() => {
+      this.taskStore.reconcileCodexCallbacks(threadId).then((pending) => {
+        if (pending > 0)
+          this.schedule(threadId);
+      }).catch((error51) => {
+        console.error(`GPT-Control could not retry a parent callback: ${callbackErrorDetail(errorMessage3(error51))}`);
+      });
+    }, Math.max(1, this.options.retryDelayMs ?? 1000));
+    timer.unref?.();
   }
 }
 function createMcpServer(serviceOrOptions = {}) {
