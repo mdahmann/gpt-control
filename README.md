@@ -2,7 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.4 adds durable model and project catalogs so ordinary catalog reads do not
+0.5.0-alpha.1 adds an opt-in experimental protocol-v2 driver for the signed
+macOS ChatGPT desktop app. Chrome Bridge remains the default. Version 0.4.4
+added durable model and project catalogs so ordinary catalog reads do not
 open Chrome. Version 0.4.3 added shared rate-limit cooldown, ChatGPT
 project-conversation recovery, and bounded Codex callback retry. Version 0.4.2 added immediate-return single
 and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
@@ -52,6 +54,13 @@ Set `GPT_CONTROL_BROWSER_DRIVER` to an external protocol-v2 command. When that
 is absent, GPT-Control may use an installed Chrome Bridge adapter, but only when
 its private request-file RPC is available. Prompt text and snapshot paths are
 never passed through child-process argv.
+
+The experimental desktop driver is documented in
+[`docs/CHATGPT_DESKTOP_CDP.md`](docs/CHATGPT_DESKTOP_CDP.md). It is not enabled
+unless the operator explicitly configures `GPT_CONTROL_BROWSER_DRIVER`. A
+read-only signed-app diagnostic has passed on macOS. Signed-in message sends,
+model selection, uploads, recovery, and concurrent renderer isolation remain
+release gates for this alpha.
 
 ## Tools
 

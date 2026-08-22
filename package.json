@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.4.4",
+  "version": "0.5.0-alpha.1",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents",
   "type": "module",
   "license": "MIT",
@@ -48,8 +48,10 @@
     "test": "bun test",
     "mcp": "node ./dist/gpt-control-mcp.js",
     "verify:security": "bash scripts/verify-security.sh",
-    "prepack": "bun run build:mcp && bun run check && bun test && bash scripts/verify-security.sh",
-    "build:mcp": "bun build src/mcp.ts --target=node --outfile=dist/gpt-control-mcp.js"
+    "prepack": "bun run build && bun run check && bun test && bash scripts/verify-security.sh",
+    "build": "bun run build:mcp && bun run build:desktop-driver",
+    "build:mcp": "bun build src/mcp.ts --target=node --outfile=dist/gpt-control-mcp.js",
+    "build:desktop-driver": "bun build src/desktop-driver-cli.ts --target=node --minify-whitespace --outfile=dist/gpt-control-desktop-driver.js"
   },
   "omp": {
     "extensions": [

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0-alpha.1] - 2026-08-22
+
+- Added an opt-in protocol-v2 adapter for the signed macOS ChatGPT desktop app
+  through an explicit loopback-only Electron CDP endpoint.
+- Added official bundle and Team ID checks, exact listener-process checks,
+  durable renderer ownership, exact-conversation restart rebinding, and
+  fail-closed renderer capacity handling.
+- Kept prompt text on private stdin and out of durable state. The adapter
+  records only a prompt hash and persists `sendState=attempted` before Send so
+  an ambiguous click cannot be replayed automatically.
+- Added read-only diagnostics and separately authorized live smoke tests for
+  one, two, three, and six distinct renderer identities.
+- Kept Chrome Bridge as the default. This desktop route remains experimental
+  until signed-in macOS acceptance is complete.
+
 ## [0.4.4] - 2026-08-22
 
 - Changed ordinary `gpt_models` and `gpt_projects` calls to read durable cache

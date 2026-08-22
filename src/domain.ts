@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.4.4";
+export const PACKAGE_VERSION = "0.5.0-alpha.1";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";

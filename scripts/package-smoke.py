@@ -17,7 +17,7 @@ def main() -> int:
     if not isinstance(payload, list) or len(payload) != 1:
         raise SystemExit(f"unexpected npm pack payload: {payload!r}")
     package = payload[0]
-    if package.get("filename") != "gpt-control-0.4.4.tgz":
+    if package.get("filename") != "gpt-control-0.5.0-alpha.1.tgz":
         raise SystemExit(f"unexpected package filename: {package.get('filename')}")
     paths = {entry["path"] for entry in package.get("files", [])}
     required = {
@@ -25,10 +25,17 @@ def main() -> int:
         ".mcp.json",
         "THIRD_PARTY_NOTICES.md",
         "bin/gpt-control-mcp",
+		"bin/gpt-control-desktop-driver",
+		"dist/gpt-control-desktop-driver.js",
         "dist/gpt-control-mcp.js",
+		"docs/CHATGPT_DESKTOP_CDP.md",
+		"scripts/desktop-cdp-live-smoke.mjs",
         "scripts/mcp-stdio-smoke.py",
         "scripts/verify-security.sh",
         "src/mcp.ts",
+		"src/desktop-cdp-macos.ts",
+		"src/desktop-driver-cli.ts",
+		"src/desktop-driver.ts",
     }
     missing = required - paths
     if missing:

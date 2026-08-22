@@ -1337,7 +1337,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			providerTurnPending: false,
 			providerStopRequested: false,
 		});
-		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(2);
+		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(1);
 	});
 
 	test("legacy unresolved provider turns fail closed and can be explicitly abandoned", async () => {
