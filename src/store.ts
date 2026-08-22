@@ -18,6 +18,7 @@ import {
 } from "./domain";
 
 const ProviderSchema = z.literal("browser");
+const McpSessionIdSchema = z.string().min(1).max(512);
 const RunStatusSchema = z.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 const RecoverySchema = z.object({
 	at: z.string(),
@@ -79,6 +80,7 @@ const ConversationSchema = z.object({
 	browserAssistantTurnCount: z.number().int().nonnegative().optional(),
 	workspaceRoot: z.string(),
 	policyFingerprint: z.string().optional(),
+	mcpSessionId: McpSessionIdSchema.optional(),
 	createdAt: z.string(),
 	updatedAt: z.string(),
 	closedAt: z.string().optional(),
@@ -385,6 +387,23 @@ export class RunStore {
 			const next = { ...current, mcpTaskId: taskId, id, updatedAt: nowIso() };
 			RunSchema.parse(next);
 			await atomicWrite(this.runPath(id), next);
+			return next;
+		}, { timeoutMs: 10_000 });
+	}
+
+	async claimConversationMcpSession(id: string, sessionId: string, allowTransfer = false): Promise<ConversationRecord> {
+		assertConversationId(id);
+		McpSessionIdSchema.parse(sessionId);
+		await this.init();
+		return this.withNamedLock(`record-${id}`, async () => {
+			const current = ConversationSchema.parse(JSON.parse(await safeRead(this.conversationPath(id)))) as ConversationRecord;
+			if (current.mcpSessionId && current.mcpSessionId !== sessionId && !allowTransfer) {
+				throw new Error("This durable conversation is already claimed by another MCP session.");
+			}
+			if (current.mcpSessionId === sessionId) return current;
+			const next = { ...current, mcpSessionId: sessionId, id, updatedAt: nowIso() };
+			ConversationSchema.parse(next);
+			await atomicWrite(this.conversationPath(id), next);
 			return next;
 		}, { timeoutMs: 10_000 });
 	}

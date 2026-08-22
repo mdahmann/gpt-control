@@ -10,7 +10,7 @@ import { operatorPolicyFromEnv } from "./src/policy";
 import { secureDirectory } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
 import type { ExtensionAPI, SchemaNode, ToolDefinition, TypeBuilder } from "./src/types";
-import { FakeChromeBridge, makeChromeService } from "./test_helpers";
+import { FakeChromeBridge, makeChromeService, TEST_OPERATOR_ABANDON_TOKEN } from "./test_helpers";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -96,8 +96,10 @@ describe("public extension contract", () => {
 describe("MCP plugin contract", () => {
 	test("advertises optional task execution and omits authority-expanding schemas", async () => {
 		const pluginMcp = JSON.parse(readFileSync(join(import.meta.dir, ".mcp.json"), "utf8")) as {
-			mcpServers: { "gpt-control": { env_vars: string[] } };
+			mcpServers: { "gpt-control": { command: string; args: string[]; env_vars: string[] } };
 		};
+		expect(pluginMcp.mcpServers["gpt-control"].command).toBe("node");
+		expect(pluginMcp.mcpServers["gpt-control"].args).toEqual(["./dist/gpt-control-mcp.js"]);
 		expect(pluginMcp.mcpServers["gpt-control"].env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
 		const root = scratch();
 		const { service } = makeChromeService(join(root, "state"), join(root, "workspace"), new FakeChromeBridge());
@@ -122,9 +124,131 @@ describe("MCP plugin contract", () => {
 			}
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_image");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_abandon_pending");
+			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_claim");
 		} finally {
 			await client.close();
 			await server.close();
 		}
 	});
+
+	test("confines ordinary runs and conversations to their durable MCP session", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const { service } = makeChromeService(join(root, "state"), workspace, new FakeChromeBridge());
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const serverA = createMcpServer({ service, taskStore, recover: false });
+		const serverB = createMcpServer({ service, taskStore, recover: false });
+		const serverFallback = createMcpServer({ service, taskStore, recover: false, taskSupport: false });
+		const clientA = new Client({ name: "session-a", version: "1" }, {});
+		const clientB = new Client({ name: "session-b", version: "1" }, {});
+		const clientFallback = new Client({ name: "fallback-session", version: "1" }, {});
+		const [clientTransportA, serverTransportA] = InMemoryTransport.createLinkedPair();
+		const [clientTransportB, serverTransportB] = InMemoryTransport.createLinkedPair();
+		const [clientTransportFallback, serverTransportFallback] = InMemoryTransport.createLinkedPair();
+		serverTransportA.sessionId = "mcp-session-a";
+		serverTransportB.sessionId = "mcp-session-b";
+		serverTransportFallback.sessionId = "mcp-session-fallback";
+		await Promise.all([
+			serverA.connect(serverTransportA), clientA.connect(clientTransportA),
+			serverB.connect(serverTransportB), clientB.connect(clientTransportB),
+			serverFallback.connect(serverTransportFallback), clientFallback.connect(clientTransportFallback),
+		]);
+		try {
+			const started = await clientA.callTool({
+				name: "gpt_chat",
+				arguments: { prompt: "session-owned ordinary run", idempotency_key: "ordinary-session-owner", wait: false, timeout_ms: 1000 },
+			});
+			const content = started.structuredContent as { conversationId: string; run: { runId: string } };
+			const runId = content.run.runId;
+			const conversationId = content.conversationId;
+			expect((await service.store.getConversation(conversationId)).mcpSessionId).toBe("mcp-session-a");
+
+			const ownerRead = await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: runId } });
+			expect((ownerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(runId);
+			const foreignRead = await clientB.callTool({ name: "gpt_run", arguments: { action: "status", run_id: runId } });
+			expect(foreignRead.isError).toBe(true);
+			const foreignCancel = await clientB.callTool({ name: "gpt_run_cancel", arguments: { run_id: runId } });
+			expect(foreignCancel.isError).toBe(true);
+			const foreignFollowUp = await clientB.callTool({
+				name: "gpt_chat",
+				arguments: { prompt: "must not continue foreign conversation", conversation_id: conversationId, wait: false },
+			});
+			expect(foreignFollowUp.isError).toBe(true);
+			const foreignIdempotentStart = await clientB.callTool({
+				name: "gpt_chat",
+				arguments: { prompt: "session-owned ordinary run", idempotency_key: "ordinary-session-owner", wait: false, timeout_ms: 1000 },
+			});
+			expect(foreignIdempotentStart.isError).toBe(true);
+
+			const legacy = await service.start({
+				kind: "subagent",
+				prompt: "legacy task-owned run",
+				idempotencyKey: "legacy-task-owner",
+				wait: false,
+			}, { deferExecution: true });
+			const legacyTask = await taskStore.createTask(
+				{ ttl: 60_000 },
+				2,
+				{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+				"mcp-session-a",
+			);
+			await taskStore.bindRun(legacyTask.taskId, legacy.run.id);
+			const legacyOwnerRead = await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacy.run.id } });
+			expect(legacyOwnerRead.isError).not.toBe(true);
+			const legacyForeignRead = await clientB.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacy.run.id } });
+			expect(legacyForeignRead.isError).toBe(true);
+			const transferredTaskRun = await clientB.callTool({
+				name: "gpt_run_claim",
+				arguments: { run_id: legacy.run.id, confirmation: `CLAIM ${legacy.run.id}`, operator_token: TEST_OPERATOR_ABANDON_TOKEN },
+			});
+			expect(transferredTaskRun.isError).not.toBe(true);
+			expect(await taskStore.getTask(legacyTask.taskId, "mcp-session-a")).toBeNull();
+			expect((await taskStore.getTask(legacyTask.taskId, "mcp-session-b"))?.taskId).toBe(legacyTask.taskId);
+			expect((await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacy.run.id } })).isError).toBe(true);
+			expect((await clientB.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacy.run.id } })).isError).not.toBe(true);
+
+			const legacyOrdinary = await service.start({ kind: "chat", prompt: "legacy ordinary run", wait: false, timeoutMs: 1000 });
+			expect((await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacyOrdinary.run.id } })).isError).toBe(true);
+			const wrongClaim = await clientA.callTool({
+				name: "gpt_run_claim",
+				arguments: { run_id: legacyOrdinary.run.id, confirmation: `CLAIM ${legacyOrdinary.run.id}`, operator_token: "wrong-operator-token-000000000000000000" },
+			});
+			expect(wrongClaim.isError).toBe(true);
+			const claimed = await clientA.callTool({
+				name: "gpt_run_claim",
+				arguments: { run_id: legacyOrdinary.run.id, confirmation: `CLAIM ${legacyOrdinary.run.id}`, operator_token: TEST_OPERATOR_ABANDON_TOKEN },
+			});
+			expect(claimed.isError).not.toBe(true);
+			expect((await service.store.getConversation(legacyOrdinary.conversation.id)).mcpSessionId).toBe("mcp-session-a");
+			const claimedOwnerRead = await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacyOrdinary.run.id } });
+			expect((claimedOwnerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(legacyOrdinary.run.id);
+			expect((await clientB.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacyOrdinary.run.id } })).isError).toBe(true);
+			const transferredOrdinary = await clientB.callTool({
+				name: "gpt_run_claim",
+				arguments: { run_id: legacyOrdinary.run.id, confirmation: `CLAIM ${legacyOrdinary.run.id}`, operator_token: TEST_OPERATOR_ABANDON_TOKEN },
+			});
+			expect(transferredOrdinary.isError).not.toBe(true);
+			expect((await service.store.getConversation(legacyOrdinary.conversation.id)).mcpSessionId).toBe("mcp-session-b");
+			expect((await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacyOrdinary.run.id } })).isError).toBe(true);
+			const transferredOwnerRead = await clientB.callTool({ name: "gpt_run", arguments: { action: "status", run_id: legacyOrdinary.run.id } });
+			expect((transferredOwnerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(legacyOrdinary.run.id);
+
+			const fallbackStarted = await clientFallback.callTool({
+				name: "gpt_subagent_run",
+				arguments: { prompt: "taskless fallback owner", idempotency_key: "taskless-fallback-owner", timeout_ms: 1000 },
+			});
+			const fallbackRunId = ((fallbackStarted.structuredContent as { run?: { runId?: string } } | undefined)?.run?.runId)!;
+			expect(fallbackRunId).toMatch(/^run_/);
+			expect(await taskStore.findTaskIdByRun(fallbackRunId)).toBeUndefined();
+			const fallbackOwnerRead = await clientFallback.callTool({ name: "gpt_run", arguments: { action: "status", run_id: fallbackRunId } });
+			expect((fallbackOwnerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(fallbackRunId);
+			expect((await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: fallbackRunId } })).isError).toBe(true);
+		} finally {
+			await Promise.allSettled([
+				clientA.close(), clientB.close(), clientFallback.close(),
+				serverA.close(), serverB.close(), serverFallback.close(),
+			]);
+		}
+	}, 15_000);
 });

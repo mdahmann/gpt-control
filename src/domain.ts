@@ -119,6 +119,8 @@ export interface ConversationRecord {
 	browserAssistantTurnCount?: number;
 	workspaceRoot: string;
 	policyFingerprint?: string;
+	/** Durable owner for resources created through a multiplexed MCP session. */
+	mcpSessionId?: string;
 	createdAt: string;
 	updatedAt: string;
 	closedAt?: string;

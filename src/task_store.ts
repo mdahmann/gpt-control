@@ -16,6 +16,8 @@ const TRANSITIONS: Record<Task["status"], ReadonlySet<Task["status"]>> = {
 	cancelled: new Set(["cancelled"]),
 };
 
+class TaskSessionAccessDenied extends Error {}
+
 interface DurableTaskRecord {
 	task: Task;
 	requestId: RequestId;
@@ -89,9 +91,10 @@ export class DurableTaskStore implements TaskStore {
 	async getTask(taskId: string, sessionId?: string): Promise<Task | null> {
 		try {
 			const record = await this.readRecord(taskId);
-			return sessionCanAccess(record, sessionId) ? record.task : null;
+			return await this.withSessionAccess(record, sessionId, async () => record.task);
 		} catch (error) {
 			if (isMissing(error)) return null;
+			if (error instanceof TaskSessionAccessDenied) return null;
 			throw error;
 		}
 	}
@@ -124,11 +127,12 @@ export class DurableTaskStore implements TaskStore {
 
 	async getTaskResult(taskId: string, sessionId?: string): Promise<Result> {
 		const record = await this.readRecord(taskId);
-		assertSessionAccess(record, sessionId);
-		if (!TERMINAL.has(record.task.status) || record.result === undefined) {
-			throw new Error(`Task ${taskId} has no terminal result.`);
-		}
-		return record.result;
+		return this.withSessionAccess(record, sessionId, async () => {
+			if (!TERMINAL.has(record.task.status) || record.result === undefined) {
+				throw new Error(`Task ${taskId} has no terminal result.`);
+			}
+			return record.result;
+		});
 	}
 
 	async updateTaskStatus(
@@ -179,16 +183,24 @@ export class DurableTaskStore implements TaskStore {
 		let lastReturnedIndex = -1;
 		for (let index = start; index < names.length && tasks.length < 100; index += 1) {
 			const record = await this.readRecord(names[index].slice(0, -5));
-			if (!sessionCanAccess(record, sessionId)) continue;
-			tasks.push(record.task);
+			try {
+				await this.withSessionAccess(record, sessionId, async () => { tasks.push(record.task); });
+			} catch (error) {
+				if (error instanceof TaskSessionAccessDenied) continue;
+				throw error;
+			}
 			lastReturnedIndex = index;
 		}
 		let hasMore = false;
 		if (lastReturnedIndex >= 0) {
 			for (let index = lastReturnedIndex + 1; index < names.length; index += 1) {
-				if (sessionCanAccess(await this.readRecord(names[index].slice(0, -5)), sessionId)) {
+				try {
+					await this.withSessionAccess(await this.readRecord(names[index].slice(0, -5)), sessionId, async () => undefined);
 					hasMore = true;
 					break;
+				} catch (error) {
+					if (error instanceof TaskSessionAccessDenied) continue;
+					throw error;
 				}
 			}
 		}
@@ -222,8 +234,7 @@ export class DurableTaskStore implements TaskStore {
 
 	async getRunId(taskId: string, sessionId?: string): Promise<string | undefined> {
 		const record = await this.readRecord(taskId);
-		assertSessionAccess(record, sessionId);
-		return record.runId;
+		return this.withSessionAccess(record, sessionId, async () => record.runId);
 	}
 
 	async statusHistory(taskId: string): Promise<DurableTaskRecord["statusHistory"]> {
@@ -240,6 +251,17 @@ export class DurableTaskStore implements TaskStore {
 			cursor = page.nextCursor;
 		} while (cursor);
 		return undefined;
+	}
+
+	async legacySessionOwnsRun(runId: string, sessionId: string): Promise<boolean> {
+		await this.init();
+		await this.lockStore.getRun(runId);
+		const names = (await readdir(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name));
+		for (const name of names) {
+			const record = await this.readRecord(name.slice(0, -5));
+			if (record.runId === runId) return record.sessionId === sessionId;
+		}
+		return false;
 	}
 
 	async listBindings(limit?: number, sessionId?: string): Promise<Array<{ task: Task; runId?: string }>> {
@@ -279,10 +301,11 @@ export class DurableTaskStore implements TaskStore {
 	private async mutate(taskId: string, update: (record: DurableTaskRecord) => DurableTaskRecord, sessionId?: string): Promise<void> {
 		await this.lockStore.withTaskLock(taskId, async () => {
 			const current = await this.readRecord(taskId);
-			assertSessionAccess(current, sessionId);
-			const next = update(current);
-			validateRecord(next, taskId);
-			await atomicWrite(this.taskPath(taskId), next, false);
+			await this.withSessionAccess(current, sessionId, async () => {
+				const next = update(current);
+				validateRecord(next, taskId);
+				await atomicWrite(this.taskPath(taskId), next, false);
+			});
 		});
 	}
 
@@ -290,13 +313,13 @@ export class DurableTaskStore implements TaskStore {
 		let notify: Task | undefined;
 		await this.lockStore.withTaskLock(taskId, async () => {
 			const record = await this.readRecord(taskId);
-			assertSessionAccess(record, sessionId);
-			if (record.task.status === "cancelled" || TERMINAL.has(record.task.status)) return;
-			if (!TRANSITIONS[record.task.status].has("cancelled")) {
-				throw new Error(`Invalid task transition ${record.task.status} -> cancelled.`);
-			}
-			const timestamp = nowIso();
-			if (record.runId) {
+			await this.withSessionAccess(record, sessionId, async () => {
+				if (record.task.status === "cancelled" || TERMINAL.has(record.task.status)) return;
+				if (!TRANSITIONS[record.task.status].has("cancelled")) {
+					throw new Error(`Invalid task transition ${record.task.status} -> cancelled.`);
+				}
+				const timestamp = nowIso();
+				if (record.runId) {
 				// The service owns browser cancellation. Invoke it while the task lock
 				// prevents a competing task result, and before sealing this task, so the
 				// active controller is aborted before an in-flight send can complete.
@@ -313,17 +336,46 @@ export class DurableTaskStore implements TaskStore {
 				}
 				// If provider completion won the run-record lock, do not discard that
 				// immutable result by independently cancelling its still-working task.
-				if (run.status !== "cancelled") return;
-			}
-			record.task = { ...record.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
-			record.result = cancellationResult(taskId, record.runId, statusMessage);
-			record.resultHash = jsonHash(record.result);
-			record.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
-			validateRecord(record, taskId);
-			await atomicWrite(this.taskPath(taskId), record, false);
-			notify = record.task;
+					if (run.status !== "cancelled") return;
+				}
+				record.task = { ...record.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
+				record.result = cancellationResult(taskId, record.runId, statusMessage);
+				record.resultHash = jsonHash(record.result);
+				record.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
+				validateRecord(record, taskId);
+				await atomicWrite(this.taskPath(taskId), record, false);
+				notify = record.task;
+			});
 		});
 		if (notify) await this.notify(taskId, notify);
+	}
+
+	private async withSessionAccess<T>(
+		record: DurableTaskRecord,
+		sessionId: string | undefined,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		// Undefined is reserved for broker-internal recovery and single-session
+		// transports. Once a task is bound, the conversation is the single durable
+		// ownership authority for the task and all of its runs.
+		if (sessionId === undefined) return operation();
+		if (record.runId) {
+			const run = await this.lockStore.getRun(record.runId);
+			return this.lockStore.withConversationLock(run.conversationId, async () => {
+				const currentRun = await this.lockStore.getRun(record.runId!);
+				if (currentRun.conversationId !== run.conversationId) throw new Error("Durable task run conversation identity changed.");
+				const conversation = await this.lockStore.getConversation(run.conversationId);
+				const allowed = conversation.mcpSessionId !== undefined
+					? conversation.mcpSessionId === sessionId
+					: record.sessionId !== undefined && record.sessionId === sessionId;
+				if (!allowed) throw new TaskSessionAccessDenied(`Task ${record.task.taskId} is not owned by this MCP session.`);
+				return operation();
+			});
+		}
+		if (record.sessionId === undefined || record.sessionId !== sessionId) {
+			throw new TaskSessionAccessDenied(`Task ${record.task.taskId} is not owned by this MCP session.`);
+		}
+		return operation();
 	}
 
 	private async notify(taskId: string, task: Task): Promise<void> {
@@ -344,16 +396,6 @@ function validateRecord(value: unknown, expectedId: string): DurableTaskRecord {
 	if (!(record.task.status in TRANSITIONS)) throw new Error(`Invalid task status for ${expectedId}.`);
 	if (!Array.isArray(record.statusHistory)) throw new Error(`Invalid task status history for ${expectedId}.`);
 	return record;
-}
-
-function sessionCanAccess(record: DurableTaskRecord, sessionId?: string): boolean {
-	// Undefined is reserved for broker-internal recovery and single-session
-	// transports. A multiplexed transport must present the exact creating id.
-	return sessionId === undefined || (record.sessionId !== undefined && record.sessionId === sessionId);
-}
-
-function assertSessionAccess(record: DurableTaskRecord, sessionId?: string): void {
-	if (!sessionCanAccess(record, sessionId)) throw new Error(`Task ${record.task.taskId} is not owned by this MCP session.`);
 }
 
 async function atomicWrite(path: string, value: DurableTaskRecord, createOnly: boolean): Promise<void> {

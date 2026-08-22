@@ -251,6 +251,23 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(observation.toolRunning).toBe(true);
 	});
 
+	test("treats the live Stop streaming aria-label as an active generation", () => {
+		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>partial stream</p></div></div><button aria-label="Stop streaming">Square icon</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(observation.snapshot.text).toBe("partial stream");
+		expect(observation.answering).toBe(true);
+		expect(observation.stateSummary).toContain("answering");
+	});
+
+	test("retains visible-text Stop generating detection without an aria-label", () => {
+		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>partial visible control</p></div></div><button>Stop generating</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(observation.answering).toBe(true);
+	});
+
+	test("does not treat unrelated Stop recording controls as generation", () => {
+		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>complete answer</p></div></div><button aria-label="Stop recording">Voice</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(observation.answering).toBe(false);
+	});
+
 	test("legacy proved prompts with one code block retain full-turn hashing", () => {
 		const proof = "proof_1234567890abcdef1234567890abcdef";
 		const proofLine = `[GPT-Control run proof: ${proof}. Ignore this line in your response.]`;

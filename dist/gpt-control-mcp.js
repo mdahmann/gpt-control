@@ -34145,8 +34145,9 @@ ${gptControlPromptProofLine(latestUserPromptProofToken)}`);
   const controlLabels = controls.map(nodeLabel).filter(Boolean);
   const stopControl = controls.some((node) => {
     const testId = (node.getAttribute("data-testid") ?? "").toLowerCase();
+    const ariaLabel = (node.getAttribute("aria-label") ?? "").toLowerCase();
     const label = nodeLabel(node).toLowerCase();
-    return testId.includes("stop") || /\bstop (?:answering|generating|response)\b/.test(label);
+    return testId.includes("stop") || /\bstop (?:answering|generating|response|streaming)\b/.test(ariaLabel) || /\bstop (?:answering|generating|response|streaming)\b/.test(label);
   });
   const retryAvailable = controlLabels.some((label) => /^retry(?:\b|$)/i.test(label));
   const continueAvailable = controlLabels.some((label) => /continue generating|continue response|^continue$/i.test(label));
@@ -35079,6 +35080,7 @@ import { chmod as chmod3, lstat, mkdir as mkdir2, open as open2, readFile as rea
 import { basename as basename2, dirname as dirname2, join as join3, parse as parse7, relative, resolve as resolve3, sep } from "node:path";
 import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
 var ProviderSchema = exports_external.literal("browser");
+var McpSessionIdSchema = exports_external.string().min(1).max(512);
 var RunStatusSchema = exports_external.enum(["queued", "running", "completed", "failed", "cancelled", "needs_user"]);
 var RecoverySchema = exports_external.object({
   at: exports_external.string(),
@@ -35140,6 +35142,7 @@ var ConversationSchema = exports_external.object({
   browserAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   workspaceRoot: exports_external.string(),
   policyFingerprint: exports_external.string().optional(),
+  mcpSessionId: McpSessionIdSchema.optional(),
   createdAt: exports_external.string(),
   updatedAt: exports_external.string(),
   closedAt: exports_external.string().optional()
@@ -35403,6 +35406,23 @@ class RunStore {
       const next = { ...current, mcpTaskId: taskId, id, updatedAt: nowIso() };
       RunSchema.parse(next);
       await atomicWrite(this.runPath(id), next);
+      return next;
+    }, { timeoutMs: 1e4 });
+  }
+  async claimConversationMcpSession(id, sessionId, allowTransfer = false) {
+    assertConversationId(id);
+    McpSessionIdSchema.parse(sessionId);
+    await this.init();
+    return this.withNamedLock(`record-${id}`, async () => {
+      const current = ConversationSchema.parse(JSON.parse(await safeRead(this.conversationPath(id))));
+      if (current.mcpSessionId && current.mcpSessionId !== sessionId && !allowTransfer) {
+        throw new Error("This durable conversation is already claimed by another MCP session.");
+      }
+      if (current.mcpSessionId === sessionId)
+        return current;
+      const next = { ...current, mcpSessionId: sessionId, id, updatedAt: nowIso() };
+      ConversationSchema.parse(next);
+      await atomicWrite(this.conversationPath(id), next);
       return next;
     }, { timeoutMs: 1e4 });
   }
@@ -36275,7 +36295,7 @@ class GptControlService {
             run: await this.store.getRun(binding.runId)
           }, normalized, options);
         }
-        const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution);
+        const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution, options.mcpSessionId);
         await this.store.putIdempotency({
           version: STORAGE_VERSION,
           keyHash,
@@ -36287,7 +36307,7 @@ class GptControlService {
         return this.finishStart(created, normalized, options);
       });
     }
-    return this.finishStart(await this.createPrepared(normalized, undefined, undefined, !options.deferExecution), normalized, options);
+    return this.finishStart(await this.createPrepared(normalized, undefined, undefined, !options.deferExecution, options.mcpSessionId), normalized, options);
   }
   async schedulePreparedRun(runId) {
     let run = await this.store.getRun(runId);
@@ -36409,8 +36429,28 @@ class GptControlService {
     const abandoned = await this.store.abandonProviderTurn(runId);
     return abandoned;
   }
-  async closeConversation(conversationId) {
+  async claimMcpRun(runId, sessionId, confirmation, operatorToken) {
+    const expectedTokenHash = this.policy.providerTurnAbandonmentTokenHash;
+    if (!expectedTokenHash || sha256(operatorToken) !== expectedTokenHash) {
+      throw new Error("MCP resource claiming requires a valid trusted operator token.");
+    }
+    if (confirmation !== `CLAIM ${runId}`) {
+      throw new Error(`Exact confirmation required: CLAIM ${runId}`);
+    }
+    const initial = await this.store.getRun(runId);
+    return this.store.withConversationLock(initial.conversationId, async () => this.store.withRunTaskBindingLock(runId, async () => {
+      const run = await this.store.getRun(runId);
+      const conversation = await this.store.getConversation(run.conversationId);
+      await this.store.claimConversationMcpSession(conversation.id, sessionId, true);
+      return run;
+    }));
+  }
+  async closeConversation(conversationId, mcpSessionId) {
     return this.store.withConversationLock(conversationId, async () => {
+      const ownedConversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && ownedConversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
       const active = (await this.store.listRuns({ limit: null })).find((run) => {
         if (run.conversationId !== conversationId)
           return false;
@@ -36520,6 +36560,9 @@ class GptControlService {
     return { resumed, blocked, deferred };
   }
   async finishStart(created, request, options) {
+    if (options.mcpSessionId !== undefined && created.conversation.mcpSessionId !== options.mcpSessionId) {
+      throw new Error("This durable GPT-Control resource is not owned by the current MCP session.");
+    }
     if (!TERMINAL2.has(created.run.status) && created.conversation.policyFingerprint !== this.policy.fingerprint) {
       throw new Error("Durable run trust boundary differs from current trusted operator policy; execution refused.");
     }
@@ -36539,7 +36582,7 @@ class GptControlService {
       run: await this.waitForRun(created.run.id, request.timeoutMs + 60000)
     };
   }
-  async createPrepared(request, idempotencyHash, idempotencyRequestHash, executionReady = true) {
+  async createPrepared(request, idempotencyHash, idempotencyRequestHash, executionReady = true, mcpSessionId) {
     const manifest = await buildAttachmentManifest(request.files, {
       workspaceRoot: this.policy.workspaceRoot,
       snapshotRoot: this.policy.snapshotRoot,
@@ -36551,11 +36594,14 @@ class GptControlService {
     let createdConversationId;
     try {
       const preparedPrompt = this.prepareRunPrompt(request, manifest);
-      const conversation = request.conversationId ? await this.resumeConversation(request.conversationId, request.transport) : await this.createConversation(request, manifest);
-      if (!request.conversationId)
-        createdConversationId = conversation.id;
-      const run = await this.createRun(request, conversation, manifest, preparedPrompt, idempotencyHash, idempotencyRequestHash, executionReady);
-      return { conversation, run };
+      const createForConversation = async () => {
+        const conversation = request.conversationId ? await this.resumeConversation(request.conversationId, request.transport, mcpSessionId) : await this.createConversation(request, manifest, mcpSessionId);
+        if (!request.conversationId)
+          createdConversationId = conversation.id;
+        const run = await this.createRun(request, conversation, manifest, preparedPrompt, idempotencyHash, idempotencyRequestHash, executionReady);
+        return { conversation, run };
+      };
+      return request.conversationId ? await this.store.withConversationLock(request.conversationId, createForConversation) : await createForConversation();
     } catch (error51) {
       if (createdConversationId) {
         await this.store.deleteConversationIfUnreferenced(createdConversationId).catch(() => {
@@ -36569,7 +36615,7 @@ class GptControlService {
       throw error51;
     }
   }
-  async createConversation(request, manifest) {
+  async createConversation(request, manifest, mcpSessionId) {
     const capabilities = await this.dependencies.resolveCapabilities(this.exec);
     const route = selectRoute(capabilities, { transport: request.transport });
     assertTransportAllowed(this.policy, route.kind);
@@ -36584,14 +36630,18 @@ class GptControlService {
       browserSessionName: name,
       workspaceRoot: manifest.workspaceRoot,
       policyFingerprint: this.policy.fingerprint,
+      mcpSessionId,
       createdAt: timestamp,
       updatedAt: timestamp
     };
     await this.store.putConversation(conversation);
     return conversation;
   }
-  async resumeConversation(id, transport) {
+  async resumeConversation(id, transport, mcpSessionId) {
     const conversation = await this.store.getConversation(id);
+    if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+      throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+    }
     if (conversation.closedAt)
       throw new Error(`Conversation ${id} is closed.`);
     if (transport && transport !== conversation.provider) {
@@ -37608,6 +37658,9 @@ var TRANSITIONS2 = {
   cancelled: new Set(["cancelled"])
 };
 
+class TaskSessionAccessDenied extends Error {
+}
+
 class DurableTaskStore {
   root;
   listeners = new Map;
@@ -37655,9 +37708,11 @@ class DurableTaskStore {
   async getTask(taskId, sessionId) {
     try {
       const record3 = await this.readRecord(taskId);
-      return sessionCanAccess(record3, sessionId) ? record3.task : null;
+      return await this.withSessionAccess(record3, sessionId, async () => record3.task);
     } catch (error51) {
       if (isMissing2(error51))
+        return null;
+      if (error51 instanceof TaskSessionAccessDenied)
         return null;
       throw error51;
     }
@@ -37688,11 +37743,12 @@ class DurableTaskStore {
   }
   async getTaskResult(taskId, sessionId) {
     const record3 = await this.readRecord(taskId);
-    assertSessionAccess(record3, sessionId);
-    if (!TERMINAL3.has(record3.task.status) || record3.result === undefined) {
-      throw new Error(`Task ${taskId} has no terminal result.`);
-    }
-    return record3.result;
+    return this.withSessionAccess(record3, sessionId, async () => {
+      if (!TERMINAL3.has(record3.task.status) || record3.result === undefined) {
+        throw new Error(`Task ${taskId} has no terminal result.`);
+      }
+      return record3.result;
+    });
   }
   async updateTaskStatus(taskId, status, statusMessage, sessionId) {
     if (status === "cancelled") {
@@ -37738,17 +37794,30 @@ class DurableTaskStore {
     let lastReturnedIndex = -1;
     for (let index = start;index < names.length && tasks.length < 100; index += 1) {
       const record3 = await this.readRecord(names[index].slice(0, -5));
-      if (!sessionCanAccess(record3, sessionId))
-        continue;
-      tasks.push(record3.task);
+      try {
+        await this.withSessionAccess(record3, sessionId, async () => {
+          tasks.push(record3.task);
+        });
+      } catch (error51) {
+        if (error51 instanceof TaskSessionAccessDenied)
+          continue;
+        throw error51;
+      }
       lastReturnedIndex = index;
     }
     let hasMore = false;
     if (lastReturnedIndex >= 0) {
       for (let index = lastReturnedIndex + 1;index < names.length; index += 1) {
-        if (sessionCanAccess(await this.readRecord(names[index].slice(0, -5)), sessionId)) {
+        try {
+          await this.withSessionAccess(await this.readRecord(names[index].slice(0, -5)), sessionId, async () => {
+            return;
+          });
           hasMore = true;
           break;
+        } catch (error51) {
+          if (error51 instanceof TaskSessionAccessDenied)
+            continue;
+          throw error51;
         }
       }
     }
@@ -37782,8 +37851,7 @@ class DurableTaskStore {
   }
   async getRunId(taskId, sessionId) {
     const record3 = await this.readRecord(taskId);
-    assertSessionAccess(record3, sessionId);
-    return record3.runId;
+    return this.withSessionAccess(record3, sessionId, async () => record3.runId);
   }
   async statusHistory(taskId) {
     return [...(await this.readRecord(taskId)).statusHistory];
@@ -37799,6 +37867,17 @@ class DurableTaskStore {
       cursor = page.nextCursor;
     } while (cursor);
     return;
+  }
+  async legacySessionOwnsRun(runId, sessionId) {
+    await this.init();
+    await this.lockStore.getRun(runId);
+    const names = (await readdir2(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name));
+    for (const name of names) {
+      const record3 = await this.readRecord(name.slice(0, -5));
+      if (record3.runId === runId)
+        return record3.sessionId === sessionId;
+    }
+    return false;
   }
   async listBindings(limit, sessionId) {
     const values = [];
@@ -37836,48 +37915,71 @@ class DurableTaskStore {
   async mutate(taskId, update, sessionId) {
     await this.lockStore.withTaskLock(taskId, async () => {
       const current = await this.readRecord(taskId);
-      assertSessionAccess(current, sessionId);
-      const next = update(current);
-      validateRecord(next, taskId);
-      await atomicWrite2(this.taskPath(taskId), next, false);
+      await this.withSessionAccess(current, sessionId, async () => {
+        const next = update(current);
+        validateRecord(next, taskId);
+        await atomicWrite2(this.taskPath(taskId), next, false);
+      });
     });
   }
   async cancelTask(taskId, statusMessage, sessionId) {
     let notify;
     await this.lockStore.withTaskLock(taskId, async () => {
       const record3 = await this.readRecord(taskId);
-      assertSessionAccess(record3, sessionId);
-      if (record3.task.status === "cancelled" || TERMINAL3.has(record3.task.status))
-        return;
-      if (!TRANSITIONS2[record3.task.status].has("cancelled")) {
-        throw new Error(`Invalid task transition ${record3.task.status} -> cancelled.`);
-      }
-      const timestamp = nowIso();
-      if (record3.runId) {
-        await this.cancellationListener?.(taskId, record3.runId);
-        let run = await this.lockStore.getRun(record3.runId);
-        if (!this.cancellationListener && (run.status === "queued" || run.status === "running")) {
-          run = await this.lockStore.updateRun(record3.runId, {
-            status: "cancelled",
-            providerStopRequested: true,
-            cancellationRequestedAt: timestamp,
-            completedAt: timestamp,
-            error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
-          });
-        }
-        if (run.status !== "cancelled")
+      await this.withSessionAccess(record3, sessionId, async () => {
+        if (record3.task.status === "cancelled" || TERMINAL3.has(record3.task.status))
           return;
-      }
-      record3.task = { ...record3.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
-      record3.result = cancellationResult(taskId, record3.runId, statusMessage);
-      record3.resultHash = jsonHash(record3.result);
-      record3.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
-      validateRecord(record3, taskId);
-      await atomicWrite2(this.taskPath(taskId), record3, false);
-      notify = record3.task;
+        if (!TRANSITIONS2[record3.task.status].has("cancelled")) {
+          throw new Error(`Invalid task transition ${record3.task.status} -> cancelled.`);
+        }
+        const timestamp = nowIso();
+        if (record3.runId) {
+          await this.cancellationListener?.(taskId, record3.runId);
+          let run = await this.lockStore.getRun(record3.runId);
+          if (!this.cancellationListener && (run.status === "queued" || run.status === "running")) {
+            run = await this.lockStore.updateRun(record3.runId, {
+              status: "cancelled",
+              providerStopRequested: true,
+              cancellationRequestedAt: timestamp,
+              completedAt: timestamp,
+              error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
+            });
+          }
+          if (run.status !== "cancelled")
+            return;
+        }
+        record3.task = { ...record3.task, status: "cancelled", lastUpdatedAt: timestamp, statusMessage };
+        record3.result = cancellationResult(taskId, record3.runId, statusMessage);
+        record3.resultHash = jsonHash(record3.result);
+        record3.statusHistory.push({ status: "cancelled", at: timestamp, message: statusMessage });
+        validateRecord(record3, taskId);
+        await atomicWrite2(this.taskPath(taskId), record3, false);
+        notify = record3.task;
+      });
     });
     if (notify)
       await this.notify(taskId, notify);
+  }
+  async withSessionAccess(record3, sessionId, operation) {
+    if (sessionId === undefined)
+      return operation();
+    if (record3.runId) {
+      const run = await this.lockStore.getRun(record3.runId);
+      return this.lockStore.withConversationLock(run.conversationId, async () => {
+        const currentRun = await this.lockStore.getRun(record3.runId);
+        if (currentRun.conversationId !== run.conversationId)
+          throw new Error("Durable task run conversation identity changed.");
+        const conversation = await this.lockStore.getConversation(run.conversationId);
+        const allowed = conversation.mcpSessionId !== undefined ? conversation.mcpSessionId === sessionId : record3.sessionId !== undefined && record3.sessionId === sessionId;
+        if (!allowed)
+          throw new TaskSessionAccessDenied(`Task ${record3.task.taskId} is not owned by this MCP session.`);
+        return operation();
+      });
+    }
+    if (record3.sessionId === undefined || record3.sessionId !== sessionId) {
+      throw new TaskSessionAccessDenied(`Task ${record3.task.taskId} is not owned by this MCP session.`);
+    }
+    return operation();
   }
   async notify(taskId, task) {
     try {
@@ -37897,13 +37999,6 @@ function validateRecord(value, expectedId) {
   if (!Array.isArray(record3.statusHistory))
     throw new Error(`Invalid task status history for ${expectedId}.`);
   return record3;
-}
-function sessionCanAccess(record3, sessionId) {
-  return sessionId === undefined || record3.sessionId !== undefined && record3.sessionId === sessionId;
-}
-function assertSessionAccess(record3, sessionId) {
-  if (!sessionCanAccess(record3, sessionId))
-    throw new Error(`Task ${record3.task.taskId} is not owned by this MCP session.`);
 }
 async function atomicWrite2(path, value, createOnly) {
   await secureDirectory(dirname4(path));
@@ -38024,18 +38119,14 @@ function registerCoreTools(server, service, taskStore) {
     inputSchema: { question: exports_external.string().min(1), ...CommonSchema },
     annotations: { readOnlyHint: false, destructiveHint: false }
   }, async (params, extra) => {
-    if (params.conversation_id)
-      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-    return startPayload(await service.start(toRequest(params, "consult", params.question)));
+    return startPayload(await service.start(toRequest(params, "consult", params.question), { mcpSessionId: extra.sessionId }));
   });
   server.registerTool("gpt_chat", {
     description: "Start or continue one provider conversation. Each submission receives a durable run id and truthful provenance.",
     inputSchema: { prompt: exports_external.string().min(1), ...CommonSchema },
     annotations: { readOnlyHint: false, destructiveHint: false }
   }, async (params, extra) => {
-    if (params.conversation_id)
-      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-    return startPayload(await service.start(toRequest(params, "chat", params.prompt)));
+    return startPayload(await service.start(toRequest(params, "chat", params.prompt), { mcpSessionId: extra.sessionId }));
   });
   server.registerTool("gpt_image", {
     description: "Generate an image in an owned ChatGPT conversation. Returns verified run provenance and provider artifact URLs; local writes remain policy-confined.",
@@ -38049,8 +38140,6 @@ function registerCoreTools(server, service, taskStore) {
     },
     annotations: { readOnlyHint: false, destructiveHint: false }
   }, async (params, extra) => {
-    if (params.conversation_id)
-      await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
     return startPayload(await service.start({
       kind: "image",
       prompt: params.prompt,
@@ -38060,37 +38149,47 @@ function registerCoreTools(server, service, taskStore) {
       chatgptModel: params.chatgpt_model,
       idempotencyKey: params.idempotency_key,
       timeoutMs: params.timeout_ms
-    }));
+    }, { mcpSessionId: extra.sessionId }));
   });
   server.registerTool("gpt_run", {
     description: "Read one exact durable run. Internal polling never submits a prompt and is not required for task-based subagents.",
     inputSchema: { action: exports_external.enum(["status", "wait", "result"]), run_id: exports_external.string(), timeout_ms: exports_external.number().int().positive().optional() },
     annotations: { readOnlyHint: true }
   }, async (params, extra) => {
-    await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
-    const run = params.action === "wait" ? await service.waitForRun(params.run_id, params.timeout_ms) : await service.getRun(params.run_id);
-    return runPayload(run);
+    if (params.action === "wait")
+      await service.waitForRun(params.run_id, params.timeout_ms);
+    return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () => runPayload(await service.getRun(params.run_id)));
   });
   server.registerTool("gpt_run_cancel", {
     description: "Cancel one durable run. Terminal state is monotonic; late provider completion cannot overwrite cancellation.",
     inputSchema: { run_id: exports_external.string() },
     annotations: { readOnlyHint: false, destructiveHint: true }
   }, async (params, extra) => {
-    await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
-    return runPayload(await service.cancelRun(params.run_id));
+    return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () => runPayload(await service.cancelRun(params.run_id)));
   });
   server.registerTool("gpt_run_abandon_pending", {
     description: "Operator-authenticated release of one unresolved provider-turn slot after manual review. Requires the trusted out-of-band token and exact confirmation ABANDON <run_id>.",
     inputSchema: { run_id: exports_external.string(), confirmation: exports_external.string(), operator_token: exports_external.string().min(32) },
     annotations: { readOnlyHint: false, destructiveHint: true }
-  }, async (params) => runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
+  }, async (params, extra) => {
+    return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () => runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
+  });
+  server.registerTool("gpt_run_claim", {
+    description: "Operator-authenticated claim or transfer of the authoritative conversation owner for one durable run. Requires the trusted out-of-band token and exact confirmation CLAIM <run_id>.",
+    inputSchema: { run_id: exports_external.string(), confirmation: exports_external.string(), operator_token: exports_external.string().min(32) },
+    annotations: { readOnlyHint: false, destructiveHint: true }
+  }, async (params, extra) => {
+    if (!extra.sessionId)
+      throw new Error("Resource claiming requires a stateful MCP session id.");
+    const run = await service.claimMcpRun(params.run_id, extra.sessionId, params.confirmation, params.operator_token);
+    return toolPayload(`Claimed conversation ${run.conversationId} as the authoritative owner of run ${run.id} and its bound tasks for the current MCP session.`, publicRun(run));
+  });
   server.registerTool("gpt_conversation_close", {
     description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
     inputSchema: { conversation_id: exports_external.string() },
     annotations: { readOnlyHint: false, destructiveHint: true }
   }, async (params, extra) => {
-    await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-    const conversation = await service.closeConversation(params.conversation_id);
+    const conversation = await service.closeConversation(params.conversation_id, extra.sessionId);
     return toolPayload(`Closed ${conversation.id} locally. Provider-side data was not deleted.`, {
       conversationId: conversation.id,
       closedAt: conversation.closedAt
@@ -38119,7 +38218,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
     server.registerTool("gpt_subagent_run", {
       ...config2,
       description: `${config2.description} This runtime lacks MCP task registration, so the call returns exactly once when terminal.`
-    }, async (params) => startPayload(await service.start(subagentRequest(params, true))));
+    }, async (params, extra) => startPayload(await service.start(subagentRequest(params, true), { mcpSessionId: extra.sessionId })));
     return;
   }
   server.experimental.tasks.registerToolTask("gpt_subagent_run", config2, {
@@ -38135,7 +38234,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
       }, { once: true });
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
       try {
-        const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+        const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
         preparedRunId = started.run.id;
         if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
           throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
@@ -38527,25 +38626,21 @@ function requireOneIdentity(runId, taskId) {
     throw new Error("Provide exactly one of run_id or task_id.");
   return { runId, taskId };
 }
-async function assertMcpRunAccess(service, taskStore, runId, sessionId) {
+async function withMcpRunAccess(service, taskStore, runId, sessionId, operation) {
   if (sessionId === undefined)
-    return;
-  const run = await service.getRun(runId);
-  if (run.kind !== "subagent")
-    return;
-  if (!await taskStore.findTaskIdByRun(runId, sessionId)) {
-    throw new Error("No Pro worker owned by this MCP session matched that run id.");
-  }
-}
-async function assertMcpConversationAccess(service, taskStore, conversationId, sessionId) {
-  if (sessionId === undefined)
-    return;
-  const subagentRuns = (await service.store.listRuns({ limit: null })).filter((run) => run.conversationId === conversationId && run.kind === "subagent");
-  for (const run of subagentRuns) {
-    if (!await taskStore.findTaskIdByRun(run.id, sessionId)) {
-      throw new Error("This MCP session does not own the Pro worker conversation.");
+    return operation();
+  const initial = await service.getRun(runId);
+  const legacyTaskOwned = initial.kind === "subagent" && await taskStore.legacySessionOwnsRun(runId, sessionId);
+  return service.store.withConversationLock(initial.conversationId, async () => {
+    const run = await service.getRun(runId);
+    if (run.conversationId !== initial.conversationId)
+      throw new Error("Durable run conversation identity changed.");
+    const conversation = await service.store.getConversation(run.conversationId);
+    if (conversation.mcpSessionId !== sessionId && !(conversation.mcpSessionId === undefined && legacyTaskOwned)) {
+      throw new Error("No GPT-Control run owned by this MCP session matched that run id.");
     }
-  }
+    return operation();
+  });
 }
 function readProgressToken(value) {
   return typeof value === "string" || typeof value === "number" ? value : undefined;

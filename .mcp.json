@@ -2,10 +2,9 @@
   "mcpServers": {
     "gpt-control": {
       "cwd": ".",
-      "command": "./bin/gpt-control-mcp",
-      "args": [],
+      "command": "node",
+      "args": ["./dist/gpt-control-mcp.js"],
       "env_vars": [
-        "GPT_CONTROL_NODE",
         "GPT_CONTROL_HOME",
         "GPT_CONTROL_WORKSPACE_ROOT",
         "GPT_CONTROL_SNAPSHOT_ROOT",

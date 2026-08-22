@@ -41,12 +41,12 @@
     "LICENSE"
   ],
   "bin": {
-    "gpt-control-mcp": "./bin/gpt-control-mcp"
+    "gpt-control-mcp": "./bin/gpt-control-mcp.js"
   },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test",
-    "mcp": "./bin/gpt-control-mcp",
+    "mcp": "node ./dist/gpt-control-mcp.js",
     "verify:security": "bash scripts/verify-security.sh",
     "prepack": "bun run build:mcp && bun run check && bun test && bash scripts/verify-security.sh",
     "build:mcp": "bun build src/mcp.ts --target=node --outfile=dist/gpt-control-mcp.js"

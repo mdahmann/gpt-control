@@ -98,8 +98,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		inputSchema: { question: z.string().min(1), ...CommonSchema },
 		annotations: { readOnlyHint: false, destructiveHint: false },
 	}, async (params, extra) => {
-		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-		return startPayload(await service.start(toRequest(params, "consult", params.question)));
+		return startPayload(await service.start(toRequest(params, "consult", params.question), { mcpSessionId: extra.sessionId }));
 	});
 
 	server.registerTool("gpt_chat", {
@@ -107,8 +106,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		inputSchema: { prompt: z.string().min(1), ...CommonSchema },
 		annotations: { readOnlyHint: false, destructiveHint: false },
 	}, async (params, extra) => {
-		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-		return startPayload(await service.start(toRequest(params, "chat", params.prompt)));
+		return startPayload(await service.start(toRequest(params, "chat", params.prompt), { mcpSessionId: extra.sessionId }));
 	});
 
 	server.registerTool("gpt_image", {
@@ -123,7 +121,6 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		},
 		annotations: { readOnlyHint: false, destructiveHint: false },
 	}, async (params, extra) => {
-		if (params.conversation_id) await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
 		return startPayload(await service.start({
 			kind: "image",
 			prompt: params.prompt,
@@ -133,7 +130,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 			chatgptModel: params.chatgpt_model,
 			idempotencyKey: params.idempotency_key,
 			timeoutMs: params.timeout_ms,
-		}));
+		}, { mcpSessionId: extra.sessionId }));
 	});
 
 	server.registerTool("gpt_run", {
@@ -141,9 +138,9 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		inputSchema: { action: z.enum(["status", "wait", "result"]), run_id: z.string(), timeout_ms: z.number().int().positive().optional() },
 		annotations: { readOnlyHint: true },
 	}, async (params, extra) => {
-		await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
-		const run = params.action === "wait" ? await service.waitForRun(params.run_id, params.timeout_ms) : await service.getRun(params.run_id);
-		return runPayload(run);
+		if (params.action === "wait") await service.waitForRun(params.run_id, params.timeout_ms);
+		return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () =>
+			runPayload(await service.getRun(params.run_id)));
 	});
 
 	server.registerTool("gpt_run_cancel", {
@@ -151,23 +148,43 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		inputSchema: { run_id: z.string() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
 	}, async (params, extra) => {
-		await assertMcpRunAccess(service, taskStore, params.run_id, extra.sessionId);
-		return runPayload(await service.cancelRun(params.run_id));
+		return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () =>
+			runPayload(await service.cancelRun(params.run_id)));
 	});
 
 	server.registerTool("gpt_run_abandon_pending", {
 		description: "Operator-authenticated release of one unresolved provider-turn slot after manual review. Requires the trusted out-of-band token and exact confirmation ABANDON <run_id>.",
 		inputSchema: { run_id: z.string(), confirmation: z.string(), operator_token: z.string().min(32) },
 		annotations: { readOnlyHint: false, destructiveHint: true },
-	}, async (params) => runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
+	}, async (params, extra) => {
+		return withMcpRunAccess(service, taskStore, params.run_id, extra.sessionId, async () =>
+			runPayload(await service.abandonPendingProviderTurn(params.run_id, params.confirmation, params.operator_token)));
+	});
+
+	server.registerTool("gpt_run_claim", {
+		description: "Operator-authenticated claim or transfer of the authoritative conversation owner for one durable run. Requires the trusted out-of-band token and exact confirmation CLAIM <run_id>.",
+		inputSchema: { run_id: z.string(), confirmation: z.string(), operator_token: z.string().min(32) },
+		annotations: { readOnlyHint: false, destructiveHint: true },
+	}, async (params, extra) => {
+		if (!extra.sessionId) throw new Error("Resource claiming requires a stateful MCP session id.");
+		const run = await service.claimMcpRun(
+			params.run_id,
+			extra.sessionId,
+			params.confirmation,
+			params.operator_token,
+		);
+		return toolPayload(
+			`Claimed conversation ${run.conversationId} as the authoritative owner of run ${run.id} and its bound tasks for the current MCP session.`,
+			publicRun(run),
+		);
+	});
 
 	server.registerTool("gpt_conversation_close", {
 		description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
 		inputSchema: { conversation_id: z.string() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
 	}, async (params, extra) => {
-		await assertMcpConversationAccess(service, taskStore, params.conversation_id, extra.sessionId);
-		const conversation = await service.closeConversation(params.conversation_id);
+		const conversation = await service.closeConversation(params.conversation_id, extra.sessionId);
 		return toolPayload(`Closed ${conversation.id} locally. Provider-side data was not deleted.`, {
 			conversationId: conversation.id,
 			closedAt: conversation.closedAt,
@@ -206,7 +223,7 @@ function registerSubagentRun(
 		server.registerTool("gpt_subagent_run", {
 			...config,
 			description: `${config.description} This runtime lacks MCP task registration, so the call returns exactly once when terminal.`,
-		}, async (params) => startPayload(await service.start(subagentRequest(params, true))));
+		}, async (params, extra) => startPayload(await service.start(subagentRequest(params, true), { mcpSessionId: extra.sessionId })));
 		return;
 	}
 
@@ -223,7 +240,7 @@ function registerSubagentRun(
 			}, { once: true });
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
 			try {
-				const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+				const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
 				preparedRunId = started.run.id;
 				if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
 					throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
@@ -657,34 +674,26 @@ function requireOneIdentity(runId?: string, taskId?: string): { runId?: string; 
 	return { runId, taskId };
 }
 
-async function assertMcpRunAccess(
+async function withMcpRunAccess<T>(
 	service: GptControlService,
 	taskStore: DurableTaskStore,
 	runId: string,
-	sessionId?: string,
-): Promise<void> {
-	if (sessionId === undefined) return;
-	const run = await service.getRun(runId);
-	if (run.kind !== "subagent") return;
-	if (!await taskStore.findTaskIdByRun(runId, sessionId)) {
-		throw new Error("No Pro worker owned by this MCP session matched that run id.");
-	}
-}
-
-async function assertMcpConversationAccess(
-	service: GptControlService,
-	taskStore: DurableTaskStore,
-	conversationId: string,
-	sessionId?: string,
-): Promise<void> {
-	if (sessionId === undefined) return;
-	const subagentRuns = (await service.store.listRuns({ limit: null }))
-		.filter((run) => run.conversationId === conversationId && run.kind === "subagent");
-	for (const run of subagentRuns) {
-		if (!await taskStore.findTaskIdByRun(run.id, sessionId)) {
-			throw new Error("This MCP session does not own the Pro worker conversation.");
+	sessionId: string | undefined,
+	operation: () => Promise<T>,
+): Promise<T> {
+	if (sessionId === undefined) return operation();
+	const initial = await service.getRun(runId);
+	const legacyTaskOwned = initial.kind === "subagent"
+		&& await taskStore.legacySessionOwnsRun(runId, sessionId);
+	return service.store.withConversationLock(initial.conversationId, async () => {
+		const run = await service.getRun(runId);
+		if (run.conversationId !== initial.conversationId) throw new Error("Durable run conversation identity changed.");
+		const conversation = await service.store.getConversation(run.conversationId);
+		if (conversation.mcpSessionId !== sessionId && !(conversation.mcpSessionId === undefined && legacyTaskOwned)) {
+			throw new Error("No GPT-Control run owned by this MCP session matched that run id.");
 		}
-	}
+		return operation();
+	});
 }
 
 function readProgressToken(value: unknown): ProgressToken | undefined {

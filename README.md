@@ -54,6 +54,7 @@ never passed through child-process argv.
 | `gpt_run` | Read, wait for, or retrieve one durable run |
 | `gpt_run_cancel` | Durably cancel any active run |
 | `gpt_run_abandon_pending` | Operator-authenticated release of an unresolved provider slot after manual review |
+| `gpt_run_claim` | Operator-authenticated claim or transfer of a run's authoritative conversation owner, including all bound tasks |
 | `gpt_conversation_close` | Close an owned local browser session; provider history remains |
 | `gpt_subagent_run` | Start one independent bounded ChatGPT Pro worker |
 | `gpt_subagent_get` | One reconnect/recovery lookup for a worker |
@@ -136,10 +137,11 @@ bun test
 ```
 
 The repository commits a reproducible Node-compatible MCP bundle at
-`dist/gpt-control-mcp.js`. Codex plugin snapshots therefore start without
-`node_modules` or an install hook. `bin/gpt-control-mcp` uses `GPT_CONTROL_NODE`
-when explicitly set, otherwise a trusted `node` on PATH. Bun is required only
-to develop, test, and reproduce the committed bundle.
+`dist/gpt-control-mcp.js`. Codex plugin snapshots therefore start on macOS,
+Linux, and Windows without `node_modules`, a shell launcher, or an install hook.
+The plugin and package command use `node` on PATH. The optional Unix launcher
+`bin/gpt-control-mcp` honors `GPT_CONTROL_NODE`. Bun is required only to develop,
+test, and reproduce the committed bundle.
 
 ### OMP / Pi
 
@@ -149,7 +151,7 @@ read `src/index.ts` from the `omp`/`pi` package metadata.
 ### MCP
 
 ```bash
-./bin/gpt-control-mcp
+node ./dist/gpt-control-mcp.js
 ```
 
 For Codex, the repository includes `.codex-plugin/plugin.json`, `.mcp.json`,

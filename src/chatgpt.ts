@@ -823,8 +823,11 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	const controlLabels = controls.map(nodeLabel).filter(Boolean);
 	const stopControl = controls.some((node) => {
 		const testId = (node.getAttribute("data-testid") ?? "").toLowerCase();
+		const ariaLabel = (node.getAttribute("aria-label") ?? "").toLowerCase();
 		const label = nodeLabel(node).toLowerCase();
-		return testId.includes("stop") || /\bstop (?:answering|generating|response)\b/.test(label);
+		return testId.includes("stop")
+			|| /\bstop (?:answering|generating|response|streaming)\b/.test(ariaLabel)
+			|| /\bstop (?:answering|generating|response|streaming)\b/.test(label);
 	});
 	const retryAvailable = controlLabels.some((label) => /^retry(?:\b|$)/i.test(label));
 	const continueAvailable = controlLabels.some((label) => /continue generating|continue response|^continue$/i.test(label));

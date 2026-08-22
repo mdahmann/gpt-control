@@ -57,6 +57,7 @@ replacement page or resubmit an ambiguous prompt.
 - `gpt_image`: image generation/iteration with confined local output.
 - `gpt_run`: status, wait, or result for one durable run.
 - `gpt_run_cancel`: durable cancellation.
+- `gpt_run_claim`: operator-authenticated claim or reconnect transfer of a run's authoritative conversation owner, including bound task access.
 - `gpt_conversation_close`: local session cleanup; provider history remains.
 - `gpt_diagnose`: passive configuration report; executes nothing discovered.
 - `gpt_diagnose_active`: opt-in driver probe when trusted policy enables it.

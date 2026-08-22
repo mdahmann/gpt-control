@@ -85,6 +85,15 @@ release that slot. The call also requires the out-of-band secret configured as
 sufficient. This records the abandonment and does not claim that the provider
 turn stopped.
 
+Ordinary runs created before durable MCP session ownership was added are not
+claimed automatically. A reconnect can also receive a new transport session
+ID. In a stateful MCP transport, use `gpt_run_claim` with the same trusted
+out-of-band operator token and exact confirmation `CLAIM <run_id>`. The
+operation atomically transfers the conversation that authoritatively owns that
+run to the current MCP session. Bound task APIs derive access from that same
+conversation owner, so the old session is revoked without a second ownership
+write. Other sessions remain denied.
+
 Automatic Stop reconciliation uses a bounded exponential retry sequence. An
 unproved turn remains durable and keeps its slot, but it does not create a
 permanent browser-probe loop. Broker restart performs another bounded sweep.

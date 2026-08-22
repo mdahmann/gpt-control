@@ -90,6 +90,8 @@ export interface StartResult {
 export interface StartOptions {
 	/** Trusted internal control used to bind an MCP task before provider execution. */
 	deferExecution?: boolean;
+	/** Trusted transport identity; never accepted from model-controlled tool input. */
+	mcpSessionId?: string;
 }
 
 export interface ServiceDependencies {
@@ -227,7 +229,7 @@ export class GptControlService {
 						run: await this.store.getRun(binding.runId),
 					}, normalized, options);
 				}
-				const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution);
+				const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution, options.mcpSessionId);
 				await this.store.putIdempotency({
 					version: STORAGE_VERSION, keyHash, requestHash, runId: created.run.id,
 					conversationId: created.conversation.id, createdAt: nowIso(),
@@ -236,7 +238,7 @@ export class GptControlService {
 			});
 		}
 		return this.finishStart(
-			await this.createPrepared(normalized, undefined, undefined, !options.deferExecution),
+			await this.createPrepared(normalized, undefined, undefined, !options.deferExecution, options.mcpSessionId),
 			normalized,
 			options,
 		);
@@ -362,8 +364,36 @@ export class GptControlService {
 		return abandoned;
 	}
 
-	async closeConversation(conversationId: string): Promise<ConversationRecord> {
+	async claimMcpRun(
+		runId: string,
+		sessionId: string,
+		confirmation: string,
+		operatorToken: string,
+	): Promise<RunRecord> {
+		const expectedTokenHash = this.policy.providerTurnAbandonmentTokenHash;
+		if (!expectedTokenHash || sha256(operatorToken) !== expectedTokenHash) {
+			throw new Error("MCP resource claiming requires a valid trusted operator token.");
+		}
+		if (confirmation !== `CLAIM ${runId}`) {
+			throw new Error(`Exact confirmation required: CLAIM ${runId}`);
+		}
+		const initial = await this.store.getRun(runId);
+		return this.store.withConversationLock(initial.conversationId, async () =>
+			this.store.withRunTaskBindingLock(runId, async () => {
+				const run = await this.store.getRun(runId);
+				const conversation = await this.store.getConversation(run.conversationId);
+				await this.store.claimConversationMcpSession(conversation.id, sessionId, true);
+				return run;
+			}),
+		);
+	}
+
+	async closeConversation(conversationId: string, mcpSessionId?: string): Promise<ConversationRecord> {
 		return this.store.withConversationLock(conversationId, async () => {
+			const ownedConversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && ownedConversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
 			const active = (await this.store.listRuns({ limit: null })).find((run) => {
 				if (run.conversationId !== conversationId) return false;
 				const legacyUnresolved = run.providerTurnPending === undefined
@@ -476,6 +506,10 @@ export class GptControlService {
 		request: NormalizedStartRequest,
 		options: StartOptions,
 	): Promise<StartResult> {
+		if (options.mcpSessionId !== undefined
+			&& created.conversation.mcpSessionId !== options.mcpSessionId) {
+			throw new Error("This durable GPT-Control resource is not owned by the current MCP session.");
+		}
 		if (!TERMINAL.has(created.run.status) && created.conversation.policyFingerprint !== this.policy.fingerprint) {
 			throw new Error("Durable run trust boundary differs from current trusted operator policy; execution refused.");
 		}
@@ -500,6 +534,7 @@ export class GptControlService {
 		idempotencyHash?: string,
 		idempotencyRequestHash?: string,
 		executionReady = true,
+		mcpSessionId?: string,
 	): Promise<StartResult> {
 		const manifest = await buildAttachmentManifest(request.files, {
 			workspaceRoot: this.policy.workspaceRoot,
@@ -512,15 +547,20 @@ export class GptControlService {
 		let createdConversationId: string | undefined;
 		try {
 			const preparedPrompt = this.prepareRunPrompt(request, manifest);
-			const conversation = request.conversationId
-				? await this.resumeConversation(request.conversationId, request.transport)
-				: await this.createConversation(request, manifest);
-			if (!request.conversationId) createdConversationId = conversation.id;
-			const run = await this.createRun(
-				request, conversation, manifest, preparedPrompt,
-				idempotencyHash, idempotencyRequestHash, executionReady,
-			);
-			return { conversation, run };
+			const createForConversation = async (): Promise<StartResult> => {
+				const conversation = request.conversationId
+					? await this.resumeConversation(request.conversationId, request.transport, mcpSessionId)
+					: await this.createConversation(request, manifest, mcpSessionId);
+				if (!request.conversationId) createdConversationId = conversation.id;
+				const run = await this.createRun(
+					request, conversation, manifest, preparedPrompt,
+					idempotencyHash, idempotencyRequestHash, executionReady,
+				);
+				return { conversation, run };
+			};
+			return request.conversationId
+				? await this.store.withConversationLock(request.conversationId, createForConversation)
+				: await createForConversation();
 		} catch (error) {
 			if (createdConversationId) {
 				await this.store.deleteConversationIfUnreferenced(createdConversationId).catch(() => undefined);
@@ -530,7 +570,7 @@ export class GptControlService {
 		}
 	}
 
-	private async createConversation(request: NormalizedStartRequest, manifest: AttachmentManifest): Promise<ConversationRecord> {
+	private async createConversation(request: NormalizedStartRequest, manifest: AttachmentManifest, mcpSessionId?: string): Promise<ConversationRecord> {
 		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
 		const route = selectRoute(capabilities, { transport: request.transport });
 		assertTransportAllowed(this.policy, route.kind);
@@ -545,6 +585,7 @@ export class GptControlService {
 			browserSessionName: name,
 			workspaceRoot: manifest.workspaceRoot,
 			policyFingerprint: this.policy.fingerprint,
+			mcpSessionId,
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
@@ -552,8 +593,11 @@ export class GptControlService {
 		return conversation;
 	}
 
-	private async resumeConversation(id: string, transport?: TransportChoice): Promise<ConversationRecord> {
+	private async resumeConversation(id: string, transport?: TransportChoice, mcpSessionId?: string): Promise<ConversationRecord> {
 		const conversation = await this.store.getConversation(id);
+		if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+			throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+		}
 		if (conversation.closedAt) throw new Error(`Conversation ${id} is closed.`);
 		if (transport && transport !== conversation.provider) {
 			throw new Error(`Conversation ${id} uses ${conversation.provider}; it cannot be resumed through ${transport}.`);
