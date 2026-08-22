@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+BUNDLE="$ROOT/dist/gpt-control-mcp.js"
+
+if [[ ! -f "$BUNDLE" ]]; then
+  printf 'GPT-Control MCP bundle is missing: %s\n' "$BUNDLE" >&2
+  printf '%s\n' 'Reinstall the plugin or run bun run build:mcp from a trusted source checkout.' >&2
+  exit 66
+fi
+
+if [[ -n "${GPT_CONTROL_NODE:-}" ]]; then
+  NODE=${GPT_CONTROL_NODE}
+elif command -v node >/dev/null 2>&1; then
+  NODE=$(command -v node)
+else
+  printf '%s\n' 'GPT-Control requires Node.js 20 or newer to run its committed MCP bundle.' >&2
+  exit 127
+fi
+
+if [[ ! -x "$NODE" ]]; then
+  printf 'Trusted Node executable is not runnable: %s\n' "$NODE" >&2
+  exit 126
+fi
+
+if ! "$NODE" -e 'const major=Number(process.versions.node.split(".")[0]); process.exit(Number.isInteger(major) && major >= 20 ? 0 : 1)'; then
+  printf 'GPT-Control requires Node.js 20 or newer; selected runtime is %s.\n' "$($NODE --version 2>/dev/null || printf unknown)" >&2
+  exit 65
+fi
+
+exec "$NODE" "$BUNDLE" "$@"

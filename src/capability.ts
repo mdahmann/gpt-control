@@ -1,20 +1,17 @@
-import { resolveBrowserDriver, type DriverProbe, type WebChatDriver } from "./browser-driver";
-import { probeOracle, resolveOracleLauncher, type Launcher } from "./transport";
+import { BROWSER_DRIVER_PROTOCOL_VERSION, resolveBrowserDriver, type DriverProbe, type WebChatDriver } from "./browser-driver";
 import type { Provider } from "./domain";
 import type { Exec } from "./types";
 
-export type TransportChoice = Provider;
+export type TransportChoice = Provider | "oracle_browser" | "oracle_api";
 
 export interface Capabilities {
 	browser?: { driver: WebChatDriver; probe: DriverProbe; source: string };
 	browserOffline?: { probe: DriverProbe; source: string };
-	oracle?: { launcher: Launcher; version?: string };
 }
 
 export interface Route {
-	kind: Provider;
-	driver?: WebChatDriver;
-	launcher?: Launcher;
+	kind: "browser";
+	driver: WebChatDriver;
 }
 
 const POSITIVE_TTL_MS = 60_000;
@@ -38,7 +35,7 @@ export async function resolveCapabilities(
 	inFlight = probeCapabilities(exec, env, signal);
 	try {
 		const value = await inFlight;
-		cached = { at: Date.now(), value, positive: Boolean(value.browser || value.oracle) };
+		cached = { at: Date.now(), value, positive: Boolean(value.browser) };
 		return value;
 	} finally {
 		inFlight = undefined;
@@ -47,14 +44,12 @@ export async function resolveCapabilities(
 
 async function probeCapabilities(exec: Exec, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<Capabilities> {
 	const value: Capabilities = {};
-	const oracleLauncher = resolveOracleLauncher(env);
-	const [browser, oracleVersion] = await Promise.all([
-		resolveBrowserDriver(exec, env, signal),
-		oracleLauncher ? probeOracle(exec, oracleLauncher, signal).catch(() => undefined) : undefined,
-	]);
-	if (browser.driver && browser.probe.ready) value.browser = { driver: browser.driver, probe: browser.probe, source: browser.source };
-	else value.browserOffline = { probe: browser.probe, source: browser.source };
-	if (oracleLauncher && oracleVersion) value.oracle = { launcher: oracleLauncher, version: oracleVersion };
+	const browser = await resolveBrowserDriver(exec, env, signal);
+	if (browser.driver && browser.probe.ready && browser.probe.secureInput) {
+		value.browser = { driver: browser.driver, probe: browser.probe, source: browser.source };
+	} else {
+		value.browserOffline = { probe: browser.probe, source: browser.source };
+	}
 	return value;
 }
 
@@ -67,42 +62,50 @@ export class NoTransportError extends Error {
 
 export interface RouteOptions {
 	transport?: TransportChoice;
+	/** Legacy request fields are intentionally ignored as authority. */
 	apiConfirmed?: boolean;
 	allowFocusSteal?: boolean;
 }
 
 export function selectRoute(capabilities: Capabilities, options: RouteOptions = {}): Route {
-	const requested = options.transport;
-	if (requested === "browser" || requested === undefined) {
-		if (capabilities.browser) return { kind: "browser", driver: capabilities.browser.driver };
-		throw new NoTransportError(browserUnavailable(capabilities));
+	const requested = options.transport ?? "browser";
+	if (requested !== "browser") {
+		throw new NoTransportError(
+			`Transport ${requested} is disabled by the hardened 0.3 broker because its current CLI request path exposes sensitive data through argv.`,
+		);
 	}
-	if (requested === "oracle_browser") {
-		if (!options.allowFocusSteal) throw new NoTransportError("Oracle browser mode can foreground its own browser. Re-run with allow_focus_steal=true to choose it explicitly.");
-		if (!capabilities.oracle) throw new NoTransportError("Oracle browser mode requested, but the Oracle CLI is unavailable.");
-		return { kind: "oracle_browser", launcher: capabilities.oracle.launcher };
-	}
-	if (requested === "oracle_api") {
-		if (!options.apiConfirmed) throw new NoTransportError("Oracle API mode is paid. Re-run with api_confirmed=true.");
-		if (!capabilities.oracle) throw new NoTransportError("Oracle API mode requested, but the Oracle CLI is unavailable.");
-		return { kind: "oracle_api", launcher: capabilities.oracle.launcher };
-	}
-	throw new NoTransportError(`Unknown transport: ${requested}`);
+	if (capabilities.browser) return { kind: "browser", driver: capabilities.browser.driver };
+	throw new NoTransportError(browserUnavailable(capabilities));
 }
 
 function browserUnavailable(capabilities: Capabilities): string {
-	return `${capabilities.browserOffline?.probe.reason ?? "No browser driver is ready."} No fallback browser was launched. Configure GPT_CONTROL_BROWSER_DRIVER or retry the current adapter.`;
+	return `${capabilities.browserOffline?.probe.reason ?? "No secure browser driver is ready."} No fallback browser or paid API was launched.`;
 }
 
 export function describeCapabilities(capabilities: Capabilities): Record<string, unknown> {
 	return {
 		preferred: capabilities.browser ? "browser" : "browser_unavailable",
 		browser: capabilities.browser
-			? { available: true, driver: capabilities.browser.driver.id, source: capabilities.browser.source }
-			: { available: false, driver: capabilities.browserOffline?.probe.driver ?? "none", source: capabilities.browserOffline?.source ?? "none", reason: capabilities.browserOffline?.probe.reason },
-		oracle: capabilities.oracle
-			? { available: true, explicitOnly: true, version: capabilities.oracle.version }
-			: { available: false, explicitOnly: true },
-		focusSafety: "No unavailable driver triggers another browser. Oracle browser mode requires allow_focus_steal=true.",
+			? {
+				available: true,
+				driver: capabilities.browser.driver.id,
+				source: capabilities.browser.source,
+				protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION,
+				secureInput: true,
+			}
+			: {
+				available: false,
+				driver: capabilities.browserOffline?.probe.driver ?? "none",
+				source: capabilities.browserOffline?.source ?? "none",
+				reason: capabilities.browserOffline?.probe.reason,
+				protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION,
+				secureInput: false,
+			},
+		oracle: {
+			available: false,
+			executionEnabled: false,
+			reason: "Legacy Oracle CLI request data is argv-visible; active probing and execution are disabled.",
+		},
+		focusSafety: "No unavailable driver triggers another browser. No focus-stealing fallback is executed.",
 	};
 }

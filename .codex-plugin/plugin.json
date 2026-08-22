@@ -1,0 +1,40 @@
+{
+  "name": "gpt-control",
+  "version": "0.3.2",
+  "description": "Hardened signed-in ChatGPT web control with exact conversations, durable runs, and bounded Codex Pro workers.",
+  "author": {
+    "name": "GPT-Control contributors"
+  },
+  "homepage": "https://github.com/wolfiesch/gpt-control",
+  "repository": "https://github.com/wolfiesch/gpt-control",
+  "license": "MIT",
+  "keywords": [
+    "chatgpt",
+    "codex",
+    "mcp",
+    "subagent",
+    "browser-automation",
+    "code-review"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "GPT-Control",
+    "shortDescription": "Run exact, durable ChatGPT Pro web workers from Codex",
+      "longDescription": "Use Codex as the orchestrator for signed-in ChatGPT web reviews, exact conversation follow-ups, image work, and durable Pro workers with a default ceiling of six and an operator ceiling of ten.",
+    "developerName": "GPT-Control contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/wolfiesch/gpt-control",
+    "defaultPrompt": [
+      "Start an independent ChatGPT Pro worker for this bounded task and return its completion or blocker.",
+      "Ask ChatGPT Pro to review these files, then verify every cited finding locally.",
+      "Continue the exact GPT-Control conversation without creating or resubmitting a replacement turn."
+    ],
+    "screenshots": []
+  }
+}

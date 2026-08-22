@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.3.2] - 2026-08-22
+
+### Added
+
+- Event-driven Codex parent callbacks for durable Pro workers through `codex queue`, using only the runtime-provided trusted `CODEX_THREAD_ID`.
+- Durable, coalesced completion receipts that carry task/run IDs and terminal status without prompt or result text.
+
+### Security
+
+- Parent callback targets cannot be supplied by model tool arguments. Callback attempts are marked before the external queue command, preventing automatic duplicate wakes across restart or an ambiguous command boundary.
+- A missing thread identity, unavailable Codex executable, or failed callback does not alter the immutable worker result. Durable task/run lookup remains authoritative.
+
+## [0.3.1] - 2026-08-21
+
+### Added
+
+- Optional MCP tool-task delivery for independent ChatGPT Pro workers, with durable task status, result, cancellation, reconnect, and one-terminal-call fallback.
+- Connector-aware worker intent with explicit preferred/required semantics and blocker behavior for unavailable required connectors.
+- Codex plugin metadata, portable MCP launcher, migration guidance, security model, and disposable-Chrome validation procedure.
+- Browser-driver protocol v2 with separate fill and send operations, secure-input attestation, exact session/page ownership, live UI observations, and bounded same-conversation recovery.
+- Exact existing-conversation attachment by canonical ChatGPT URL or provider ID in a separate GPT-Control-owned background tab.
+
+### Security
+
+- Trusted operator policy now owns workspace, sensitive-file, output, transport, diagnostic, prompt, attachment, and worker authority; tool arguments cannot expand it.
+- Attachments are immutable private snapshots protected against symlink, non-regular-file, and time-of-check/time-of-use attacks.
+- ChatGPT Pro provenance is derived from live composer selection and read-back immediately before send, never from a requested model string.
+- Submitted work is never replayed after a crash. Cancellation is persisted as an immutable terminal state before best-effort browser stop, so late completion cannot overwrite it.
+- Exact provider conversation URLs are persisted and restored only in the same owned page; conversation drift, page replacement, and first-tab races fail closed.
+- Legacy Oracle argv execution code was removed; passive detection only explains why an installed legacy CLI is not executable. All unavailable-driver paid/focus-stealing fallbacks are disabled. Nonzero child exits cannot masquerade as successful JSON responses.
+
+### Changed
+
+- Local state moves to isolated schema v3 under `~/.gpt-control/v3` by default because previous version-2 records had incompatible shapes.
+- The built-in Chrome Bridge adapter requires its private RPC and identifies as `chrome-bridge/private-rpc-v2`.
+- Package version advances to 0.3.1 and includes a committed, reproducibility-checked Node MCP bundle so Codex plugin snapshots start without `node_modules` or install hooks.
+
 ## [0.3.0] - 2026-08-21
 
 ### Added
