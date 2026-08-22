@@ -1104,19 +1104,16 @@ async function recoverSameConversation(
 		if (last) last.outcome = "recovered";
 		return observation;
 	}
+	// Retry can replay connector or other external side effects that completed
+	// before the provider exposed an error. Leave the turn unchanged so the
+	// caller returns an operator-visible needs_user result.
+	if (observation.retryAvailable) return observation;
 	if (observation.continueAvailable) {
 		try {
 			await bridgeJson(exec, launcher, ["click", String(tabId), "text=Continue generating"], options.signal);
 			options.attempts.push({ at: nowIso(), action: "continue", reason, outcome: "still_active" });
 		} catch (error) {
 			options.attempts.push({ at: nowIso(), action: "continue", reason, outcome: "failed", detail: error instanceof Error ? error.message : String(error) });
-		}
-	} else if (observation.retryAvailable) {
-		try {
-			await bridgeJson(exec, launcher, ["click", String(tabId), "text=Retry"], options.signal);
-			options.attempts.push({ at: nowIso(), action: "retry", reason, outcome: "still_active" });
-		} catch (error) {
-			options.attempts.push({ at: nowIso(), action: "retry", reason, outcome: "failed", detail: error instanceof Error ? error.message : String(error) });
 		}
 	}
 	await sleep(Math.min(pollIntervalMs(), 250));

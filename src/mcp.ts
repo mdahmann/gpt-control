@@ -213,6 +213,7 @@ function registerSubagentRun(
 	server.experimental.tasks.registerToolTask("gpt_subagent_run", config, {
 		async createTask(params: SubagentParams, extra: CreateTaskRequestHandlerExtra) {
 			const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
+			let preparedRunId: string | undefined;
 			const progressToken = readProgressToken(extra._meta?.progressToken);
 			taskStore.setStatusListener(task.taskId, async (updated) => {
 				await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
@@ -223,6 +224,7 @@ function registerSubagentRun(
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
 			try {
 				const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+				preparedRunId = started.run.id;
 				if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
 					throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
 				}
@@ -242,6 +244,12 @@ function registerSubagentRun(
 					scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId);
 				}
 			} catch (error) {
+				const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
+				if (currentTask?.status === "cancelled" && preparedRunId) {
+					await service.cancelPreparedRunUnlessOwnedByAnotherTask(preparedRunId, task.taskId);
+					taskStore.removeStatusListener(task.taskId);
+					return { task };
+				}
 				await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`Pro worker could not start: ${errorMessage(error)}`, {
 					taskId: task.taskId,
 					status: "failed",
@@ -496,7 +504,14 @@ export async function resumeDurableSubagents(
 	for (const binding of bindings) {
 		if (binding.runId) continue;
 		const claimed = claimedRuns.get(binding.task.taskId);
-		if (claimed) await taskStore.bindRun(binding.task.taskId, claimed.id);
+		if (!claimed) continue;
+		if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
+			if (claimed.status !== "completed" && claimed.status !== "failed") {
+				await service.cancelRun(claimed.id);
+			}
+			continue;
+		}
+		await taskStore.bindRun(binding.task.taskId, claimed.id);
 	}
 	bindings = await taskStore.listBindings();
 	// Reconcile durable task authority before recovering runnable work. This also

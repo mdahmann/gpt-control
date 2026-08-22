@@ -202,6 +202,9 @@ export class DurableTaskStore implements TaskStore {
 	async bindRun(taskId: string, runId: string): Promise<void> {
 		await this.lockStore.withTaskLock(taskId, async () => {
 			const record = await this.readRecord(taskId);
+			if (TERMINAL.has(record.task.status)) {
+				throw new Error(`Task ${taskId} is already ${record.task.status} and cannot be bound to a run.`);
+			}
 			if (record.runId && record.runId !== runId) throw new Error(`Task ${taskId} is already bound to another run.`);
 			await this.lockStore.withRunTaskBindingLock(runId, async () => {
 				const existingTaskId = await this.findTaskIdByRun(runId);

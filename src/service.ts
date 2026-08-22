@@ -289,6 +289,14 @@ export class GptControlService {
 		await Promise.allSettled(active.map((value) => value.promise));
 	}
 
+	async cancelPreparedRunUnlessOwnedByAnotherTask(runId: string, taskId: string): Promise<RunRecord> {
+		return this.store.withRunTaskBindingLock(runId, async () => {
+			const current = await this.store.getRun(runId);
+			if (current.mcpTaskId && current.mcpTaskId !== taskId) return current;
+			return this.cancelRun(runId);
+		});
+	}
+
 	async cancelRun(runId: string): Promise<RunRecord> {
 		// Register intent synchronously so a same-process completion that is already
 		// unwinding cannot win merely because the durable operations contain awaits.

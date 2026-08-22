@@ -414,12 +414,14 @@ async function recoverSameDriverConversation(
 		if (last) last.outcome = "recovered";
 		return { ok: true, session: current, observation };
 	}
+	if (observation.retryAvailable) {
+		return {
+			ok: false,
+			reason: `${exactNeedsUserReason(observation, "Provider retry requires operator review")} Automatic Retry is disabled because the prior turn may already have caused external side effects.`,
+		};
+	}
 
-	const action: DriverRecoveryAction | undefined = observation.continueAvailable
-		? "continue"
-		: observation.retryAvailable
-			? "retry"
-			: undefined;
+	const action: DriverRecoveryAction | undefined = observation.continueAvailable ? "continue" : undefined;
 	if (action) {
 		try {
 			await driver.recover(current, action, options.signal);

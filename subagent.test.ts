@@ -584,6 +584,30 @@ describe("MCP task delivery", () => {
 		expect(await store.findTaskIdByRun(prepared.run.id, "session-b")).toBeUndefined();
 	});
 
+	test("cancel cleanup cannot revoke a prepared run owned by another task", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const { service } = makeChromeService(join(root, "state"), workspace, new FakeChromeBridge());
+		const prepared = await service.start({
+			kind: "subagent",
+			prompt: "atomic cleanup owner",
+			idempotencyKey: "atomic-cleanup-owner",
+			wait: false,
+		}, { deferExecution: true });
+		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const cancelledTask = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
+		const ownerTask = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
+		await store.bindRun(ownerTask.taskId, prepared.run.id);
+
+		const preserved = await service.cancelPreparedRunUnlessOwnedByAnotherTask(prepared.run.id, cancelledTask.taskId);
+		expect(preserved.status).toBe("queued");
+		expect(preserved.mcpTaskId).toBe(ownerTask.taskId);
+		const cancelled = await service.cancelPreparedRunUnlessOwnedByAnotherTask(prepared.run.id, ownerTask.taskId);
+		expect(cancelled.status).toBe("cancelled");
+	});
+
 	test("a task rejected from a second run does not claim that run", async () => {
 		const root = scratch();
 		const workspace = join(root, "workspace");
@@ -597,6 +621,32 @@ describe("MCP task delivery", () => {
 		await expect(store.bindRun(task.taskId, second.run.id)).rejects.toThrow(/already bound to another run/i);
 		expect((await service.getRun(first.run.id)).mcpTaskId).toBe(task.taskId);
 		expect((await service.getRun(second.run.id)).mcpTaskId).toBeUndefined();
+	});
+
+	test("refuses to bind an already-cancelled task to a prepared run", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const { service } = makeChromeService(join(root, "state"), workspace, new FakeChromeBridge());
+		const prepared = await service.start({
+			kind: "subagent",
+			prompt: "must remain cancelled before binding",
+			idempotencyKey: "cancel-before-bind",
+			wait: false,
+		}, { deferExecution: true });
+		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
+		const task = await store.createTask(
+			{ ttl: 60_000 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+			"session-a",
+		);
+		await store.updateTaskStatus(task.taskId, "cancelled", "cancel won before binding", "session-a");
+
+		await expect(store.bindRun(task.taskId, prepared.run.id)).rejects.toThrow(/already cancelled/);
+		expect((await service.getRun(prepared.run.id)).mcpTaskId).toBeUndefined();
+		await service.cancelRun(prepared.run.id);
+		expect((await service.getRun(prepared.run.id)).status).toBe("cancelled");
 	});
 
 	test("delivers one successful terminal result exactly once with durable truthful provenance", async () => {
@@ -649,13 +699,15 @@ describe("MCP task delivery", () => {
 		}
 	});
 
-	test("recovers a ChatGPT network error without model-visible status prompts", async () => {
+	test("returns one blocker for ChatGPT Retry without replaying possible connector side effects", async () => {
 		const harness = await connectMcp();
 		try {
 			const events = await collectTask(harness.client, "[network-recover] protocol", "network-recovery");
 			expect(resultEvents(events)).toHaveLength(1);
-			expect(resultEvents(events)[0].result.isError).not.toBe(true);
+			expect(resultEvents(events)[0].result.isError).toBe(true);
+			expect(resultEvents(events)[0].result.structuredContent).toMatchObject({ workerStatus: "input_required" });
 			expect(harness.bridge.submittedPrompts).toEqual(["[network-recover] protocol"]);
+			expect(harness.bridge.calls.some((call) => call.args.includes("text=Retry"))).toBe(false);
 			expect(harness.bridge.submittedPrompts.some((prompt) => /are you done|status/i.test(prompt))).toBe(false);
 		} finally {
 			await harness.close();

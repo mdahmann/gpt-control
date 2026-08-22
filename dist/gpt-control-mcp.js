@@ -34590,7 +34590,13 @@ async function recoverSameDriverConversation(driver, expected, session, initial,
       last.outcome = "recovered";
     return { ok: true, session: current, observation };
   }
-  const action = observation.continueAvailable ? "continue" : observation.retryAvailable ? "retry" : undefined;
+  if (observation.retryAvailable) {
+    return {
+      ok: false,
+      reason: `${exactNeedsUserReason(observation, "Provider retry requires operator review")} Automatic Retry is disabled because the prior turn may already have caused external side effects.`
+    };
+  }
+  const action = observation.continueAvailable ? "continue" : undefined;
   if (action) {
     try {
       await driver.recover(current, action, options.signal);
@@ -36334,6 +36340,14 @@ class GptControlService {
       value.controller.abort(new RestartSuspension);
     await Promise.allSettled(active.map((value) => value.promise));
   }
+  async cancelPreparedRunUnlessOwnedByAnotherTask(runId, taskId) {
+    return this.store.withRunTaskBindingLock(runId, async () => {
+      const current = await this.store.getRun(runId);
+      if (current.mcpTaskId && current.mcpTaskId !== taskId)
+        return current;
+      return this.cancelRun(runId);
+    });
+  }
   async cancelRun(runId) {
     this.cancellationIntents.add(runId);
     this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
@@ -37747,6 +37761,9 @@ class DurableTaskStore {
   async bindRun(taskId, runId) {
     await this.lockStore.withTaskLock(taskId, async () => {
       const record3 = await this.readRecord(taskId);
+      if (TERMINAL3.has(record3.task.status)) {
+        throw new Error(`Task ${taskId} is already ${record3.task.status} and cannot be bound to a run.`);
+      }
       if (record3.runId && record3.runId !== runId)
         throw new Error(`Task ${taskId} is already bound to another run.`);
       await this.lockStore.withRunTaskBindingLock(runId, async () => {
@@ -38108,6 +38125,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
   server.experimental.tasks.registerToolTask("gpt_subagent_run", config2, {
     async createTask(params, extra) {
       const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
+      let preparedRunId;
       const progressToken = readProgressToken(extra._meta?.progressToken);
       taskStore.setStatusListener(task.taskId, async (updated) => {
         await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
@@ -38118,6 +38136,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
       try {
         const started = await service.start(subagentRequest(params, false), { deferExecution: true });
+        preparedRunId = started.run.id;
         if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
           throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
         }
@@ -38134,6 +38153,12 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
           scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId);
         }
       } catch (error51) {
+        const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
+        if (currentTask?.status === "cancelled" && preparedRunId) {
+          await service.cancelPreparedRunUnlessOwnedByAnotherTask(preparedRunId, task.taskId);
+          taskStore.removeStatusListener(task.taskId);
+          return { task };
+        }
         await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`Pro worker could not start: ${errorMessage3(error51)}`, {
           taskId: task.taskId,
           status: "failed",
@@ -38357,8 +38382,15 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map) {
     if (binding.runId)
       continue;
     const claimed = claimedRuns.get(binding.task.taskId);
-    if (claimed)
-      await taskStore.bindRun(binding.task.taskId, claimed.id);
+    if (!claimed)
+      continue;
+    if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
+      if (claimed.status !== "completed" && claimed.status !== "failed") {
+        await service.cancelRun(claimed.id);
+      }
+      continue;
+    }
+    await taskStore.bindRun(binding.task.taskId, claimed.id);
   }
   bindings = await taskStore.listBindings();
   for (const binding of bindings) {

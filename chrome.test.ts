@@ -115,13 +115,14 @@ describe("observed Chrome failures", () => {
 		expect(bridge.submittedPrompts).toEqual(["legacy exact recovery"]);
 	});
 
-	test("recovers a network error by explicit live Retry without duplicate prompt submission", async () => {
+	test("returns needs_user instead of retrying a provider turn that may have external side effects", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({ kind: "subagent", prompt: "[network-recover] continue", timeoutMs: 1000 });
-		expect(result.run.status).toBe("completed");
+		expect(result.run.status).toBe("needs_user");
+		expect(result.run.error).toContain("Automatic Retry is disabled");
 		expect(bridge.submittedPrompts).toHaveLength(1);
-		expect(result.run.receipt.recoveryAttempts?.some((attempt) => attempt.action === "retry")).toBe(true);
+		expect(bridge.calls.some((call) => call.args.includes("text=Retry"))).toBe(false);
 	});
 });
 
