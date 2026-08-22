@@ -67,7 +67,7 @@ describe("public extension contract", () => {
 		const names = tools.map((tool) => tool.name);
 		for (const expected of [
 			"gpt_consult", "gpt_chat", "gpt_image", "gpt_subagent_run", "gpt_subagent_get", "gpt_subagent_cancel", "gpt_subagent_list",
-			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
+			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_attach", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");
 		expect(tools.find((tool) => tool.name === "gpt_diagnose_active")?.approval).toBe("exec");

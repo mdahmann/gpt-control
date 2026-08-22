@@ -321,6 +321,37 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
+		name: "gpt_conversation_attach",
+		label: "GPT Conversation Attach",
+		description: "Attach an exact existing ChatGPT conversation in a new GPT-Control-owned background tab. This does not send a message or adopt a foreground tab.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({
+			conversation_url: Type.Optional(Type.String()),
+			provider_conversation_id: Type.Optional(Type.String()),
+			timeout_ms: Type.Optional(Type.Integer()),
+		}),
+		execute: async (_id, params) => {
+			try {
+				const value = await service.attachConversation({
+					conversationUrl: typeof params.conversation_url === "string" ? params.conversation_url : undefined,
+					providerConversationId: typeof params.provider_conversation_id === "string" ? params.provider_conversation_id : undefined,
+					timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
+				});
+				return textResult(`Attached existing ChatGPT conversation ${value.providerConversationId}.`, {
+					conversationId: value.id,
+					providerConversationId: value.providerConversationId,
+					providerConversationUrl: value.providerConversationUrl,
+					localAssistantTurnCount: value.browserAssistantTurnCount,
+				});
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "gpt_conversation_close",
 		label: "GPT Conversation Close",
 		description: "Close one exactly-owned browser conversation locally; provider-side history is not deleted.",

@@ -483,6 +483,67 @@ describe("bounded Pro worker scheduler", () => {
 	});
 });
 
+describe("existing ChatGPT conversation attachment", () => {
+	test("attaches an exact existing conversation, follows up with the raw prompt, and closes only the local tab", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const attached = await service.attachConversation({
+			conversationUrl: "https://chatgpt.com/c/existing-chat-123/",
+		}, "mcp-owner");
+		expect(attached.providerConversationId).toBe("existing-chat-123");
+		expect(attached.providerConversationUrl).toBe("https://chatgpt.com/c/existing-chat-123");
+		expect(attached.browserAssistantTurnCount).toBe(0);
+		expect(bridge.activeTabs()).toHaveLength(1);
+
+		const result = await service.start({
+			kind: "chat",
+			prompt: "normal human follow-up",
+			conversationId: attached.id,
+			timeoutMs: 1500,
+		}, { mcpSessionId: "mcp-owner" });
+		expect(result.run.status).toBe("completed");
+		expect(result.run.receipt.providerConversationUrl).toBe("https://chatgpt.com/c/existing-chat-123");
+		expect(bridge.submittedPrompts).toEqual(["normal human follow-up"]);
+		expect(bridge.activeTabs()).toHaveLength(1);
+
+		await service.closeConversation(attached.id, "mcp-owner");
+		expect(bridge.activeTabs()).toEqual([]);
+		expect((await service.store.getConversation(attached.id)).closedAt).toBeDefined();
+	});
+
+	test("rejects malformed or ambiguous identities before allocating a tab", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		await expect(service.attachConversation({ conversationUrl: "https://example.com/c/nope" })).rejects.toThrow("must identify one exact");
+		await expect(service.attachConversation({ conversationUrl: "https://chatgpt.com/c/okay?x=1" })).rejects.toThrow("without query");
+		await expect(service.attachConversation({ conversationUrl: "https://chatgpt.com/c/okay", providerConversationId: "okay" })).rejects.toThrow("exactly one");
+		expect(bridge.activeTabs()).toEqual([]);
+	});
+
+	test("fails closed on an exact-conversation redirect and closes the allocated tab", async () => {
+		const bridge = new FakeChromeBridge({ attachRedirectUrl: "https://chatgpt.com/" });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		await expect(service.attachConversation({ providerConversationId: "wanted-chat" })).rejects.toThrow("did not retain exact");
+		expect(bridge.activeTabs()).toEqual([]);
+		const records = await service.store.listConversations();
+		expect(records).toHaveLength(1);
+		expect(records[0].closedAt).toBeDefined();
+	});
+
+	test("serializes duplicate attachment and preserves MCP-session ownership", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(root, workspace, bridge);
+		const second = makeChromeService(root, workspace, bridge);
+		const attached = await first.service.attachConversation({ providerConversationId: "shared-chat" }, "first-session");
+		await expect(second.service.attachConversation({ providerConversationId: "shared-chat" }, "second-session"))
+			.rejects.toThrow(`already attached as ${attached.id}`);
+		await expect(second.service.closeConversation(attached.id, "second-session")).rejects.toThrow("not owned");
+		await first.service.closeConversation(attached.id, "first-session");
+	});
+});
+
 interface McpHarness {
 	client: Client;
 	server: ReturnType<typeof createMcpServer>;
@@ -539,6 +600,30 @@ function taskIdFrom(events: Array<Record<string, unknown>>): string {
 }
 
 describe("MCP task delivery", () => {
+	test("exposes exact existing-conversation attachment through the public MCP tools", async () => {
+		const harness = await connectMcp();
+		try {
+			const attached = await harness.client.callTool({
+				name: "gpt_conversation_attach",
+				arguments: { provider_conversation_id: "mcp-existing-chat" },
+			});
+			expect(attached.isError).not.toBe(true);
+			expect(attached.structuredContent).toMatchObject({
+				providerConversationId: "mcp-existing-chat",
+				providerConversationUrl: "https://chatgpt.com/c/mcp-existing-chat",
+			});
+			const conversationId = (attached.structuredContent as { conversationId: string }).conversationId;
+			const closed = await harness.client.callTool({
+				name: "gpt_conversation_close",
+				arguments: { conversation_id: conversationId },
+			});
+			expect(closed.isError).not.toBe(true);
+			expect(harness.bridge.activeTabs()).toEqual([]);
+		} finally {
+			await harness.close();
+		}
+	});
+
 	test("waits for startup recovery before creating a new protocol task", async () => {
 		const harness = await connectMcp({ recover: true });
 		try {

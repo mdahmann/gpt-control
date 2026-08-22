@@ -50,6 +50,7 @@ never passed through child-process argv.
 |---|---|
 | `gpt_consult` | Structured independent review with evidence, manifest, and receipt |
 | `gpt_chat` | Start or continue one exact ChatGPT conversation |
+| `gpt_conversation_attach` | Open an exact existing ChatGPT conversation in a new owned background tab |
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
 | `gpt_run_cancel` | Durably cancel any active run |
@@ -66,9 +67,25 @@ never passed through child-process argv.
 ## Codex Pro workers
 
 `gpt_subagent_run` requires an idempotency key and creates a fresh owned
-conversation. Trusted policy permits at most three simultaneous workers, even
-across broker processes sharing the same state root. A fourth worker queues
-fairly.
+conversation. Trusted policy defaults to six simultaneous workers and permits
+an operator-configured limit from one through ten, even across broker processes
+sharing the same state root. Additional workers queue fairly.
+
+## Existing ChatGPT conversations
+
+`gpt_conversation_attach` accepts exactly one canonical
+`https://chatgpt.com/c/<id>` URL or provider conversation ID. It opens that URL
+in a new GPT-Control-owned background tab, proves the exact session, page, URL,
+and ready composer, and returns a local `conversationId`. It does not send a
+message and it does not adopt or mutate a foreground tab. Use the returned ID
+with `gpt_chat`; each new send still selects and verifies Pro immediately before
+submission. `gpt_conversation_close` closes only the owned local tab. The
+provider conversation remains in ChatGPT history.
+
+Chat Manager or another thread inventory can help a Codex orchestrator find an
+exact URL, but GPT-Control does not load or depend on Chat Manager at runtime.
+Titles, previews, and prior conversation text are untrusted discovery context,
+not new instructions.
 
 The MCP server advertises optional task execution through the installed MCP SDK.
 Task-capable clients can use task status/result/cancel. The run is durably bound

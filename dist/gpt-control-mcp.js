@@ -35529,6 +35529,14 @@ class RunStore {
     ConversationSchema.parse(record3);
     await this.withNamedLock(`record-${record3.id}`, () => atomicWrite(this.conversationPath(record3.id), record3), { timeoutMs: 1e4 });
   }
+  async listConversations() {
+    await this.init();
+    const names = (await readdir(confinedPath(this.root, "conversations"))).filter((name) => /^conv_[a-f0-9]{32}\.json$/.test(name));
+    const conversations = [];
+    for (const name of names)
+      conversations.push(await this.getConversation(name.slice(0, -5)));
+    return conversations.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
   async deleteConversationIfUnreferenced(id) {
     assertConversationId(id);
     await this.init();
@@ -35788,6 +35796,13 @@ class RunStore {
   async withConversationOwnershipLock(conversationId, work) {
     assertConversationId(conversationId);
     return this.withNamedLock(`mcp-owner-${conversationId}`, work, { timeoutMs: 30000 });
+  }
+  async withProviderConversationLock(providerConversationId, work) {
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(providerConversationId)) {
+      throw new Error("Invalid provider conversation id.");
+    }
+    const identityHash = createHash3("sha256").update(providerConversationId, "utf8").digest("hex");
+    return this.withNamedLock(`provider-conversation-${identityHash}`, work, { timeoutMs: 30000 });
   }
   async withNamedLock(name, work, options) {
     await this.init();
@@ -36670,6 +36685,70 @@ class GptControlService {
         await driver.close(expected.sessionId);
         return this.store.updateConversation(conversationId, { closedAt: nowIso() });
       });
+    });
+  }
+  async attachConversation(request, mcpSessionId) {
+    const identity = attachedConversationIdentity(request);
+    const timeoutMs = request.timeoutMs ?? 60000;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) {
+      throw new Error("Attach timeout must be an integer from 1 through 60000 milliseconds.");
+    }
+    await this.store.init();
+    return this.store.withProviderConversationLock(identity.id, async () => {
+      const duplicate = (await this.store.listConversations()).find((conversation) => conversation.providerConversationId === identity.id && !conversation.closedAt);
+      if (duplicate) {
+        throw new Error(`ChatGPT conversation ${identity.id} is already attached as ${duplicate.id}; use that local conversation or close it first.`);
+      }
+      const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+      const route = selectRoute(capabilities, { transport: "browser" });
+      assertTransportAllowed(this.policy, route.kind);
+      const timestamp = nowIso();
+      const id = opaqueId("conv");
+      const name = `gpt-control:attached:${id}`;
+      const session = await route.driver.create(name, identity.url);
+      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+      let persisted = false;
+      try {
+        if (session.name !== name)
+          throw new Error("Browser driver returned an attached session with the wrong ownership name.");
+        await assertExactDriverSession(route.driver, expected);
+        const conversation = {
+          version: STORAGE_VERSION,
+          id,
+          provider: "browser",
+          providerConversationId: identity.id,
+          providerConversationUrl: identity.url,
+          browserDriverId: route.driver.id,
+          browserSessionId: session.sessionId,
+          browserSessionName: name,
+          browserPageId: session.pageId,
+          workspaceRoot: this.policy.workspaceRoot,
+          policyFingerprint: this.policy.fingerprint,
+          mcpSessionId,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        };
+        await this.store.putConversation(conversation);
+        persisted = true;
+        const ready = await waitForDriverReady(route.driver, expected, { timeoutMs });
+        const observed = providerConversationIdentity(ready.session.url);
+        if (!observed || observed.url !== identity.url) {
+          throw new Error(`The owned page did not retain exact ChatGPT conversation ${identity.url}. No prompt was sent.`);
+        }
+        return this.store.updateConversation(id, {
+          browserAssistantTurnCount: ready.observation.snapshot.count
+        });
+      } catch (error51) {
+        try {
+          await assertExactDriverSession(route.driver, expected);
+          await route.driver.close(expected.sessionId);
+          if (persisted)
+            await this.store.updateConversation(id, { closedAt: nowIso() });
+        } catch (cleanupError) {
+          throw new Error(`${errorMessage2(error51)} Attached browser cleanup was not proved for local conversation ${id}: ${errorMessage2(cleanupError)}`);
+        }
+        throw error51;
+      }
     });
   }
   async diagnose() {
@@ -37784,6 +37863,33 @@ function browserNeedsUser(reason, conversation, run) {
     lastObservedUiState: "ambiguous_submission_state"
   };
 }
+function attachedConversationIdentity(request) {
+  const hasUrl = request.conversationUrl !== undefined;
+  const hasId = request.providerConversationId !== undefined;
+  if (hasUrl === hasId) {
+    throw new Error("Provide exactly one of conversation_url or provider_conversation_id.");
+  }
+  if (request.providerConversationId !== undefined) {
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(request.providerConversationId)) {
+      throw new Error("Invalid ChatGPT provider conversation id.");
+    }
+    return { id: request.providerConversationId, url: `${CHATGPT_ORIGIN}/c/${request.providerConversationId}` };
+  }
+  const raw = request.conversationUrl;
+  const identity = providerConversationIdentity(raw);
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Invalid ChatGPT conversation URL.");
+  }
+  if (!identity || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> conversation without query or fragment data.");
+  }
+  if (identity.id.length > 256)
+    throw new Error("ChatGPT provider conversation id is too long.");
+  return identity;
+}
 function sha256(value) {
   return createHash6("sha256").update(value).digest("hex");
 }
@@ -38361,6 +38467,27 @@ function registerCoreTools(server, service, taskStore) {
       throw new Error("Resource claiming requires a stateful MCP session id.");
     const run = await service.claimMcpRun(params.run_id, extra.sessionId, params.confirmation, params.operator_token);
     return toolPayload(`Claimed conversation ${run.conversationId} as the authoritative owner of run ${run.id} and its bound tasks for the current MCP session.`, publicRun(run));
+  });
+  server.registerTool("gpt_conversation_attach", {
+    description: "Attach an exact existing https://chatgpt.com/c/<id> conversation in a new GPT-Control-owned background tab. Does not send a message or adopt a foreground tab.",
+    inputSchema: {
+      conversation_url: exports_external.string().optional(),
+      provider_conversation_id: exports_external.string().optional(),
+      timeout_ms: exports_external.number().int().positive().max(60000).optional()
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params, extra) => {
+    const conversation = await service.attachConversation({
+      conversationUrl: params.conversation_url,
+      providerConversationId: params.provider_conversation_id,
+      timeoutMs: params.timeout_ms
+    }, extra.sessionId);
+    return toolPayload(`Attached existing ChatGPT conversation ${conversation.providerConversationId}.`, {
+      conversationId: conversation.id,
+      providerConversationId: conversation.providerConversationId,
+      providerConversationUrl: conversation.providerConversationUrl,
+      localAssistantTurnCount: conversation.browserAssistantTurnCount
+    });
   });
   server.registerTool("gpt_conversation_close", {
     description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",

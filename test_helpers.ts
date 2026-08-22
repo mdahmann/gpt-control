@@ -13,6 +13,7 @@ export const TEST_OPERATOR_ABANDON_TOKEN = "test-only-provider-abandon-token-000
 
 export interface FakeBridgeOptions {
 	firstTabRaceReads?: number;
+	attachRedirectUrl?: string;
 	initialModel?: string;
 	modelSelectorAbsent?: boolean;
 	modelAvailable?: boolean;
@@ -246,7 +247,8 @@ export class FakeChromeBridge {
 		}
 		if (operation === "navigate") {
 			const sessionId = String(args[1]);
-			const url = String(args[2]);
+			const requestedUrl = String(args[2]);
+			const url = this.options.attachRedirectUrl ?? requestedUrl;
 			const existing = [...this.tabs.values()].find((tab) => tab.sessionId === sessionId);
 			if (existing) {
 				existing.url = url;

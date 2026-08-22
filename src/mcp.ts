@@ -180,6 +180,28 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		);
 	});
 
+	server.registerTool("gpt_conversation_attach", {
+		description: "Attach an exact existing https://chatgpt.com/c/<id> conversation in a new GPT-Control-owned background tab. Does not send a message or adopt a foreground tab.",
+		inputSchema: {
+			conversation_url: z.string().optional(),
+			provider_conversation_id: z.string().optional(),
+			timeout_ms: z.number().int().positive().max(60_000).optional(),
+		},
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params, extra) => {
+		const conversation = await service.attachConversation({
+			conversationUrl: params.conversation_url,
+			providerConversationId: params.provider_conversation_id,
+			timeoutMs: params.timeout_ms,
+		}, extra.sessionId);
+		return toolPayload(`Attached existing ChatGPT conversation ${conversation.providerConversationId}.`, {
+			conversationId: conversation.id,
+			providerConversationId: conversation.providerConversationId,
+			providerConversationUrl: conversation.providerConversationUrl,
+			localAssistantTurnCount: conversation.browserAssistantTurnCount,
+		});
+	});
+
 	server.registerTool("gpt_conversation_close", {
 		description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
 		inputSchema: { conversation_id: z.string() },

@@ -318,6 +318,15 @@ export class RunStore {
 		await this.withNamedLock(`record-${record.id}`, () => atomicWrite(this.conversationPath(record.id), record), { timeoutMs: 10_000 });
 	}
 
+	async listConversations(): Promise<ConversationRecord[]> {
+		await this.init();
+		const names = (await readdir(confinedPath(this.root, "conversations")))
+			.filter((name) => /^conv_[a-f0-9]{32}\.json$/.test(name));
+		const conversations: ConversationRecord[] = [];
+		for (const name of names) conversations.push(await this.getConversation(name.slice(0, -5)));
+		return conversations.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	}
+
 	async deleteConversationIfUnreferenced(id: string): Promise<void> {
 		assertConversationId(id);
 		await this.init();
@@ -594,6 +603,14 @@ export class RunStore {
 	async withConversationOwnershipLock<T>(conversationId: string, work: () => Promise<T>): Promise<T> {
 		assertConversationId(conversationId);
 		return this.withNamedLock(`mcp-owner-${conversationId}`, work, { timeoutMs: 30_000 });
+	}
+
+	async withProviderConversationLock<T>(providerConversationId: string, work: () => Promise<T>): Promise<T> {
+		if (!/^[A-Za-z0-9_-]{1,256}$/.test(providerConversationId)) {
+			throw new Error("Invalid provider conversation id.");
+		}
+		const identityHash = createHash("sha256").update(providerConversationId, "utf8").digest("hex");
+		return this.withNamedLock(`provider-conversation-${identityHash}`, work, { timeoutMs: 30_000 });
 	}
 
 	private async withNamedLock<T>(name: string, work: () => Promise<T>, options: LockOptions): Promise<T> {

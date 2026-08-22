@@ -8,6 +8,7 @@
 - Connector-aware worker intent with explicit preferred/required semantics and blocker behavior for unavailable required connectors.
 - Codex plugin metadata, portable MCP launcher, migration guidance, security model, and disposable-Chrome validation procedure.
 - Browser-driver protocol v2 with separate fill and send operations, secure-input attestation, exact session/page ownership, live UI observations, and bounded same-conversation recovery.
+- Exact existing-conversation attachment by canonical ChatGPT URL or provider ID in a separate GPT-Control-owned background tab.
 
 ### Security
 

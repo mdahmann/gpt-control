@@ -92,6 +92,12 @@ export interface StartOptions {
 	mcpSessionId?: string;
 }
 
+export interface AttachConversationRequest {
+	conversationUrl?: string;
+	providerConversationId?: string;
+	timeoutMs?: number;
+}
+
 export interface ServiceDependencies {
 	resolveCapabilities?: (exec: Exec, env?: NodeJS.ProcessEnv, signal?: AbortSignal) => Promise<Capabilities>;
 }
@@ -418,6 +424,71 @@ export class GptControlService {
 				await driver.close(expected.sessionId);
 				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
 			});
+		});
+	}
+
+	async attachConversation(request: AttachConversationRequest, mcpSessionId?: string): Promise<ConversationRecord> {
+		const identity = attachedConversationIdentity(request);
+		const timeoutMs = request.timeoutMs ?? 60_000;
+		if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+			throw new Error("Attach timeout must be an integer from 1 through 60000 milliseconds.");
+		}
+		await this.store.init();
+		return this.store.withProviderConversationLock(identity.id, async () => {
+			const duplicate = (await this.store.listConversations()).find((conversation) =>
+				conversation.providerConversationId === identity.id && !conversation.closedAt);
+			if (duplicate) {
+				throw new Error(`ChatGPT conversation ${identity.id} is already attached as ${duplicate.id}; use that local conversation or close it first.`);
+			}
+
+			const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+			const route = selectRoute(capabilities, { transport: "browser" });
+			assertTransportAllowed(this.policy, route.kind);
+			const timestamp = nowIso();
+			const id = opaqueId("conv");
+			const name = `gpt-control:attached:${id}`;
+			const session = await route.driver.create(name, identity.url);
+			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+			let persisted = false;
+			try {
+				if (session.name !== name) throw new Error("Browser driver returned an attached session with the wrong ownership name.");
+				await assertExactDriverSession(route.driver, expected);
+				const conversation: ConversationRecord = {
+					version: STORAGE_VERSION,
+					id,
+					provider: "browser",
+					providerConversationId: identity.id,
+					providerConversationUrl: identity.url,
+					browserDriverId: route.driver.id,
+					browserSessionId: session.sessionId,
+					browserSessionName: name,
+					browserPageId: session.pageId,
+					workspaceRoot: this.policy.workspaceRoot,
+					policyFingerprint: this.policy.fingerprint,
+					mcpSessionId,
+					createdAt: timestamp,
+					updatedAt: timestamp,
+				};
+				await this.store.putConversation(conversation);
+				persisted = true;
+				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs });
+				const observed = providerConversationIdentity(ready.session.url);
+				if (!observed || observed.url !== identity.url) {
+					throw new Error(`The owned page did not retain exact ChatGPT conversation ${identity.url}. No prompt was sent.`);
+				}
+				return this.store.updateConversation(id, {
+					browserAssistantTurnCount: ready.observation.snapshot.count,
+				});
+			} catch (error) {
+				try {
+					await assertExactDriverSession(route.driver, expected);
+					await route.driver.close(expected.sessionId);
+					if (persisted) await this.store.updateConversation(id, { closedAt: nowIso() });
+				} catch (cleanupError) {
+					throw new Error(`${errorMessage(error)} Attached browser cleanup was not proved for local conversation ${id}: ${errorMessage(cleanupError)}`);
+				}
+				throw error;
+			}
 		});
 	}
 
@@ -1655,6 +1726,29 @@ function browserNeedsUser(reason: string, conversation: ConversationRecord, run:
 		localAssistantTurnCount: run.baselineMessageCount,
 		lastObservedUiState: "ambiguous_submission_state",
 	};
+}
+
+function attachedConversationIdentity(request: AttachConversationRequest): { id: string; url: string } {
+	const hasUrl = request.conversationUrl !== undefined;
+	const hasId = request.providerConversationId !== undefined;
+	if (hasUrl === hasId) {
+		throw new Error("Provide exactly one of conversation_url or provider_conversation_id.");
+	}
+	if (request.providerConversationId !== undefined) {
+		if (!/^[A-Za-z0-9_-]{1,256}$/.test(request.providerConversationId)) {
+			throw new Error("Invalid ChatGPT provider conversation id.");
+		}
+		return { id: request.providerConversationId, url: `${CHATGPT_ORIGIN}/c/${request.providerConversationId}` };
+	}
+	const raw = request.conversationUrl!;
+	const identity = providerConversationIdentity(raw);
+	let parsed: URL;
+	try { parsed = new URL(raw); } catch { throw new Error("Invalid ChatGPT conversation URL."); }
+	if (!identity || parsed.username || parsed.password || parsed.search || parsed.hash) {
+		throw new Error("Conversation URL must identify one exact https://chatgpt.com/c/<id> conversation without query or fragment data.");
+	}
+	if (identity.id.length > 256) throw new Error("ChatGPT provider conversation id is too long.");
+	return identity;
 }
 
 function sha256(value: string): string {
