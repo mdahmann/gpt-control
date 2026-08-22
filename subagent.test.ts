@@ -45,7 +45,7 @@ describe("bounded Pro worker scheduler", () => {
 		expect(result.run.receipt).toMatchObject({ observedModel: "Pro", modelVerified: true });
 	});
 
-	test("accepts the broker proof when ChatGPT renders Markdown syntax away", async () => {
+	test("binds the first provider user-message id when ChatGPT renders Markdown syntax away", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({
@@ -58,7 +58,7 @@ describe("bounded Pro worker scheduler", () => {
 		expect(result.run.providerUserMessageId).toBeDefined();
 	});
 
-	test("rejects a rendered user turn whose task body changed but proof survived", async () => {
+	test("keeps provider identity when the post-send transcript renderer changes text", async () => {
 		const bridge = new FakeChromeBridge({ mutateRenderedPrompt: true });
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({
@@ -67,12 +67,11 @@ describe("bounded Pro worker scheduler", () => {
 			idempotencyKey: "mutated-rendered-prompt",
 			timeoutMs: 1000,
 		});
-		expect(result.run.status).toBe("needs_user");
-		expect(result.run.error).toContain("did not match the broker-owned send-boundary proof");
-		expect(result.run.providerUserMessageId).toBeUndefined();
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerUserMessageId).toBeDefined();
 	});
 
-	test("rejects unexpected instructions outside the authenticated task envelope", async () => {
+	test("does not depend on synthetic post-send transcript siblings", async () => {
 		const bridge = new FakeChromeBridge({ injectEnvelopeInstruction: true });
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({
@@ -81,8 +80,8 @@ describe("bounded Pro worker scheduler", () => {
 			idempotencyKey: "mutated-envelope-sibling",
 			timeoutMs: 1000,
 		});
-		expect(result.run.status).toBe("needs_user");
-		expect(result.run.providerUserMessageId).toBeUndefined();
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerUserMessageId).toBeDefined();
 	});
 
 	test("requires each request to opt in to operator-approved file exceptions", async () => {
@@ -191,15 +190,13 @@ describe("bounded Pro worker scheduler", () => {
 		expect(bridge.activeTabs()).toEqual([]);
 	});
 
-	test("validates the final wrapped prompt before allocating a browser session", async () => {
+	test("validates a generated review prompt before allocating a browser session", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxPromptBytes: 128 });
 		await expect(service.start({
-			kind: "subagent",
+			kind: "consult",
 			prompt: "x",
 			idempotencyKey: "wrapped-prompt-limit",
-			connectors: ["GitHub"],
-			connectorMode: "require",
 			wait: false,
 		})).rejects.toThrow(/Prompt exceeds trusted 128-byte limit/);
 		expect(bridge.activeTabs()).toEqual([]);
@@ -374,12 +371,12 @@ describe("bounded Pro worker scheduler", () => {
 		expect(bridge.activeTabs()).toEqual([]);
 	});
 
-	test("records connector intent and sends a non-authoritative required-connector contract", async () => {
+	test("records connector intent without rewriting the assignment", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const value = await service.start({
 			kind: "subagent",
-			prompt: "Inspect the repository evidence.",
+			prompt: "Use @GitHub and @Zenbox to inspect the repository evidence.",
 			idempotencyKey: "connector-intent",
 			connectors: ["GitHub", "Zenbox", "GitHub"],
 			connectorMode: "require",
@@ -388,10 +385,7 @@ describe("bounded Pro worker scheduler", () => {
 		expect(value.run.status).toBe("completed");
 		expect(value.run.connectorIntent).toEqual({ names: ["GitHub", "Zenbox"], mode: "require" });
 		expect(bridge.submittedPrompts).toHaveLength(1);
-		expect(bridge.submittedPrompts[0]).toContain("this text does not grant permissions");
-		expect(bridge.submittedPrompts[0]).toContain("Every listed connector is required");
-		expect(bridge.submittedPrompts[0]).toContain("do not fabricate access");
-		expect(bridge.submittedPrompts[0]).toContain("Inspect the repository evidence.");
+		expect(bridge.submittedPrompts[0]).toBe("Use @GitHub and @Zenbox to inspect the repository evidence.");
 	});
 
 	test("rejects connector intent on ordinary chats and unsafe connector names", async () => {
@@ -498,14 +492,14 @@ interface McpHarness {
 	close: () => Promise<void>;
 }
 
-async function connectMcp(options: { taskSupport?: boolean; clientTasks?: boolean; bridge?: FakeChromeBridge; root?: string } = {}): Promise<McpHarness> {
+async function connectMcp(options: { taskSupport?: boolean; clientTasks?: boolean; bridge?: FakeChromeBridge; root?: string; recover?: boolean } = {}): Promise<McpHarness> {
 	const root = options.root ?? scratch();
 	const workspace = join(root, "workspace");
 	mkdirSync(workspace, { recursive: true });
 	const bridge = options.bridge ?? new FakeChromeBridge();
 	const { service } = makeChromeService(join(root, "state"), workspace, bridge);
 	const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
-	const server = createMcpServer({ service, taskStore, recover: false, taskSupport: options.taskSupport });
+	const server = createMcpServer({ service, taskStore, recover: options.recover ?? false, taskSupport: options.taskSupport });
 	const client = new Client({ name: "codex-fixture", version: "1" }, options.clientTasks === false ? {} : {
 		capabilities: { tasks: { requests: { tools: { call: {} } } } },
 	});
@@ -545,6 +539,18 @@ function taskIdFrom(events: Array<Record<string, unknown>>): string {
 }
 
 describe("MCP task delivery", () => {
+	test("waits for startup recovery before creating a new protocol task", async () => {
+		const harness = await connectMcp({ recover: true });
+		try {
+			const events = await collectTask(harness.client, "start after recovery", "start-after-recovery");
+			expect(resultEvents(events)).toHaveLength(1);
+			expect(resultEvents(events)[0].result.isError).not.toBe(true);
+			expect(harness.bridge.submittedPrompts).toEqual(["start after recovery"]);
+		} finally {
+			await harness.close();
+		}
+	});
+
 	test("isolates task listing, reads, results, and cancellation by MCP session", async () => {
 		const root = scratch();
 		const store = new DurableTaskStore(join(root, "mcp-tasks"));
@@ -905,6 +911,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const legacy = JSON.parse(readFileSync(runPath, "utf8")) as Record<string, unknown>;
 		delete legacy.providerTurnPending;
 		legacy.providerStopRequested = true;
+		delete legacy.providerUserMessageId;
 		delete legacy.promptProofToken;
 		delete legacy.promptObservationSha256;
 		legacy.status = "needs_user";
@@ -1367,7 +1374,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			} });
 			expect(await harness.taskStore.listBindings()).toEqual([]);
 			expect(harness.bridge.submittedPrompts).toHaveLength(1);
-			expect(harness.bridge.submittedPrompts[0]).toContain("Assignment:\nfallback worker");
+			expect(harness.bridge.submittedPrompts[0]).toBe("fallback worker");
 		} finally {
 			await harness.close();
 		}

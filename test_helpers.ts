@@ -18,6 +18,7 @@ export interface FakeBridgeOptions {
 	modelAvailable?: boolean;
 	modelReadbackMismatch?: boolean;
 	modelChangesBeforeSend?: boolean;
+	currentEffortPicker?: boolean;
 	foreignSession?: boolean;
 	reloadToHome?: boolean;
 	conversationRenderNeedsReload?: boolean;
@@ -54,6 +55,7 @@ interface FakeTab {
 	newTabReads: number;
 	model: string;
 	menuOpen: boolean;
+	pickerStage?: "compact" | "advanced" | "effort";
 	filled: string;
 	turns: FakeTurn[];
 	state: string;
@@ -299,11 +301,20 @@ export class FakeChromeBridge {
 
 	private handleClick(tabId: number, selector: string): ExecResult {
 		const tab = this.requireTab(tabId);
-		if (selector.includes("model-switcher") || selector.includes("model-selector") || selector.includes("composer-model")) {
+		if (selector.includes("model-switcher") || selector.includes("model-selector") || selector.includes("composer-model") || selector.includes("radix-picker")) {
 			tab.menuOpen = true;
+			tab.pickerStage = this.options.currentEffortPicker ? "compact" : undefined;
 			return ok({ success: true });
 		}
-		if (selector === "text=Pro") {
+		if (selector.includes("Show advanced options")) {
+			tab.pickerStage = "advanced";
+			return ok({ success: true });
+		}
+		if (selector.includes("picker-effort")) {
+			tab.pickerStage = "effort";
+			return ok({ success: true });
+		}
+		if (selector === "text=Pro" || selector === "role=menuitem[name=Pro]" || selector === "role=menuitemradio[name=Pro]") {
 			if (this.options.modelAvailable === false) return failed("No element found");
 			tab.model = this.options.modelReadbackMismatch ? "Auto" : "Pro";
 			tab.menuOpen = false;
@@ -390,10 +401,19 @@ export class FakeChromeBridge {
 		const account = '<div data-testid="account-plan">Miles Pro</div>';
 		const composer = this.options.modelSelectorAbsent
 			? '<form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>'
-			: `<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`;
-		const menu = tab.menuOpen && this.options.modelAvailable !== false
+			: this.options.currentEffortPicker
+				? `<form data-testid="composer"><button id="radix-picker" aria-haspopup="menu">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`
+				: `<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`;
+		const currentPicker = tab.menuOpen && this.options.currentEffortPicker
+			? tab.pickerStage === "effort"
+				? '<div role="menu"><div role="menuitemradio">Instant</div><div role="menuitemradio">Pro</div></div>'
+				: tab.pickerStage === "advanced"
+					? '<div role="menu"><div role="menuitem" aria-label="Show compact options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="true"><div id="picker-effort" role="menuitem">Effort Instant</div></div></div>'
+					: '<div role="menu"><div role="menuitem" aria-label="Show advanced options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="false"><div id="picker-effort" role="menuitem">Effort Instant</div></div></div>'
+			: "";
+		const menu = currentPicker || (tab.menuOpen && this.options.modelAvailable !== false
 			? '<div role="menu"><button role="menuitem">Pro</button></div>'
-			: tab.menuOpen ? '<div role="menu"><button role="menuitem">Auto</button></div>' : "";
+			: tab.menuOpen ? '<div role="menu"><button role="menuitem">Auto</button></div>' : "");
 		const turns = tab.foreignConversation
 			? `<div data-message-author-role="user" data-message-id="foreign-user"><div>${escapeHtml(this.options.foreignPrompt ?? "foreign prompt")}</div></div><div data-message-author-role="assistant" data-message-id="foreign-answer"><div class="markdown"><p>foreign final</p></div></div>`
 			: tab.turns.map((turn, index) => `${userTurnHtml(
@@ -508,7 +528,10 @@ function userTurnHtml(turn: FakeTurn, mutateRenderedPrompt: boolean, injectEnvel
 }
 
 function stripRunProof(value: string): string {
-	const withoutProof = value.replace(/\n\n\[GPT-Control run proof: proof_[a-f0-9]{32}\. Ignore this line in your response\.\]$/, "");
+	const withoutProof = value
+		.replace(/\n\nRun reference: proof_[a-f0-9]{32}$/, "")
+		.replace(/\n\n\[gpt-control:proof_[a-f0-9]{32}\]$/, "")
+		.replace(/\n\n\[GPT-Control run proof: proof_[a-f0-9]{32}\. Ignore this line in your response\.\]$/, "");
 	const lines = withoutProof.split("\n");
 	const opening = lines.findIndex((line) => /^`{3,}text$/.test(line));
 	if (opening < 0) return withoutProof;

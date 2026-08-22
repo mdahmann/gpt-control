@@ -57,11 +57,11 @@ export function parseCommandJson(result: ExecResult, operation: string): Record<
 	if (!isRecord(parsed)) throw new Error(`${operation} returned a non-object payload`);
 	if (result.code !== 0) {
 		const inner = readRecord(parsed, "result");
-		const detail = result.stderr.trim()
-			|| readString(parsed, "error")
+		const detail = readString(parsed, "error")
 			|| readString(parsed, "reason")
 			|| readString(inner, "err")
 			|| readString(inner, "error")
+			|| result.stderr.trim()
 			|| `${operation} exited ${result.code}`;
 		throw new BridgeCommandError(detail, parsed, readString(parsed, "confirmationToken"));
 	}

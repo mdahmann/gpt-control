@@ -144,6 +144,15 @@ describe("child-process and diagnosis safety", () => {
 		expect(() => parseCommandJson({ stdout: JSON.stringify({ success: true }), stderr: "real failure", code: 7, killed: false }, "fake")).toThrow("real failure");
 	});
 
+	test("structured bridge errors outrank generic process-wrapper stderr", () => {
+		expect(() => parseCommandJson({
+			stdout: JSON.stringify({ success: false, error: "expectedTarget exact URL changed before the browser action" }),
+			stderr: "Command failed: private bridge helper",
+			code: 1,
+			killed: false,
+		}, "fake")).toThrow("expectedTarget exact URL changed before the browser action");
+	});
+
 	test("private Chrome Bridge RPC keeps prompt and snapshot paths out of argv and removes its request", async () => {
 		const seen: string[][] = [];
 		let requestPath = "";

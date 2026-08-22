@@ -32,7 +32,10 @@ export interface BridgeProbe {
 }
 
 const DEFAULT_BRIDGE_ROOTS = ["Projects/chrome-bridge", "Projects/chrome-native-bridge", "chrome-bridge", "src/chrome-bridge"];
-const BRIDGE_RPC_HELPER = fileURLToPath(new URL("./bridge_rpc.py", import.meta.url));
+const BRIDGE_RPC_HELPERS = [
+	fileURLToPath(new URL("./bridge_rpc.py", import.meta.url)),
+	fileURLToPath(new URL("../src/bridge_rpc.py", import.meta.url)),
+];
 
 function isExecutable(path: string): boolean {
 	try {
@@ -88,7 +91,8 @@ function resolvePython(env: NodeJS.ProcessEnv): string | undefined {
 
 function attachPrivateRpc(launcher: Launcher, env: NodeJS.ProcessEnv, explicitClient?: string): Launcher {
 	const python = resolvePython(env);
-	if (!python || !isReadable(BRIDGE_RPC_HELPER)) return launcher;
+	const helper = BRIDGE_RPC_HELPERS.find(isReadable);
+	if (!python || !helper) return launcher;
 	let client = explicitClient;
 	if (!client && launcher.args.length > 0) {
 		const first = isAbsolute(launcher.args[0]) ? launcher.args[0] : resolve(launcher.cwd ?? process.cwd(), launcher.args[0]);
@@ -105,7 +109,7 @@ function attachPrivateRpc(launcher: Launcher, env: NodeJS.ProcessEnv, explicitCl
 		...launcher,
 		privateRpc: {
 			command: python,
-			args: [BRIDGE_RPC_HELPER],
+			args: [helper],
 			clientScript: resolve(client),
 			origin: `private request-file RPC via ${client}`,
 		},

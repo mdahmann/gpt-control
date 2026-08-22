@@ -256,6 +256,7 @@ describe("MCP plugin contract", () => {
 			expect((fallbackOwnerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(fallbackRunId);
 			expect((await clientA.callTool({ name: "gpt_run", arguments: { action: "status", run_id: fallbackRunId } })).isError).toBe(true);
 		} finally {
+			await service.suspendActiveRunsForRestart();
 			await Promise.allSettled([
 				clientA.close(), clientB.close(), clientFallback.close(),
 				serverA.close(), serverB.close(), serverFallback.close(),

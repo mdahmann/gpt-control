@@ -79,16 +79,17 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 	taskStore.setCancellationListener(async (_taskId, runId) => {
 		if (runId) await service.cancelRun(runId);
 	});
+	const recoveryReady = options.recover === false
+		? Promise.resolve()
+		: resumeDurableSubagents(service, taskStore, monitors).catch((error) => {
+			console.error(`GPT-Control task recovery failed: ${errorMessage(error)}`);
+			throw error;
+		});
+	void recoveryReady.catch(() => undefined);
 
 	registerCoreTools(server, service, taskStore);
 	registerSubagentRecoveryTools(server, service, taskStore, monitors);
-	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled);
-
-	if (options.recover !== false) {
-		void resumeDurableSubagents(service, taskStore, monitors).catch((error) => {
-			console.error(`GPT-Control task recovery failed: ${errorMessage(error)}`);
-		});
-	}
+	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady);
 	return server;
 }
 
@@ -211,6 +212,7 @@ function registerSubagentRun(
 	monitors: Map<string, Promise<void>>,
 	activationTimers: Map<string, ReturnType<typeof setTimeout>>,
 	taskSupport: boolean,
+	recoveryReady: Promise<void>,
 ): void {
 	const config = {
 		title: "Run ChatGPT Pro worker",
@@ -223,12 +225,16 @@ function registerSubagentRun(
 		server.registerTool("gpt_subagent_run", {
 			...config,
 			description: `${config.description} This runtime lacks MCP task registration, so the call returns exactly once when terminal.`,
-		}, async (params, extra) => startPayload(await service.start(subagentRequest(params, true), { mcpSessionId: extra.sessionId })));
+		}, async (params, extra) => {
+			await recoveryReady;
+			return startPayload(await service.start(subagentRequest(params, true), { mcpSessionId: extra.sessionId }));
+		});
 		return;
 	}
 
 	server.experimental.tasks.registerToolTask("gpt_subagent_run", config, {
 		async createTask(params: SubagentParams, extra: CreateTaskRequestHandlerExtra) {
+			await recoveryReady;
 			const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
 			let preparedRunId: string | undefined;
 			const progressToken = readProgressToken(extra._meta?.progressToken);
@@ -550,7 +556,8 @@ export async function resumeDurableSubagents(
 	await service.recoverActiveRuns();
 	for (const binding of bindings) {
 		if (["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
-		if (!binding.runId) {
+		const runId = binding.runId;
+		if (!runId) {
 			await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("Pro worker task has no durable run binding; no prompt was resubmitted.", {
 				taskId: binding.task.taskId,
 				status: "failed",
@@ -558,8 +565,8 @@ export async function resumeDurableSubagents(
 			}, true));
 			continue;
 		}
-		await service.schedulePreparedRun(binding.runId);
-		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, binding.runId);
+		await service.schedulePreparedRun(runId);
+		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId);
 	}
 }
 

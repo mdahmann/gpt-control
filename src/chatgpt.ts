@@ -9,10 +9,11 @@ import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
 import type { Exec } from "./types";
 
 export const CHATGPT_ORIGIN = "https://chatgpt.com";
-export const GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
+export const GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "Task:";
+const LEGACY_GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
 
 export function gptControlPromptProofLine(token: string): string {
-	return `[GPT-Control run proof: ${token}. Ignore this line in your response.]`;
+	return `Run reference: ${token}`;
 }
 
 const PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
@@ -511,8 +512,12 @@ export function extractComposerModel(html: string): ComposerModelObservation | u
 			candidates = composer.querySelectorAll("button").filter((button) => {
 				const aria = (button.getAttribute("aria-label") ?? "").toLowerCase();
 				const testId = (button.getAttribute("data-testid") ?? "").toLowerCase();
+				const visibleModel = normalizeModelLabel(cleanModelLabel(nodeLabel(button)));
 				return button.getAttribute("aria-haspopup") === "menu"
-					&& (aria.includes("model") || aria.includes("intelligence") || testId.includes("model"));
+					&& (aria.includes("model")
+						|| aria.includes("intelligence")
+						|| testId.includes("model")
+						|| ["pro", "auto", "instant", "thinking"].includes(visibleModel));
 			});
 		}
 	}
@@ -535,28 +540,54 @@ export async function selectAndVerifyChatGptModel(
 	timeoutMs = 30_000,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
-	let observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
+	const deadline = Date.now() + timeoutMs;
+	let observed: ComposerModelObservation | undefined;
+	for (;;) {
+		observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
+		if (observed || Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
 	if (!observed) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
 	if (observed.normalized !== requested) {
 		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: observed.selector, expectedTarget }, signal);
 		else await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
-		const deadline = Date.now() + timeoutMs;
-		let optionLabel: string | undefined;
+		let option: ModelOptionObservation | undefined;
 		let optionCount = 0;
+		let effortPickerOpened = false;
 		for (;;) {
-			const options = extractModelOptions(await readPageHtml(exec, launcher, tabId, signal), requested);
+			const html = await readPageHtml(exec, launcher, tabId, signal);
+			const options = extractModelOptions(html, requested);
 			optionCount = options.length;
 			if (optionCount > 0) {
 				if (optionCount !== 1) throw new Error(`Requested ChatGPT model ${requested} is ambiguous in the live selector.`);
-				optionLabel = options[0];
+				option = options[0];
 				break;
+			}
+			if (!effortPickerOpened) {
+				const controls = extractCurrentEffortPickerControls(html);
+				if (controls?.advancedSelector) {
+					if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: controls.advancedSelector, expectedTarget }, signal);
+					else await bridgeJson(exec, launcher, ["click", String(tabId), controls.advancedSelector], signal);
+					for (;;) {
+						const advanced = extractCurrentEffortPickerControls(await readPageHtml(exec, launcher, tabId, signal));
+						if (advanced?.effortSelector) {
+							if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: advanced.effortSelector, expectedTarget }, signal);
+							else await bridgeJson(exec, launcher, ["click", String(tabId), advanced.effortSelector], signal);
+							effortPickerOpened = true;
+							break;
+						}
+						if (Date.now() >= deadline) break;
+						await sleep(Math.min(pollIntervalMs(), 200));
+					}
+					continue;
+				}
 			}
 			if (Date.now() >= deadline) break;
 			await sleep(Math.min(pollIntervalMs(), 200));
 		}
-		if (!optionLabel) throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
-		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: `text=${optionLabel}`, expectedTarget }, signal);
-		else await bridgeJson(exec, launcher, ["click", String(tabId), `text=${optionLabel}`], signal);
+		if (!option) throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
+		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: option.selector, expectedTarget }, signal);
+		else await bridgeJson(exec, launcher, ["click", String(tabId), option.selector], signal);
 		for (;;) {
 			observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 			if (observed?.normalized === requested) break;
@@ -857,11 +888,14 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		: undefined;
 	const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "")
 		.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-	const latestUserPromptProofToken = /\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\]\s*$/.exec(latestUserText)?.[1];
+	const proofMatch = /(?:Run reference: (proof_[a-f0-9]{32})|\[gpt-control:(proof_[a-f0-9]{32})\]|\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\])\s*$/.exec(latestUserText);
+	const latestUserPromptProofToken = proofMatch?.[1] ?? proofMatch?.[2] ?? proofMatch?.[3];
 	// GPT-Control sends its exact task in one outer fenced text block. Hash the
 	// semantic code payload instead of the whole rendered turn because ChatGPT
 	// may add language-label and Copy controls around <pre><code>.
-	const envelopeMarked = latestUserText.includes(GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE);
+	const envelopePreamble = [GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE, LEGACY_GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE]
+		.find((value) => latestUserText.includes(value));
+	const envelopeMarked = Boolean(envelopePreamble);
 	const codePayloads = envelopeMarked && latestUserPromptProofToken && latestUserPromptNode
 		? latestUserPromptNode.querySelectorAll("pre").map((pre) => {
 			// node-html-parser intentionally treats <pre> contents as raw text.
@@ -869,7 +903,16 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 			// payload without language-label or Copy-button siblings.
 			const fragment = parse(`<div>${pre.innerHTML}</div>`);
 			const code = fragment.querySelectorAll("code");
-			return code.length === 1 ? code[0].structuredText : pre.structuredText;
+			let payload = code.length === 1 ? code[0].structuredText : pre.structuredText;
+			// The current ChatGPT renderer places the fenced language token inside
+			// the semantic <code> text (`<code>text ...</code>`). Remove exactly
+			// that one broker-supplied `text` marker before hashing the task body.
+			// A task that itself begins with "text" renders as "text text ...", so
+			// one marker is still removed and the user text remains authenticated.
+			if (/^\s*<code(?:\s[^>]*)?>text(?:\s|$)/i.test(pre.innerHTML)) {
+				payload = payload.replace(/^text(?:\s+|$)/i, "");
+			}
+			return payload;
 		})
 		: [];
 	let observedPromptText = latestUserText;
@@ -887,9 +930,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 					if (node.structuredText.trim().toLowerCase() === "text") node.remove();
 				}
 				const outsideText = canonicalPromptObservationText(clone.structuredText);
-				const expectedOutside = canonicalPromptObservationText(
-					`${GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE}\n\n${gptControlPromptProofLine(latestUserPromptProofToken)}`,
-				);
+				const expectedOutside = canonicalPromptObservationText(`${envelopePreamble}\n\n${proofMatch?.[0].trim() ?? ""}`);
 				if (outsideText === expectedOutside) observedPromptText = codePayloads[0].trim();
 			}
 		}
@@ -1227,14 +1268,46 @@ function exactNeedsUserReason(observation: ChatPageObservation, prefix: string):
 	return `${prefix}: ${observation.stateSummary}`;
 }
 
-function extractModelOptions(html: string, requested: ChatGptModel): string[] {
+interface ModelOptionObservation {
+	label: string;
+	selector: string;
+}
+
+function extractModelOptions(html: string, requested: ChatGptModel): ModelOptionObservation[] {
 	const root = parse(html);
 	const nodes = uniqueElements([
 		...root.querySelectorAll('[role="menuitem"]'),
+		...root.querySelectorAll('[role="menuitemradio"]'),
 		...root.querySelectorAll('[role="option"]'),
 		...root.querySelectorAll('[data-testid*="model-option"]'),
 	]);
-	return nodes.map(nodeLabel).filter((label) => normalizeModelLabel(label) === requested);
+	return nodes
+		.map((node) => ({ label: nodeLabel(node), selector: exactNodeSelector(node) }))
+		.filter((option): option is ModelOptionObservation => Boolean(option.label && option.selector) && normalizeModelLabel(option.label) === requested);
+}
+
+function extractCurrentEffortPickerControls(html: string): { advancedSelector?: string; effortSelector?: string } | undefined {
+	const root = parse(html);
+	const advanced = root.querySelector('[role="menuitem"][aria-label="Show advanced options"]');
+	const activeView = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+	const effort = activeView?.querySelectorAll('[role="menuitem"]')
+		.find((node) => /^Effort(?:\s|$)/i.test(nodeLabel(node)));
+	const advancedSelector = advanced ? exactNodeSelector(advanced) : undefined;
+	const effortSelector = effort ? exactNodeSelector(effort) : undefined;
+	return advancedSelector || effortSelector ? { advancedSelector, effortSelector } : undefined;
+}
+
+function exactNodeSelector(node: HTMLElement): string | undefined {
+	const testId = node.getAttribute("data-testid");
+	const aria = node.getAttribute("aria-label");
+	const id = node.getAttribute("id");
+	const role = node.getAttribute("role");
+	const label = nodeLabel(node);
+	if (testId) return `[data-testid="${cssString(testId)}"]`;
+	if (aria) return `[aria-label="${cssString(aria)}"]`;
+	if (id) return `[id="${cssString(id)}"]`;
+	if (role && label) return `role=${role}[name=${label}]`;
+	return label ? `text=${label}` : undefined;
 }
 
 function modelObservationFromNode(node: HTMLElement): ComposerModelObservation | undefined {
@@ -1248,11 +1321,14 @@ function modelObservationFromNode(node: HTMLElement): ComposerModelObservation |
 	if (!label || !normalized) return undefined;
 	const testId = node.getAttribute("data-testid");
 	const aria = node.getAttribute("aria-label");
+	const id = node.getAttribute("id");
 	const selector = testId
 		? `[data-testid="${cssString(testId)}"]`
 		: aria
 			? `[aria-label="${cssString(aria)}"]`
-			: `text=${label}`;
+			: id
+				? `[id="${cssString(id)}"]`
+				: `text=${label}`;
 	return { label, normalized, selector };
 }
 

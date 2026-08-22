@@ -141,13 +141,32 @@ describe("truthful composer model provenance", () => {
 		const result = await service.start({ kind: "subagent", prompt: "switch Pro", timeoutMs: 1000 });
 		expect(result.run.status).toBe("completed");
 		expect(result.run.receipt.observedModel).toBe("Pro");
-		expect(bridge.privateRequests.some((request) => request.action === "click" && request.payload.selector === "text=Pro")).toBe(true);
+		expect(bridge.privateRequests.some((request) => request.action === "click" && request.payload.selector === "role=menuitem[name=Pro]")).toBe(true);
+	});
+
+	test("switches the current Instant effort picker to Pro through Advanced", async () => {
+		const bridge = new FakeChromeBridge({ initialModel: "Instant", currentEffortPicker: true });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "subagent", prompt: "switch current picker to Pro", timeoutMs: 1000 });
+		expect(result.run.status).toBe("completed");
+		expect(result.run.receipt.observedModel).toBe("Pro");
+		expect(bridge.privateRequests.filter((request) => request.action === "click").map((request) => request.payload.selector)).toEqual(expect.arrayContaining([
+			'[id="radix-picker"]',
+			'[aria-label="Show advanced options"]',
+			'[id="picker-effort"]',
+			'role=menuitemradio[name=Pro]',
+		]));
 	});
 
 	test("does not infer composer selection from the Miles Pro account-plan label", () => {
 		const observation = extractComposerModel('<main><div data-testid="account-plan">Miles Pro</div><form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">Auto</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation?.label).toBe("Auto");
 		expect(observation?.normalized).toBe("auto");
+	});
+
+	test("accepts the current composer Pro pill without adopting the account plan label", () => {
+		const observation = extractComposerModel('<main><button aria-label="Miles Pro, open profile menu">Miles Pro</button><form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button id="radix-model-live" aria-haspopup="menu"><span>Pro</span></button></form></main>');
+		expect(observation).toMatchObject({ label: "Pro", normalized: "pro", selector: '[id="radix-model-live"]' });
 	});
 
 	test("does not accept an Upgrade to Pro action as selected-model evidence", () => {
@@ -316,5 +335,13 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(observation.latestUserPromptSha256).toBe(
 			createHash("sha256").update(canonicalPromptObservationText(legacyObservedText)).digest("hex"),
 		);
+	});
+
+	test("removes the current renderer's fenced text marker before send-boundary hashing", () => {
+		const proof = "proof_0123456789abcdef0123456789abcdef";
+		const body = "exact disposable task";
+		const observation = extractChatPageObservation(`<main><div data-message-author-role="user" data-message-id="user-current"><div class="whitespace-pre-wrap"><div>Task:</div><pre><code>text ${body}</code></pre><div>Run reference: ${proof}</div></div></div><form><div id="prompt-textarea" contenteditable="true"></div></form></main>`);
+		expect(observation.latestUserPromptProofToken).toBe(proof);
+		expect(observation.latestUserPromptSha256).toBe(createHash("sha256").update(body).digest("hex"));
 	});
 });
