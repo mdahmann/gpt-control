@@ -45,6 +45,73 @@ describe("bounded Pro worker scheduler", () => {
 		expect(result.run.receipt).toMatchObject({ observedModel: "Pro", modelVerified: true });
 	});
 
+	test("accepts the broker proof when ChatGPT renders Markdown syntax away", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "# Review\n- **important** item\n- inspect `src/index.ts`",
+			idempotencyKey: "rendered-markdown-proof",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerUserMessageId).toBeDefined();
+	});
+
+	test("rejects a rendered user turn whose task body changed but proof survived", async () => {
+		const bridge = new FakeChromeBridge({ mutateRenderedPrompt: true });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "verify integrity target",
+			idempotencyKey: "mutated-rendered-prompt",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("needs_user");
+		expect(result.run.error).toContain("did not match the broker-owned send-boundary proof");
+		expect(result.run.providerUserMessageId).toBeUndefined();
+	});
+
+	test("rejects unexpected instructions outside the authenticated task envelope", async () => {
+		const bridge = new FakeChromeBridge({ injectEnvelopeInstruction: true });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "authenticated payload",
+			idempotencyKey: "mutated-envelope-sibling",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("needs_user");
+		expect(result.run.providerUserMessageId).toBeUndefined();
+	});
+
+	test("requires each request to opt in to operator-approved file exceptions", async () => {
+		const workspace = scratch();
+		const outside = scratch();
+		writeFileSync(join(outside, "outside.txt"), "outside\n");
+		writeFileSync(join(workspace, ".env.local"), "TOKEN=test-only\n");
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), workspace, bridge, {
+			allowOutsideWorkspace: true,
+			allowSensitiveFiles: true,
+		});
+		await expect(service.start({
+			kind: "subagent", prompt: "outside omitted", files: [join(outside, "outside.txt")], wait: false,
+		})).rejects.toThrow("outside trusted workspace");
+		await expect(service.start({
+			kind: "subagent", prompt: "sensitive omitted", files: [".env.local"], wait: false,
+		})).rejects.toThrow("sensitive");
+		const allowed = await service.start({
+			kind: "subagent",
+			prompt: "explicitly narrowed exceptions",
+			files: [join(outside, "outside.txt"), ".env.local"],
+			allowOutsideWorkspace: true,
+			allowSensitiveFiles: true,
+			timeoutMs: 1000,
+		});
+		expect(allowed.run.status).toBe("completed");
+	});
+
 	test("supports three concurrent workers and fairly queues a fourth", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -106,6 +173,22 @@ describe("bounded Pro worker scheduler", () => {
 		await service.schedulePreparedRun(prepared.run.id);
 		expect((await service.waitForRun(prepared.run.id, 1500)).status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["deferred index"]);
+	});
+
+	test("deletes replay-capable plaintext when a deferred worker is cancelled", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge);
+		const prepared = await service.start({
+			kind: "subagent",
+			prompt: "deferred secret TOKEN=test-only",
+			idempotencyKey: "cancel-deferred-plaintext",
+			wait: false,
+			timeoutMs: 1000,
+		}, { deferExecution: true });
+		expect((await store.getRunRequest(prepared.run.id)).prompt).toContain("TOKEN=test-only");
+		expect((await service.cancelRun(prepared.run.id)).status).toBe("cancelled");
+		await expect(store.getRunRequest(prepared.run.id)).rejects.toThrow();
+		expect(bridge.activeTabs()).toEqual([]);
 	});
 
 	test("validates the final wrapped prompt before allocating a browser session", async () => {
@@ -270,6 +353,25 @@ describe("bounded Pro worker scheduler", () => {
 		expect(terminal.status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["same request"]);
 		await expect(service.start({ ...request, prompt: "different request" })).rejects.toThrow("different request");
+	});
+
+	test("default file restrictions preserve the legacy idempotency identity", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const first = await service.start({
+			kind: "subagent", prompt: "legacy hash", idempotencyKey: "legacy-default-flags", wait: false, timeoutMs: 1000,
+		}, { deferExecution: true });
+		const retry = await service.start({
+			kind: "subagent",
+			prompt: "legacy hash",
+			idempotencyKey: "legacy-default-flags",
+			allowOutsideWorkspace: false,
+			allowSensitiveFiles: false,
+			wait: false,
+			timeoutMs: 1000,
+		}, { deferExecution: true });
+		expect(retry.run.id).toBe(first.run.id);
+		expect(bridge.activeTabs()).toEqual([]);
 	});
 
 	test("records connector intent and sends a non-authoritative required-connector contract", async () => {
@@ -961,6 +1063,30 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			expect((await harness.taskStore.getTask(taskId))?.status).toBe("cancelled");
 			expect((await harness.service.getRun(runId!)).status).toBe("cancelled");
 			expect(harness.bridge.submittedPrompts).toEqual(["[slow] protocol cancel"]);
+			await iterator.return?.();
+		} finally {
+			await harness.close();
+		}
+	});
+
+	test("protocol cancellation aborts an in-flight send before sealing the task", async () => {
+		const harness = await connectMcp({ bridge: new FakeChromeBridge({ sendDelayMs: 500 }) });
+		try {
+			const iterator = harness.client.experimental.tasks.callToolStream({
+				name: "gpt_subagent_run",
+				arguments: { prompt: "must abort before click", idempotency_key: "cancel-in-flight-send", timeout_ms: 1500 },
+			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
+			const created = await iterator.next();
+			const taskId = (created.value as { type: "taskCreated"; task: { taskId: string } }).task.taskId;
+			await waitUntil(() => harness.bridge.calls.some((call) =>
+				call.args[0] === "click" && String(call.args[2] ?? "").includes("send-button")));
+			expect(harness.bridge.submittedPrompts).toEqual([]);
+			expect((await harness.client.experimental.tasks.cancelTask(taskId)).status).toBe("cancelled");
+			const runId = await harness.taskStore.getRunId(taskId);
+			expect(runId).toBeDefined();
+			await waitUntil(async () => (await harness.service.getRun(runId!)).status === "cancelled");
+			expect(harness.bridge.submittedPrompts).toEqual([]);
+			await expect(harness.service.store.getRunRequest(runId!)).rejects.toThrow();
 			await iterator.return?.();
 		} finally {
 			await harness.close();

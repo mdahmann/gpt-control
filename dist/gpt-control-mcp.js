@@ -33771,6 +33771,10 @@ function nowIso() {
 
 // src/chatgpt.ts
 var CHATGPT_ORIGIN = "https://chatgpt.com";
+var GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
+function gptControlPromptProofLine(token) {
+  return `[GPT-Control run proof: ${token}. Ignore this line in your response.]`;
+}
 var PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
 var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
 var FILE_INPUT_SELECTOR = 'input[type="file"]';
@@ -34107,8 +34111,35 @@ function extractChatPageObservation(html) {
 `).replace(/\n{3,}/g, `
 
 `).trim();
-  const latestUserPromptSha256 = latestUserText ? createHash("sha256").update(canonicalPromptObservationText(latestUserText)).digest("hex") : undefined;
   const latestUserPromptProofToken = /\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\]\s*$/.exec(latestUserText)?.[1];
+  const envelopeMarked = latestUserText.includes(GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE);
+  const codePayloads = envelopeMarked && latestUserPromptProofToken && latestUserPromptNode ? latestUserPromptNode.querySelectorAll("pre").map((pre) => {
+    const fragment = parse6(`<div>${pre.innerHTML}</div>`);
+    const code = fragment.querySelectorAll("code");
+    return code.length === 1 ? code[0].structuredText : pre.structuredText;
+  }) : [];
+  let observedPromptText = latestUserText;
+  if (envelopeMarked) {
+    observedPromptText = "";
+    if (latestUserPromptNode && latestUserPromptProofToken && codePayloads.length === 1) {
+      const clone2 = parse6(`<div data-gpt-control-observation-root>${latestUserPromptNode.innerHTML}</div>`).querySelector("[data-gpt-control-observation-root]");
+      if (clone2) {
+        for (const node of clone2.querySelectorAll("pre, button"))
+          node.remove();
+        for (const node of clone2.querySelectorAll("span")) {
+          if (node.structuredText.trim().toLowerCase() === "text")
+            node.remove();
+        }
+        const outsideText = canonicalPromptObservationText(clone2.structuredText);
+        const expectedOutside = canonicalPromptObservationText(`${GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE}
+
+${gptControlPromptProofLine(latestUserPromptProofToken)}`);
+        if (outsideText === expectedOutside)
+          observedPromptText = codePayloads[0].trim();
+      }
+    }
+  }
+  const latestUserPromptSha256 = observedPromptText ? createHash("sha256").update(canonicalPromptObservationText(observedPromptText)).digest("hex") : undefined;
   const composerReady = PROMPT_SELECTORS.some((selector) => Boolean(root.querySelector(selector)));
   const controls = root.querySelectorAll('button, [role="button"]');
   const controlLabels = controls.map(nodeLabel).filter(Boolean);
@@ -36283,6 +36314,7 @@ class GptControlService {
   }
   async cancelRun(runId) {
     this.cancellationIntents.add(runId);
+    this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
     const current = await this.store.getRun(runId);
     if (TERMINAL2.has(current.status)) {
       const legacyPending = current.providerTurnPending === undefined && (current.submissionState === "submitting" || current.submissionState === "submitted") && current.status !== "completed" && current.status !== "failed";
@@ -36292,12 +36324,19 @@ class GptControlService {
         if (!stopped)
           this.scheduleProviderStopReconciliation(runId);
       }
+      if (current.status === "cancelled") {
+        await this.store.deleteRunRequest(runId).catch(() => {
+          return;
+        });
+      }
       this.cancellationIntents.delete(runId);
       return this.store.getRun(runId);
     }
     const cancelled = await this.persistCancellation(runId);
     if (cancelled.status === "cancelled") {
-      this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
+      await this.store.deleteRunRequest(runId).catch(() => {
+        return;
+      });
       const stopped = await this.stopOwnedBrowserRun(cancelled).catch(() => false);
       if (!stopped)
         this.scheduleProviderStopReconciliation(runId);
@@ -36468,8 +36507,8 @@ class GptControlService {
     const manifest = await buildAttachmentManifest(request.files, {
       workspaceRoot: this.policy.workspaceRoot,
       snapshotRoot: this.policy.snapshotRoot,
-      allowOutsideWorkspace: this.policy.allowOutsideWorkspace,
-      allowSensitiveFiles: this.policy.allowSensitiveFiles,
+      allowOutsideWorkspace: this.policy.allowOutsideWorkspace && request.allowOutsideWorkspace,
+      allowSensitiveFiles: this.policy.allowSensitiveFiles && request.allowSensitiveFiles,
       maxFiles: this.policy.maxAttachmentFiles,
       maxBytes: this.policy.maxAttachmentBytes
     });
@@ -36599,9 +36638,17 @@ class GptControlService {
   prepareRunPrompt(request, manifest) {
     const promptBody = request.kind === "consult" ? buildReviewPrompt(request.prompt, manifest) : request.kind === "subagent" ? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent) : request.prompt;
     const promptProofToken = opaqueId("proof");
-    const prompt = `${promptBody}
+    const proofLine = gptControlPromptProofLine(promptProofToken);
+    const preamble = GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE;
+    const longestBacktickRun = Math.max(0, ...[...promptBody.matchAll(/`+/g)].map((match) => match[0].length));
+    const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+    const prompt = `${preamble}
 
-[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
+${fence}text
+${promptBody}
+${fence}
+
+${proofLine}`;
     if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
       throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
     }
@@ -36609,7 +36656,7 @@ class GptControlService {
       prompt,
       promptProofToken,
       promptSha256: sha256(prompt),
-      promptObservationSha256: sha256(canonicalPromptObservationText(prompt))
+      promptObservationSha256: sha256(canonicalPromptObservationText(promptBody))
     };
   }
   scheduleRun(runId, recovery) {
@@ -37380,11 +37427,13 @@ function normalizeStartRequest(request, policy) {
     idempotencyKey: request.idempotencyKey,
     connectorIntent,
     wait: request.wait !== false,
-    timeoutMs: Math.min(Math.floor(requestedTimeout), 60 * 60000)
+    timeoutMs: Math.min(Math.floor(requestedTimeout), 60 * 60000),
+    allowOutsideWorkspace: request.allowOutsideWorkspace === true,
+    allowSensitiveFiles: request.allowSensitiveFiles === true
   };
 }
 function startRequestHash(request) {
-  return sha256(JSON.stringify({
+  const value = {
     kind: request.kind,
     prompt: request.prompt,
     files: request.files,
@@ -37393,7 +37442,12 @@ function startRequestHash(request) {
     chatgptModel: request.chatgptModel,
     connectorIntent: request.connectorIntent ?? null,
     timeoutMs: request.timeoutMs
-  }));
+  };
+  if (request.allowOutsideWorkspace)
+    value.allowOutsideWorkspace = true;
+  if (request.allowSensitiveFiles)
+    value.allowSensitiveFiles = true;
+  return sha256(JSON.stringify(value));
 }
 function publicPolicy(policy) {
   return {
@@ -37751,7 +37805,6 @@ class DurableTaskStore {
   }
   async cancelTask(taskId, statusMessage, sessionId) {
     let notify;
-    let cancelledRunId;
     await this.lockStore.withTaskLock(taskId, async () => {
       const record3 = await this.readRecord(taskId);
       assertSessionAccess(record3, sessionId);
@@ -37761,15 +37814,18 @@ class DurableTaskStore {
         throw new Error(`Invalid task transition ${record3.task.status} -> cancelled.`);
       }
       const timestamp = nowIso();
-      cancelledRunId = record3.runId;
-      if (cancelledRunId) {
-        const run = await this.lockStore.updateRun(cancelledRunId, {
-          status: "cancelled",
-          providerStopRequested: true,
-          cancellationRequestedAt: timestamp,
-          completedAt: timestamp,
-          error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
-        });
+      if (record3.runId) {
+        await this.cancellationListener?.(taskId, record3.runId);
+        let run = await this.lockStore.getRun(record3.runId);
+        if (!this.cancellationListener && (run.status === "queued" || run.status === "running")) {
+          run = await this.lockStore.updateRun(record3.runId, {
+            status: "cancelled",
+            providerStopRequested: true,
+            cancellationRequestedAt: timestamp,
+            completedAt: timestamp,
+            error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored."
+          });
+        }
         if (run.status !== "cancelled")
           return;
       }
@@ -37783,8 +37839,6 @@ class DurableTaskStore {
     });
     if (notify)
       await this.notify(taskId, notify);
-    if (notify)
-      await this.cancellationListener?.(taskId, cancelledRunId);
   }
   async notify(taskId, task) {
     try {

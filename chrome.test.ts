@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	CHATGPT_ORIGIN,
+	canonicalPromptObservationText,
 	captureOwnedScreenshot,
 	clickSend,
 	createSession,
@@ -246,5 +248,17 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(observation.snapshot.text).toBe("partial");
 		expect(observation.answering).toBe(true);
 		expect(observation.toolRunning).toBe(true);
+	});
+
+	test("legacy proved prompts with one code block retain full-turn hashing", () => {
+		const proof = "proof_1234567890abcdef1234567890abcdef";
+		const proofLine = `[GPT-Control run proof: ${proof}. Ignore this line in your response.]`;
+		const html = `<div data-message-author-role="user" data-message-id="legacy-user"><div data-message-content>Legacy review<pre><code>code sample</code></pre><p>${proofLine}</p></div></div>`;
+		const observation = extractChatPageObservation(html);
+		expect(observation.latestUserPromptProofToken).toBe(proof);
+		const legacyObservedText = `Legacy review\n<code>code sample</code>\n${proofLine}`;
+		expect(observation.latestUserPromptSha256).toBe(
+			createHash("sha256").update(canonicalPromptObservationText(legacyObservedText)).digest("hex"),
+		);
 	});
 });

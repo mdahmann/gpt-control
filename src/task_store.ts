@@ -285,7 +285,6 @@ export class DurableTaskStore implements TaskStore {
 
 	private async cancelTask(taskId: string, statusMessage?: string, sessionId?: string): Promise<void> {
 		let notify: Task | undefined;
-		let cancelledRunId: string | undefined;
 		await this.lockStore.withTaskLock(taskId, async () => {
 			const record = await this.readRecord(taskId);
 			assertSessionAccess(record, sessionId);
@@ -294,17 +293,21 @@ export class DurableTaskStore implements TaskStore {
 				throw new Error(`Invalid task transition ${record.task.status} -> cancelled.`);
 			}
 			const timestamp = nowIso();
-			cancelledRunId = record.runId;
-			if (cancelledRunId) {
-				// The run is the execution authority. Seal it before the task record so a
-				// process crash can never leave a cancelled task bound to runnable work.
-				const run = await this.lockStore.updateRun(cancelledRunId, {
-					status: "cancelled",
-					providerStopRequested: true,
-					cancellationRequestedAt: timestamp,
-					completedAt: timestamp,
-					error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored.",
-				});
+			if (record.runId) {
+				// The service owns browser cancellation. Invoke it while the task lock
+				// prevents a competing task result, and before sealing this task, so the
+				// active controller is aborted before an in-flight send can complete.
+				await this.cancellationListener?.(taskId, record.runId);
+				let run = await this.lockStore.getRun(record.runId);
+				if (!this.cancellationListener && (run.status === "queued" || run.status === "running")) {
+					run = await this.lockStore.updateRun(record.runId, {
+						status: "cancelled",
+						providerStopRequested: true,
+						cancellationRequestedAt: timestamp,
+						completedAt: timestamp,
+						error: statusMessage ?? "Client cancelled task execution. Late provider completion is ignored.",
+					});
+				}
 				// If provider completion won the run-record lock, do not discard that
 				// immutable result by independently cancelling its still-working task.
 				if (run.status !== "cancelled") return;
@@ -318,7 +321,6 @@ export class DurableTaskStore implements TaskStore {
 			notify = record.task;
 		});
 		if (notify) await this.notify(taskId, notify);
-		if (notify) await this.cancellationListener?.(taskId, cancelledRunId);
 	}
 
 	private async notify(taskId: string, task: Task): Promise<void> {

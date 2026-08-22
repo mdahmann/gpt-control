@@ -19,7 +19,9 @@ import {
 } from "./browser-driver";
 import {
 	CHATGPT_ORIGIN,
+	GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE,
 	canonicalPromptObservationText,
+	gptControlPromptProofLine,
 	providerConversationIdentity,
 	type ChatPageObservation,
 } from "./chatgpt";
@@ -291,6 +293,11 @@ export class GptControlService {
 		// Register intent synchronously so a same-process completion that is already
 		// unwinding cannot win merely because the durable operations contain awaits.
 		this.cancellationIntents.add(runId);
+		// Abort local browser work before any durable terminal transition. This is
+		// especially important when MCP task cancellation reaches us after the task
+		// store has acquired its own lock: an in-flight send must see cancellation
+		// before the task can be sealed.
+		this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
 		const current = await this.store.getRun(runId);
 		if (TERMINAL.has(current.status)) {
 			const legacyPending = current.providerTurnPending === undefined
@@ -301,13 +308,16 @@ export class GptControlService {
 				const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
 				if (!stopped) this.scheduleProviderStopReconciliation(runId);
 			}
+			if (current.status === "cancelled") {
+				await this.store.deleteRunRequest(runId).catch(() => undefined);
+			}
 			this.cancellationIntents.delete(runId);
 			return this.store.getRun(runId);
 		}
 		// The record lock remains the cross-process arbiter.
 		const cancelled = await this.persistCancellation(runId);
 		if (cancelled.status === "cancelled") {
-			this.activeRuns.get(runId)?.controller.abort(new Error("Cancelled by caller."));
+			await this.store.deleteRunRequest(runId).catch(() => undefined);
 			const stopped = await this.stopOwnedBrowserRun(cancelled).catch(() => false);
 			if (!stopped) this.scheduleProviderStopReconciliation(runId);
 		}
@@ -486,8 +496,8 @@ export class GptControlService {
 		const manifest = await buildAttachmentManifest(request.files, {
 			workspaceRoot: this.policy.workspaceRoot,
 			snapshotRoot: this.policy.snapshotRoot,
-			allowOutsideWorkspace: this.policy.allowOutsideWorkspace,
-			allowSensitiveFiles: this.policy.allowSensitiveFiles,
+			allowOutsideWorkspace: this.policy.allowOutsideWorkspace && request.allowOutsideWorkspace,
+			allowSensitiveFiles: this.policy.allowSensitiveFiles && request.allowSensitiveFiles,
 			maxFiles: this.policy.maxAttachmentFiles,
 			maxBytes: this.policy.maxAttachmentBytes,
 		});
@@ -628,7 +638,14 @@ export class GptControlService {
 				? buildConnectorAwareSubagentPrompt(request.prompt, request.connectorIntent)
 				: request.prompt;
 		const promptProofToken = opaqueId("proof");
-		const prompt = `${promptBody}\n\n[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
+		const proofLine = gptControlPromptProofLine(promptProofToken);
+		const preamble = GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE;
+		const longestBacktickRun = Math.max(0, ...([...promptBody.matchAll(/`+/g)].map((match) => match[0].length)));
+		const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+		const prompt = `${preamble}\n\n${fence}text\n${promptBody}\n${fence}\n\n${proofLine}`;
+		// ChatGPT renders the fence away but preserves its text payload. Hash that
+		// observable projection so Markdown syntax inside the task remains literal
+		// while truncation or mutation of any instruction still fails closed.
 		if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
 			throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
 		}
@@ -636,7 +653,7 @@ export class GptControlService {
 			prompt,
 			promptProofToken,
 			promptSha256: sha256(prompt),
-			promptObservationSha256: sha256(canonicalPromptObservationText(prompt)),
+			promptObservationSha256: sha256(canonicalPromptObservationText(promptBody)),
 		};
 	}
 
@@ -1425,6 +1442,8 @@ interface NormalizedStartRequest {
 	connectorIntent?: { names: string[]; mode: "prefer" | "require" };
 	wait: boolean;
 	timeoutMs: number;
+	allowOutsideWorkspace: boolean;
+	allowSensitiveFiles: boolean;
 }
 
 interface PreparedRunPrompt {
@@ -1489,11 +1508,13 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 		connectorIntent,
 		wait: request.wait !== false,
 		timeoutMs: Math.min(Math.floor(requestedTimeout), 60 * 60_000),
+		allowOutsideWorkspace: request.allowOutsideWorkspace === true,
+		allowSensitiveFiles: request.allowSensitiveFiles === true,
 	};
 }
 
 function startRequestHash(request: NormalizedStartRequest): string {
-	return sha256(JSON.stringify({
+	const value: Record<string, unknown> = {
 		kind: request.kind,
 		prompt: request.prompt,
 		files: request.files,
@@ -1502,7 +1523,12 @@ function startRequestHash(request: NormalizedStartRequest): string {
 		chatgptModel: request.chatgptModel,
 		connectorIntent: request.connectorIntent ?? null,
 		timeoutMs: request.timeoutMs,
-	}));
+	};
+	// Preserve the pre-hardening hash for the default restricted request. Only
+	// explicit exception opt-ins extend the idempotency identity.
+	if (request.allowOutsideWorkspace) value.allowOutsideWorkspace = true;
+	if (request.allowSensitiveFiles) value.allowSensitiveFiles = true;
+	return sha256(JSON.stringify(value));
 }
 
 function publicPolicy(policy: OperatorPolicy): Record<string, unknown> {

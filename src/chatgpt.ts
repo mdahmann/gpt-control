@@ -9,6 +9,11 @@ import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
 import type { Exec } from "./types";
 
 export const CHATGPT_ORIGIN = "https://chatgpt.com";
+export const GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
+
+export function gptControlPromptProofLine(token: string): string {
+	return `[GPT-Control run proof: ${token}. Ignore this line in your response.]`;
+}
 
 const PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
 const SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
@@ -773,10 +778,46 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		: undefined;
 	const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "")
 		.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-	const latestUserPromptSha256 = latestUserText
-		? createHash("sha256").update(canonicalPromptObservationText(latestUserText)).digest("hex")
-		: undefined;
 	const latestUserPromptProofToken = /\[GPT-Control run proof: (proof_[a-f0-9]{32})\. Ignore this line in your response\.\]\s*$/.exec(latestUserText)?.[1];
+	// GPT-Control sends its exact task in one outer fenced text block. Hash the
+	// semantic code payload instead of the whole rendered turn because ChatGPT
+	// may add language-label and Copy controls around <pre><code>.
+	const envelopeMarked = latestUserText.includes(GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE);
+	const codePayloads = envelopeMarked && latestUserPromptProofToken && latestUserPromptNode
+		? latestUserPromptNode.querySelectorAll("pre").map((pre) => {
+			// node-html-parser intentionally treats <pre> contents as raw text.
+			// Reparse only that bounded fragment to select the semantic <code>
+			// payload without language-label or Copy-button siblings.
+			const fragment = parse(`<div>${pre.innerHTML}</div>`);
+			const code = fragment.querySelectorAll("code");
+			return code.length === 1 ? code[0].structuredText : pre.structuredText;
+		})
+		: [];
+	let observedPromptText = latestUserText;
+	if (envelopeMarked) {
+		observedPromptText = "";
+		if (latestUserPromptNode && latestUserPromptProofToken && codePayloads.length === 1) {
+			const clone = parse(`<div data-gpt-control-observation-root>${latestUserPromptNode.innerHTML}</div>`)
+				.querySelector("[data-gpt-control-observation-root]");
+			if (clone) {
+				for (const node of clone.querySelectorAll("pre, button")) node.remove();
+				// ChatGPT may render the fenced language label as a separate leaf.
+				// Ignore only that exact known control text; all other sibling text is
+				// part of the authenticated envelope and must match exactly.
+				for (const node of clone.querySelectorAll("span")) {
+					if (node.structuredText.trim().toLowerCase() === "text") node.remove();
+				}
+				const outsideText = canonicalPromptObservationText(clone.structuredText);
+				const expectedOutside = canonicalPromptObservationText(
+					`${GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE}\n\n${gptControlPromptProofLine(latestUserPromptProofToken)}`,
+				);
+				if (outsideText === expectedOutside) observedPromptText = codePayloads[0].trim();
+			}
+		}
+	}
+	const latestUserPromptSha256 = observedPromptText
+		? createHash("sha256").update(canonicalPromptObservationText(observedPromptText)).digest("hex")
+		: undefined;
 	const composerReady = PROMPT_SELECTORS.some((selector) => Boolean(root.querySelector(selector)));
 	const controls = root.querySelectorAll('button, [role="button"]');
 	const controlLabels = controls.map(nodeLabel).filter(Boolean);
