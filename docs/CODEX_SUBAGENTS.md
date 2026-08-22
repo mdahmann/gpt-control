@@ -96,14 +96,18 @@ It does not grant permissions.
 
 - `prefer`: continue without an unavailable connector only when the assignment
   remains supportable, and disclose the limitation.
-- `require`: return a blocker if any named connector is unavailable. Never
-  fabricate connector access, output, or a successful action.
+- `require`: the assignment must contain every literal `@Connector` mention.
+  GPT-Control first sends one short read-only health check in the same
+  conversation. It sends the assignment only after the response contains one
+  usable `ready` payload for every connector. Otherwise it returns a blocker.
 
-This contract is advisory because the browser broker cannot observe ChatGPT's
-connector tool-call stream. Public run data therefore reports connector
-verification as `unverified` with evidence kind `provider_prompt_intent_only`.
-For a required GitHub or Zenbox connector, Codex must independently check a
-harmless connector result and its source before it accepts the worker output.
+The required preflight is a health gate, not automatic proof of a connector
+call. When no connector-named browser tool card is visible, public run data uses
+evidence kind `assistant_reported_preflight`. When the live DOM exposes bounded
+connector-named tool cards, GPT-Control records their labels and hashes with
+evidence kind `browser_tool_card`. Tool-card text and assistant payloads remain
+untrusted evidence. Verify important Zenbox, GitHub, or other external facts
+independently before accepting the Worker output.
 
 ## Cancellation and restart
 
@@ -111,6 +115,13 @@ harmless connector result and its source before it accepts the worker output.
 then seal the task, then attempt to stop the exact browser turn. A crash between
 these steps cannot leave a cancelled task bound to runnable work. A late
 completion is ignored.
+
+Interrupting or cancelling only the originating `gpt_worker_run` request
+detaches that caller and does not cancel the durable worker. Use `tasks/cancel`
+or `gpt_worker_cancel` for explicit cancellation. ChatGPT Stop controls only the
+owned ChatGPT turn. A Zenbox, GitHub, or other connected-tool operation that
+already started can continue after Stop, so its external state must be checked
+independently.
 
 On shutdown, the MCP process suspends its local watcher. On restart, submitted
 work is observed in the same driver/session/page/conversation with the original

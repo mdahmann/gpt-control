@@ -63,6 +63,10 @@ class RestartSuspension extends Error {
 export interface StartRequest {
 	kind: RunKind;
 	prompt: string;
+	/** Optional GPT Worker title. */
+	title?: string;
+	/** Optional short project identifier to prefix to a GPT Worker title. */
+	projectId?: string;
 	files?: string[];
 	conversationId?: string;
 	transport?: TransportChoice;
@@ -777,6 +781,7 @@ export class GptControlService {
 			provider: conversation.provider,
 			requestedModel: chatgptModel === "pro" ? "Pro" : chatgptModel,
 			...(chatgptEffort ? { requestedEffort: chatgptEffort } : {}),
+			...(request.title ? { requestedTitle: request.title, titleVerified: false } : {}),
 			browserDriverId: conversation.browserDriverId,
 			promptSha256,
 			attachments: manifest.files,
@@ -793,6 +798,7 @@ export class GptControlService {
 			conversationId: conversation.id,
 			kind: request.kind,
 			connectorIntent: request.connectorIntent,
+			connectorPreflight: request.connectorIntent?.mode === "require" ? { status: "required" } : undefined,
 			status: "queued",
 			executionReady,
 			providerTurnPending: false,
@@ -804,6 +810,7 @@ export class GptControlService {
 			submissionState: "not_submitted",
 			requestedChatGptModel: chatgptModel,
 			requestedChatGptEffort: chatgptEffort,
+			requestedProviderTitle: request.title,
 			pinChatRequested: request.pinChat,
 			timeoutMs: request.timeoutMs,
 			deadlineAt: new Date(Date.now() + request.timeoutMs).toISOString(),
@@ -1059,6 +1066,24 @@ export class GptControlService {
 			? "composer_selector" as const
 			: undefined;
 
+		if (run.connectorIntent?.mode === "require" && run.connectorPreflight?.status !== "passed") {
+			const preflight = await this.runRequiredConnectorPreflight(
+				driver, expected, conversation, run, request, signal, recovery,
+			);
+			if ("terminal" in preflight) return preflight.terminal;
+			run = preflight.run;
+			conversation = preflight.conversation;
+			observedModel = run.receipt.observedModel;
+			observedEffort = run.receipt.observedEffort;
+			modelVerified = run.receipt.modelVerified === true;
+			modelVerifiedAt = run.receipt.modelVerifiedAt;
+			modelEvidenceKind = run.receipt.modelEvidenceKind === "composer_selector" ? "composer_selector" : undefined;
+		}
+		if (run.connectorPreflight?.status === "passed" && (run.providerTurnPending || run.providerUserMessageId)) {
+			run = await this.store.updateRun(run.id, { providerUserMessageId: undefined });
+			run = await this.store.clearProviderTurnState(run.id);
+		}
+
 		if (run.submissionState === "not_submitted" || run.submissionState === undefined) {
 			if (!request) throw new Error("Durable browser request payload is unavailable before submission.");
 			let ready = await waitForDriverReady(driver, expected, {
@@ -1265,6 +1290,41 @@ export class GptControlService {
 			throw new Error(`Invalid browser submission state ${run.submissionState}.`);
 		}
 
+		if (run.requestedProviderTitle && run.receipt.titleVerified !== true) {
+			try {
+				const currentSession = await driver.show(expected.sessionId, signal);
+				const renamed = await driver.manageConversation(
+					currentSession,
+					{ action: "rename", title: run.requestedProviderTitle },
+					signal,
+				);
+				if (renamed.title !== run.requestedProviderTitle) {
+					throw new Error(`live title read-back returned ${JSON.stringify(renamed.title)}`);
+				}
+				conversation = await this.store.updateConversation(conversation.id, {
+					providerTitle: renamed.title,
+				});
+				run = await this.store.updateRun(run.id, {
+					receipt: {
+						...run.receipt,
+						observedTitle: renamed.title,
+						titleVerified: true,
+						titleVerifiedAt: renamed.verifiedAt,
+					},
+				});
+			} catch (error) {
+				const warning = `Automatic GPT Worker title verification failed after submission: ${errorMessage(error)}`;
+				if (!(run.diagnostics?.organizationWarnings ?? []).includes(warning)) {
+					run = await this.store.updateRun(run.id, {
+						diagnostics: {
+							...(run.diagnostics ?? {}),
+							organizationWarnings: [...(run.diagnostics?.organizationWarnings ?? []), warning],
+						},
+					});
+				}
+			}
+		}
+
 		const remaining = Math.max(1, Math.min(
 			run.timeoutMs ?? 600_000,
 			Date.parse(run.deadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600_000),
@@ -1324,6 +1384,175 @@ export class GptControlService {
 			lastObservedUrl: outcome.lastObservedUrl,
 			lastObservedUiState: outcome.lastObservedUiState,
 		};
+	}
+
+	private async runRequiredConnectorPreflight(
+		driver: WebChatDriver,
+		expected: ExpectedDriverSession,
+		conversation: ConversationRecord,
+		originalRun: RunRecord,
+		request: DurableRunRequest | undefined,
+		signal: AbortSignal,
+		recovery: boolean,
+	): Promise<{ run: RunRecord; conversation: ConversationRecord } | { terminal: ProviderTurnResult }> {
+		let run = originalRun;
+		const intent = run.connectorIntent;
+		if (!intent || intent.mode !== "require") return { run, conversation };
+		if (!request) {
+			return { terminal: browserNeedsUser("Required connector preflight cannot start because the durable assignment payload is unavailable.", conversation, run) };
+		}
+		let state = run.connectorPreflight ?? { status: "required" as const };
+		if (state.status === "failed") {
+			return { terminal: browserNeedsUser(state.error ?? "Required connector preflight failed.", conversation, run) };
+		}
+		if (state.status === "submitting" && recovery) {
+			return { terminal: browserNeedsUser(
+				"Required connector preflight stopped at an ambiguous send boundary. It was not replayed, and the main assignment was not sent.",
+				conversation,
+				run,
+			) };
+		}
+
+		if (state.status === "required") {
+			let ready = await waitForDriverReady(driver, expected, {
+				timeoutMs: Math.min(60_000, request.timeoutMs),
+				signal,
+			});
+			if (conversation.providerConversationUrl) {
+				const exact = providerConversationIdentity(conversation.providerConversationUrl);
+				if (!exact) throw new Error("Stored provider conversation URL is invalid during connector preflight.");
+				const current = providerConversationIdentity(ready.session.url);
+				if (!current || current.url !== exact.url) {
+					await driver.navigate(ready.session, exact.url, signal);
+					ready = await waitForDriverReady(driver, expected, {
+						timeoutMs: Math.min(60_000, request.timeoutMs),
+						signal,
+					});
+				}
+			}
+			const baseline = ready.observation.snapshot.count;
+			const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
+			const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro"
+				? { ...(requestedModel !== "pro" ? { model: requestedModel } : {}), ...(request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {}) }
+				: requestedModel;
+			const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+			run = await this.store.updateRun(run.id, {
+				receipt: {
+					...run.receipt,
+					requestedModel: selected.requestedModel,
+					observedModel: selected.observedModel,
+					...(selected.requestedEffort ? { requestedEffort: selected.requestedEffort } : {}),
+					...(selected.observedEffort ? { observedEffort: selected.observedEffort } : {}),
+					model: selected.observedModel,
+					modelVerified: true,
+					modelEvidenceKind: selected.modelEvidenceKind,
+					modelVerifiedAt: selected.modelVerifiedAt,
+				},
+			});
+			const prompt = connectorPreflightPrompt(intent.names);
+			await driver.fill(ready.session, prompt, signal);
+			await driver.verifyModel(ready.session, requestedSelection, signal);
+			run = await this.store.updateRun(run.id, {
+				providerTurnPending: true,
+				connectorPreflight: { status: "submitting", baselineMessageCount: baseline },
+			});
+			const beforeSend = await driver.observe(ready.session, signal);
+			await driver.send(ready.session, signal);
+			const deadline = Date.now() + Math.min(15_000, request.timeoutMs);
+			let bound = false;
+			while (Date.now() < deadline) {
+				const session = await assertExactDriverSession(driver, expected, signal);
+				const observation = await driver.observe(session, signal);
+				if (observation.latestUserMessageId && observation.latestUserMessageId !== beforeSend.latestUserMessageId) {
+					const identity = providerConversationIdentity(session.url);
+					if (identity) {
+						conversation = await this.persistConversationIdentity(conversation.id, identity);
+						run = await this.store.updateRun(run.id, {
+							providerUserMessageId: observation.latestUserMessageId,
+							connectorPreflight: {
+								status: "submitted",
+								baselineMessageCount: baseline,
+								providerUserMessageId: observation.latestUserMessageId,
+							},
+							receipt: {
+								...run.receipt,
+								providerConversationId: identity.id,
+								providerConversationUrl: identity.url,
+							},
+						});
+						state = required(run.connectorPreflight, "connector preflight state");
+						bound = true;
+						break;
+					}
+				}
+				await abortableSleep(100, signal);
+			}
+			if (!bound) {
+				return { terminal: browserNeedsUser(
+					"Required connector preflight did not produce a durable provider conversation and user-message identity. It was not replayed, and the main assignment was not sent.",
+					conversation,
+					run,
+				) };
+			}
+		}
+
+		state = required(run.connectorPreflight, "connector preflight state");
+		if (state.status !== "submitted" || !state.providerUserMessageId || state.baselineMessageCount === undefined) {
+			return { terminal: browserNeedsUser("Required connector preflight has incomplete durable state. The main assignment was not sent.", conversation, run) };
+		}
+		const remaining = Math.max(1, Date.parse(run.deadlineAt ?? "") - Date.now() || request.timeoutMs);
+		const outcome = await waitForCompletedDriverTurn(driver, expected, {
+			baselineCount: state.baselineMessageCount,
+			timeoutMs: remaining,
+			conversationUrl: conversation.providerConversationUrl,
+			providerTurnIdentityPersisted: true,
+			signal,
+			onConversationIdentity: async (identity) => { await this.persistConversationIdentity(conversation.id, identity); },
+			onConversationObservation: async (identity, observation) => {
+				const exact = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
+				if (!exact || exact.url !== identity.url) return "mismatch";
+				if (!observation.latestUserMessageId) return "unavailable";
+				return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+			},
+		});
+		if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
+			const reason = outcome.reason ?? "Required connector preflight did not complete.";
+			run = await this.store.updateRun(run.id, { connectorPreflight: { ...state, status: "failed", error: reason } });
+			return { terminal: browserNeedsUser(`${reason} The main assignment was not sent.`, conversation, run) };
+		}
+		const parsed = parseConnectorPreflight(outcome.snapshot.text, intent.names);
+		const observed = await driver.observe(await driver.show(expected.sessionId, signal), signal);
+		const matchingCards = observed.visibleToolCards.filter((card) =>
+			intent.names.some((name) => card.label.toLowerCase().includes(name.toLowerCase())));
+		const allCardNamesObserved = intent.names.every((name) =>
+			matchingCards.some((card) => card.label.toLowerCase().includes(name.toLowerCase())));
+		if (!parsed.ok) {
+			run = await this.store.clearProviderTurnState(run.id);
+			run = await this.store.updateRun(run.id, {
+				providerUserMessageId: undefined,
+				connectorPreflight: {
+					...state,
+					status: "failed",
+					responseSha256: sha256(outcome.snapshot.text),
+					toolCards: matchingCards,
+					error: parsed.reason,
+				},
+			});
+			return { terminal: browserNeedsUser(`${parsed.reason} The main assignment was not sent.`, conversation, run) };
+		}
+		run = await this.store.clearProviderTurnState(run.id);
+		run = await this.store.updateRun(run.id, {
+			providerUserMessageId: undefined,
+			connectorPreflight: {
+				...state,
+				status: "passed",
+				responseSha256: sha256(outcome.snapshot.text),
+				evidenceKind: allCardNamesObserved ? "browser_tool_card" : "assistant_reported_preflight",
+				toolCards: matchingCards,
+				verifiedAt: nowIso(),
+			},
+		});
+		return { run, conversation };
 	}
 
 	private async ensureOwnedDriver(
@@ -1507,7 +1736,7 @@ export class GptControlService {
 			providerStopRequested: providerMayBeActive ? true : current.providerStopRequested,
 			cancellationRequestedAt: at,
 			completedAt: at,
-			error: "Cancelled by caller. Late provider completion is ignored.",
+			error: "Cancelled by explicit request. Late ChatGPT completion is ignored. Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification.",
 		});
 	}
 
@@ -1674,6 +1903,8 @@ interface NormalizedStartRequest {
 	transport: "browser";
 	chatgptModel: ChatGptModel;
 	chatgptEffort?: string;
+	title?: string;
+	projectId?: string;
 	pinChat: boolean;
 	idempotencyKey?: string;
 	connectorIntent?: { names: string[]; mode: "prefer" | "require" };
@@ -1725,6 +1956,16 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	if (request.kind === "subagent" && request.conversationId) {
 		throw new Error("Each GPT Worker requires an independent owned conversation; conversation_id is not accepted.");
 	}
+	if (request.kind !== "subagent" && (request.title !== undefined || request.projectId !== undefined)) {
+		throw new Error("title and project_id are supported only for independent GPT Workers.");
+	}
+	if (request.projectId !== undefined && request.title === undefined) {
+		throw new Error("project_id requires a GPT Worker title.");
+	}
+	const projectId = request.projectId === undefined ? undefined : normalizeProjectId(request.projectId);
+	const title = request.kind === "subagent" && request.title !== undefined
+		? normalizeWorkerTitle(request.title, projectId)
+		: undefined;
 	if (request.kind !== "subagent" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
 		throw new Error("Connector intent is supported only for independent GPT Workers.");
 	}
@@ -1735,6 +1976,12 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	const connectorIntent = connectorNames.length > 0
 		? { names: connectorNames, mode: request.connectorMode ?? "prefer" }
 		: undefined;
+	if (connectorIntent?.mode === "require") {
+		const missingMentions = connectorIntent.names.filter((name) => !request.prompt.includes(`@${name}`));
+		if (missingMentions.length > 0) {
+			throw new Error(`Required connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
+		}
+	}
 	return {
 		kind: request.kind,
 		prompt: request.prompt,
@@ -1743,6 +1990,8 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 		transport: "browser",
 		chatgptModel,
 		chatgptEffort,
+		title,
+		projectId,
 		pinChat: request.kind === "subagent" || request.pinChat === true,
 		idempotencyKey: request.idempotencyKey,
 		connectorIntent,
@@ -1762,6 +2011,8 @@ function startRequestHash(request: NormalizedStartRequest): string {
 		transport: request.transport,
 		chatgptModel: request.chatgptModel,
 		chatgptEffort: request.chatgptEffort,
+		title: request.title ?? null,
+		projectId: request.projectId ?? null,
 		pinChat: request.pinChat,
 		connectorIntent: request.connectorIntent ?? null,
 		timeoutMs: request.timeoutMs,
@@ -1771,6 +2022,80 @@ function startRequestHash(request: NormalizedStartRequest): string {
 	if (request.allowOutsideWorkspace) value.allowOutsideWorkspace = true;
 	if (request.allowSensitiveFiles) value.allowSensitiveFiles = true;
 	return sha256(JSON.stringify(value));
+}
+
+function normalizeWorkerTitle(value: string, projectId?: string): string {
+	const trimmed = value.trim();
+	if (trimmed === "" || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+		throw new Error("GPT Worker title must contain visible text without control characters.");
+	}
+	const suffix = projectId
+		? trimmed.replace(new RegExp(`^${projectId}:\\s*`, "i"), "").trim()
+		: trimmed;
+	if (suffix === "") throw new Error("GPT Worker title must contain text after the project identifier.");
+	const title = projectId ? `${projectId}: ${suffix}` : suffix;
+	if (title.length > 128) throw new Error("GPT Worker title must be at most 128 characters after the project identifier is applied.");
+	return title;
+}
+
+function normalizeProjectId(value: string): string {
+	const normalized = value.trim().toUpperCase();
+	if (!/^[A-Z0-9][A-Z0-9_-]{0,15}$/.test(normalized)) {
+		throw new Error("project_id must be 1-16 letters, digits, underscores, or hyphens.");
+	}
+	return normalized;
+}
+
+function connectorPreflightPrompt(names: readonly string[]): string {
+	const checks = names.map((name) => {
+		const detail = name.toLowerCase() === "zenbox"
+			? "make one harmless read-only health call, such as computer_overview, and include one returned fact"
+			: name.toLowerCase() === "github"
+				? "make one harmless read-only call and include one returned account or repository fact"
+				: "make one harmless read-only health call and include one returned fact";
+		return `- @${name}: ${detail}`;
+	}).join("\n");
+	return `Before we start the assignment, please quickly check these connected tools in this same chat:\n${checks}\n\nDo not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise fact returned by the tool"}]}. Include exactly one entry for every listed tool. If a tool is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+}
+
+function parseConnectorPreflight(
+	text: string,
+	names: readonly string[],
+): { ok: true } | { ok: false; reason: string } {
+	let source = text.trim();
+	const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(source);
+	if (fenced) source = fenced[1].trim();
+	let value: unknown;
+	try {
+		value = JSON.parse(source);
+	} catch {
+		return { ok: false, reason: "Required connector preflight did not return the requested JSON payload." };
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return { ok: false, reason: "Required connector preflight returned an invalid payload object." };
+	}
+	const connectors = (value as { connectors?: unknown }).connectors;
+	if (!Array.isArray(connectors) || connectors.length !== names.length) {
+		return { ok: false, reason: "Required connector preflight did not return exactly one result for every connector." };
+	}
+	const seen = new Set<string>();
+	for (const entry of connectors) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			return { ok: false, reason: "Required connector preflight contained a malformed connector result." };
+		}
+		const record = entry as { name?: unknown; status?: unknown; payload?: unknown };
+		if (typeof record.name !== "string" || !names.includes(record.name) || seen.has(record.name)) {
+			return { ok: false, reason: "Required connector preflight returned a missing, duplicate, or unexpected connector name." };
+		}
+		seen.add(record.name);
+		const usablePayload = typeof record.payload === "string"
+			? record.payload.trim().length > 0
+			: Boolean(record.payload && typeof record.payload === "object" && !Array.isArray(record.payload) && Object.keys(record.payload).length > 0);
+		if (record.status !== "ready" || !usablePayload) {
+			return { ok: false, reason: `Required connector @${record.name} did not report a usable ready payload.` };
+		}
+	}
+	return { ok: true };
 }
 
 function normalizePickerRequest(value: string, maxLength: number, field: string): string {

@@ -39,6 +39,8 @@ function startRequest(
 	return {
 		kind,
 		prompt: String(kind === "consult" ? params.question ?? "" : params.prompt ?? ""),
+		title: kind === "subagent" && typeof params.title === "string" ? params.title : undefined,
+		projectId: kind === "subagent" && typeof params.project_id === "string" ? params.project_id : undefined,
 		files: stringList(params.files),
 		conversationId: kind === "subagent"
 			? undefined
@@ -201,6 +203,8 @@ function registerWorkerStart(pi: ExtensionAPI, Type: TypeBuilder, service: GptCo
 		strict: true,
 		parameters: Type.Object({
 			prompt: Type.String(),
+			title: Type.Optional(Type.String({ description: "Worker title. GPT-Control verifies the live ChatGPT title." })),
+			project_id: Type.Optional(Type.String({ description: "Optional short project identifier prefixed to the title, such as SEQ." })),
 			files: Type.Optional(Type.Array(Type.String())),
 			idempotency_key: Type.String(),
 			chatgpt_model: Type.Optional(Type.String({ description: "Exact label from gpt_models, such as GPT-5.6 Sol." })),
@@ -587,6 +591,7 @@ export function publicRun(run: RunRecord): Record<string, unknown> {
 		conversationId: run.conversationId,
 		kind: run.kind,
 		connectorIntent: run.connectorIntent,
+		connectorVerification: connectorVerification(run),
 		status: run.status,
 		providerTurnPending: run.providerTurnPending,
 		providerStopRequested: run.providerStopRequested,
@@ -607,6 +612,27 @@ export function publicRun(run: RunRecord): Record<string, unknown> {
 		createdAt: run.createdAt,
 		completedAt: run.completedAt,
 	};
+}
+
+function connectorVerification(run: RunRecord): Record<string, unknown> | undefined {
+	if (!run.connectorIntent) return undefined;
+	const preflight = run.connectorPreflight;
+	if (run.connectorIntent.mode !== "require") {
+		return { status: "unverified", evidenceKind: "provider_prompt_intent_only", note: "Preferred connector intent was not preflighted. Verify connected-tool results independently." };
+	}
+	if (preflight?.status === "passed") {
+		return {
+			status: "preflight_passed",
+			evidenceKind: preflight.evidenceKind,
+			responseSha256: preflight.responseSha256,
+			toolCards: preflight.toolCards,
+			verifiedAt: preflight.verifiedAt,
+			note: preflight.evidenceKind === "browser_tool_card"
+				? "The same conversation returned usable preflight payloads and browser-visible connector-named tool cards. Tool output remains untrusted evidence."
+				: "The same conversation returned usable preflight payloads, but GPT-Control did not prove connector tool calls from browser cards. Verify important external facts independently.",
+		};
+	}
+	return { status: preflight?.status ?? "required", evidenceKind: "none", error: preflight?.error, note: "The main assignment is blocked until the same-conversation connector preflight passes." };
 }
 
 function isTerminal(status: RunRecord["status"]): boolean {

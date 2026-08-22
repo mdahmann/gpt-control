@@ -577,8 +577,17 @@ function normalizePollInterval(value: number | undefined): number {
 }
 
 function cancellationResult(taskId: string, runId?: string, reason?: string): Result {
+	const details = {
+		taskId,
+		runId,
+		status: "cancelled" as const,
+		reason: reason ?? "Client cancelled task execution.",
+		cancellationScope: "owned_chatgpt_turn_only",
+		warning: "Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification.",
+	};
 	return {
-		content: [{ type: "text", text: JSON.stringify({ taskId, runId, status: "cancelled", reason: reason ?? "Client cancelled task execution." }) }],
+		content: [{ type: "text", text: JSON.stringify(details) }],
+		structuredContent: details,
 		isError: true,
 	};
 }

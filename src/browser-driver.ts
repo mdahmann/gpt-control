@@ -686,6 +686,10 @@ const ObservationSchema = z.object({
 	answering: z.boolean(),
 	thinking: z.boolean(),
 	toolRunning: z.boolean(),
+	visibleToolCards: z.array(z.object({
+		label: z.string().min(1).max(256),
+		sha256: z.string().regex(/^[a-f0-9]{64}$/),
+	}).strict()).default([]),
 	retryAvailable: z.boolean(),
 	continueAvailable: z.boolean(),
 	errorMessage: z.string().optional(),

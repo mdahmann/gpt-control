@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.4.0";
+export const PACKAGE_VERSION = "0.4.1";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -19,6 +19,22 @@ export type BrowserPageId = string | number;
 export interface ConnectorIntent {
 	names: string[];
 	mode: "prefer" | "require";
+}
+
+export interface ConnectorToolCardReceipt {
+	label: string;
+	sha256: string;
+}
+
+export interface ConnectorPreflightReceipt {
+	status: "required" | "submitting" | "submitted" | "passed" | "failed";
+	baselineMessageCount?: number;
+	providerUserMessageId?: string;
+	responseSha256?: string;
+	evidenceKind?: "assistant_reported_preflight" | "browser_tool_card";
+	toolCards?: ConnectorToolCardReceipt[];
+	verifiedAt?: string;
+	error?: string;
 }
 
 export interface AttachmentReceipt {
@@ -91,6 +107,10 @@ export interface ReviewReceipt {
 	modelVerified?: boolean;
 	modelEvidenceKind?: ModelEvidenceKind;
 	modelVerifiedAt?: string;
+	requestedTitle?: string;
+	observedTitle?: string;
+	titleVerified?: boolean;
+	titleVerifiedAt?: string;
 	browserDriverId?: string;
 	transportVersion?: string;
 	providerEndpoint?: string;
@@ -141,6 +161,7 @@ export interface RunRecord {
 	conversationId: string;
 	kind: RunKind;
 	connectorIntent?: ConnectorIntent;
+	connectorPreflight?: ConnectorPreflightReceipt;
 	status: RunStatus;
 	executionReady: boolean;
 	/** True until the exact submitted provider turn is final or proved stopped. */
@@ -157,6 +178,7 @@ export interface RunRecord {
 	submissionState?: SubmissionState;
 	requestedChatGptModel?: ChatGptModel;
 	requestedChatGptEffort?: ChatGptEffort;
+	requestedProviderTitle?: string;
 	pinChatRequested?: boolean;
 	timeoutMs?: number;
 	deadlineAt?: string;

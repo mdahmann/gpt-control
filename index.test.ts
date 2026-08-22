@@ -88,6 +88,8 @@ describe("public extension contract", () => {
 		const subagent = tools.find((tool) => tool.name === "gpt_worker_run")!;
 		const subagentProperties = (subagent.parameters as { properties: Record<string, SchemaNode> }).properties;
 		expect(subagentProperties).toHaveProperty("idempotency_key");
+		expect(subagentProperties).toHaveProperty("title");
+		expect(subagentProperties).toHaveProperty("project_id");
 		expect(subagentProperties).toHaveProperty("chatgpt_model");
 		expect(subagentProperties).toHaveProperty("chatgpt_effort");
 		expect(subagentProperties).toHaveProperty("connectors");

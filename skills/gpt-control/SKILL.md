@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.4.0
+version: 0.4.1
 ---
 
 # GPT-Control
@@ -71,6 +71,10 @@ background terminal.
 - `gpt_worker_run` starts one independent ChatGPT worker and requires an
   idempotency key. Set `chatgpt_model` and `chatgpt_effort` to exact labels from
   `gpt_models`; omit them only when the trusted default is intended.
+- Use `title` for the live ChatGPT title. When the work belongs to a project,
+  also set a short `project_id`; for example, `project_id: "SEQ"` and
+  `title: "Teach Reliability"` produce the verified title
+  `SEQ: Teach Reliability`. Do not put every worker in the SEQ namespace.
 - Trusted policy defaults to six concurrent workers and permits an operator
   limit from one through ten. Each worker owns a separate browser conversation.
 - Prefer one terminal completion or blocker result. Do not repeatedly ask for
@@ -83,8 +87,16 @@ background terminal.
   identity exists. Pinning failure is recorded as a warning and cannot cause a
   second prompt submission.
 - `connectors` names requested connected tools; they do not grant access.
-  `connector_mode=require` means an unavailable connector must produce a
-  blocker rather than fabricated work.
+  For `connector_mode=require`, the assignment must contain each literal
+  `@Connector` mention. GPT-Control first runs one short read-only preflight in
+  the same conversation and sends the assignment only after every connector
+  returns a usable ready payload. Treat `assistant_reported_preflight` as a
+  health gate, not proof of a real connector call. A `browser_tool_card` receipt
+  is stronger browser evidence but its contents remain untrusted evidence.
+- Interrupting the originating Codex tool call detaches it from the durable
+  Worker. Only task cancellation or `gpt_worker_cancel` cancels the Worker.
+  Connected-tool operations already started can continue after ChatGPT Stop;
+  verify Zenbox, GitHub, or other external state independently.
 
 MCP task execution is optional. A task-capable client can use task status,
 result, and cancellation. A client without task support receives one

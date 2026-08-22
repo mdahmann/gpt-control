@@ -385,8 +385,43 @@ describe("bounded GPT Worker scheduler", () => {
 		});
 		expect(value.run.status).toBe("completed");
 		expect(value.run.connectorIntent).toEqual({ names: ["GitHub", "Zenbox"], mode: "require" });
+		expect(value.run.connectorPreflight).toMatchObject({ status: "passed", evidenceKind: "assistant_reported_preflight" });
+		expect(bridge.submittedPrompts).toHaveLength(2);
+		expect(bridge.submittedPrompts[0]).toContain("@GitHub");
+		expect(bridge.submittedPrompts[0]).toContain("@Zenbox");
+		expect(bridge.submittedPrompts[1]).toBe("Use @GitHub and @Zenbox to inspect the repository evidence.");
+	});
+
+	test("blocks required connectors before browser allocation when literal mentions are missing", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		await expect(service.start({
+			kind: "subagent",
+			prompt: "Inspect the repository evidence.",
+			connectors: ["GitHub", "Zenbox"],
+			connectorMode: "require",
+		})).rejects.toThrow("@GitHub, @Zenbox");
+		expect(bridge.activeTabs()).toEqual([]);
+	});
+
+	test("stops before the assignment when a same-conversation connector preflight is blocked", async () => {
+		const bridge = new FakeChromeBridge({
+			responseForPrompt: (prompt) => prompt.includes("Before we start the assignment")
+				? JSON.stringify({ connectors: [{ name: "Zenbox", status: "blocked", payload: "connector unavailable" }] })
+				: undefined,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const value = await service.start({
+			kind: "subagent",
+			prompt: "Use @Zenbox to inspect the host.",
+			connectors: ["Zenbox"],
+			connectorMode: "require",
+			timeoutMs: 1000,
+		});
+		expect(value.run.status).toBe("needs_user");
+		expect(value.run.connectorPreflight).toMatchObject({ status: "failed" });
 		expect(bridge.submittedPrompts).toHaveLength(1);
-		expect(bridge.submittedPrompts[0]).toBe("Use @GitHub and @Zenbox to inspect the repository evidence.");
+		expect(bridge.submittedPrompts[0]).toContain("@Zenbox");
 	});
 
 	test("rejects connector intent on ordinary chats and unsafe connector names", async () => {
@@ -1429,6 +1464,33 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		}
 	});
 
+	test("originating request interruption detaches without cancelling the durable worker", async () => {
+		const harness = await connectMcp();
+		const controller = new AbortController();
+		try {
+			const iterator = harness.client.experimental.tasks.callToolStream({
+				name: "gpt_worker_run",
+				arguments: { prompt: "detached durable worker", idempotency_key: "request-detaches", timeout_ms: 1500 },
+			}, CallToolResultSchema, {
+				task: { ttl: 60_000 },
+				timeout: 5000,
+				signal: controller.signal,
+			})[Symbol.asyncIterator]();
+			const created = await iterator.next();
+			expect(created.value?.type).toBe("taskCreated");
+			const taskId = (created.value as { type: "taskCreated"; task: { taskId: string } }).task.taskId;
+			controller.abort(new Error("originating Codex turn was interrupted"));
+			await waitUntil(async () => (await harness.taskStore.getTask(taskId))?.status === "completed", 2500);
+			const runId = await harness.taskStore.getRunId(taskId);
+			expect(runId).toBeDefined();
+			expect((await harness.service.getRun(runId!)).status).toBe("completed");
+			expect(harness.bridge.submittedPrompts).toEqual(["detached durable worker"]);
+			await iterator.return?.().catch(() => undefined);
+		} finally {
+			await harness.close();
+		}
+	});
+
 	test("client disconnect does not cancel the worker; a new client retrieves one durable result", async () => {
 		const root = scratch();
 		const harness = await connectMcp({ root });
@@ -1496,6 +1558,48 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect((await second.service.getRun(started.run.id)).status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["[slow] restart"]);
 		expect(bridge.stopClicks).toEqual([]);
+	});
+
+	test("server restart resumes a submitted connector preflight before sending the assignment once", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge({
+			scenarioForPrompt: (prompt) => prompt.includes("Before we start the assignment") ? "slow" : "success",
+		});
+		const first = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await first.service.start({
+			kind: "subagent",
+			prompt: "Use @Zenbox for the main assignment.",
+			connectors: ["Zenbox"],
+			connectorMode: "require",
+			idempotencyKey: "restart-preflight",
+			wait: false,
+			timeoutMs: 3000,
+		});
+		await waitUntil(async () => {
+			const run = await first.service.getRun(started.run.id);
+			return bridge.submittedPrompts.length === 1 && run.connectorPreflight?.status === "submitted";
+		});
+		const taskStore = new DurableTaskStore(join(root, "state", "mcp-tasks"), first.service.store);
+		const task = await taskStore.createTask(
+			{ ttl: 60_000, pollInterval: 100 },
+			1,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "restart-preflight" } } } as never,
+		);
+		await taskStore.bindRun(task.taskId, started.run.id);
+		await first.service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
+		await first.service.suspendActiveRunsForRestart();
+
+		const second = makeChromeService(join(root, "state"), workspace, bridge);
+		await resumeDurableSubagents(second.service, taskStore, new Map());
+		bridge.release();
+		await waitUntil(async () => (await taskStore.getTask(task.taskId))?.status === "completed", 3000);
+		const recovered = await second.service.getRun(started.run.id);
+		expect(recovered.connectorPreflight).toMatchObject({ status: "passed" });
+		expect(bridge.submittedPrompts).toHaveLength(2);
+		expect(bridge.submittedPrompts[0]).toContain("Before we start the assignment");
+		expect(bridge.submittedPrompts[1]).toBe("Use @Zenbox for the main assignment.");
 	});
 
 	test("restart without a durable conversation URL refuses to adopt another valid conversation", async () => {
@@ -1637,7 +1741,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			const result = await harness.client.callTool({
 				name: "gpt_worker_run",
 				arguments: {
-					prompt: "fallback worker",
+					prompt: "Use @GitHub for the fallback worker.",
 					idempotency_key: "fallback-worker",
 					connectors: ["GitHub"],
 					connector_mode: "require",
@@ -1647,11 +1751,11 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			expect(result.isError).not.toBe(true);
 			expect(result.structuredContent).toMatchObject({ run: {
 				status: "completed",
-				connectorVerification: { status: "unverified", evidenceKind: "provider_prompt_intent_only" },
+				connectorVerification: { status: "preflight_passed", evidenceKind: "assistant_reported_preflight" },
 			} });
 			expect(await harness.taskStore.listBindings()).toEqual([]);
-			expect(harness.bridge.submittedPrompts).toHaveLength(1);
-			expect(harness.bridge.submittedPrompts[0]).toBe("fallback worker");
+			expect(harness.bridge.submittedPrompts).toHaveLength(2);
+			expect(harness.bridge.submittedPrompts[1]).toBe("Use @GitHub for the fallback worker.");
 		} finally {
 			await harness.close();
 		}

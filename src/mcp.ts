@@ -36,6 +36,8 @@ const SUBAGENT_ACTIVATION_GRACE_MS = 250;
 
 const SubagentSchema = {
 	prompt: z.string().min(1),
+	title: z.string().min(1).max(128).optional(),
+	project_id: z.string().min(1).max(16).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/).optional(),
 	files: z.array(z.string()).max(32).optional(),
 	idempotency_key: IdempotencyKeySchema,
 	chatgpt_model: ChatGptModelSchema.optional(),
@@ -47,6 +49,8 @@ const SubagentSchema = {
 
 interface SubagentParams {
 	prompt: string;
+	title?: string;
+	project_id?: string;
 	files?: string[];
 	idempotency_key: string;
 	chatgpt_model?: string;
@@ -417,17 +421,10 @@ function registerWorkerRun(
 			taskStore.setStatusListener(task.taskId, async (updated) => {
 				await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
 			});
-			const cancelOriginatingTask = () =>
-				taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
-			extra.signal.addEventListener("abort", () => { void cancelOriginatingTask(); }, { once: true });
-			// AbortSignal does not replay an event to a listener installed after the
-			// signal was aborted. Register first, then check explicitly; duplicate
-			// cancellation is monotonic and harmless if the event races this check.
-			if (extra.signal.aborted) {
-				await cancelOriginatingTask();
-				taskStore.removeStatusListener(task.taskId);
-				return { task };
-			}
+			// The tool request is only the durable worker's originating caller.
+			// Cancelling or interrupting that request detaches the caller; it does
+			// not cancel the task. Only tasks/cancel or gpt_worker_cancel can make
+			// the durable worker terminal and request a provider Stop.
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned GPT Worker.");
 			try {
 				const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
@@ -522,7 +519,15 @@ function registerWorkerRecoveryTools(
 			// Keep the tool's provider-Stop guarantee explicit. The task-store listener
 			// also routes protocol tasks/cancel here; cancelRun is durable and idempotent.
 			const run = runId ? await service.cancelRun(runId) : undefined;
-			return toolPayload(`GPT Worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
+			return toolPayload(
+				`GPT Worker ${taskId} is cancelled. ChatGPT Stop cannot cancel connected-tool operations that already started; verify their external state independently.`,
+				{
+					taskId,
+					run: run ? publicRun(run) : undefined,
+					cancellationScope: "owned_chatgpt_turn_only",
+					warning: "Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification.",
+				},
+			);
 		}
 		if (!identity.runId) throw new Error("No run id was available to cancel.");
 		return runPayload(await service.cancelRun(identity.runId));
@@ -762,6 +767,8 @@ function subagentRequest(params: SubagentParams, wait: boolean): StartRequest {
 	return {
 		kind: "subagent",
 		prompt: params.prompt,
+		title: params.title,
+		projectId: params.project_id,
 		files: params.files,
 		transport: "browser",
 		chatgptModel: params.chatgpt_model ?? "pro",
@@ -819,11 +826,7 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		providerStopRequested: run.providerStopRequested,
 		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
 		connectorIntent: run.connectorIntent,
-		connectorVerification: run.connectorIntent ? {
-			status: "unverified",
-			evidenceKind: "provider_prompt_intent_only",
-			note: "GPT-Control cannot observe ChatGPT connector tool calls. Verify required connector results independently before accepting the worker output.",
-		} : undefined,
+		connectorVerification: connectorVerification(run),
 		providerRunId: run.providerRunId,
 		resultText: run.resultText,
 		report: run.result,
@@ -843,6 +846,36 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		createdAt: run.createdAt,
 		updatedAt: run.updatedAt,
 		completedAt: run.completedAt,
+	};
+}
+
+function connectorVerification(run: RunRecord): Record<string, unknown> | undefined {
+	if (!run.connectorIntent) return undefined;
+	const preflight = run.connectorPreflight;
+	if (run.connectorIntent.mode !== "require") {
+		return {
+			status: "unverified",
+			evidenceKind: "provider_prompt_intent_only",
+			note: "Preferred connector intent was not preflighted. Verify connected-tool results independently.",
+		};
+	}
+	if (preflight?.status === "passed") {
+		return {
+			status: "preflight_passed",
+			evidenceKind: preflight.evidenceKind,
+			responseSha256: preflight.responseSha256,
+			toolCards: preflight.toolCards,
+			verifiedAt: preflight.verifiedAt,
+			note: preflight.evidenceKind === "browser_tool_card"
+				? "The same conversation returned usable preflight payloads and browser-visible connector-named tool cards. Tool output remains untrusted evidence."
+				: "The same conversation returned usable preflight payloads, but GPT-Control did not prove connector tool calls from browser cards. Verify important external facts independently.",
+		};
+	}
+	return {
+		status: preflight?.status ?? "required",
+		evidenceKind: "none",
+		error: preflight?.error,
+		note: "The main assignment is blocked until the same-conversation connector preflight passes.",
 	};
 }
 

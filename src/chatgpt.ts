@@ -107,6 +107,7 @@ export interface ChatPageObservation {
 	answering: boolean;
 	thinking: boolean;
 	toolRunning: boolean;
+	visibleToolCards: Array<{ label: string; sha256: string }>;
 	retryAvailable: boolean;
 	continueAvailable: boolean;
 	errorMessage?: string;
@@ -1260,6 +1261,10 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		...root.querySelectorAll('[data-testid*="tool"]'),
 		...root.querySelectorAll('[data-testid*="error"]'),
 	]);
+	const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]'))
+		.map((node) => nodeLabel(node).replace(/\s+/g, " ").trim())
+		.filter((label) => label.length > 0 && label.length <= 256)
+		.map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
 	const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
 	const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
 	const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
@@ -1282,6 +1287,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		answering: stopControl,
 		thinking,
 		toolRunning,
+		visibleToolCards,
 		retryAvailable,
 		continueAvailable,
 		errorMessage: errorText,
@@ -1847,6 +1853,16 @@ async function privateOrBridgeAction(
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	if (expectedTarget) {
+		if (action === "press") {
+			// Chrome Bridge cannot bind keyboard actions atomically. Prove the
+			// exact owned document immediately before and after the key press.
+			// This mirrors the model-picker path and avoids sending unsupported
+			// expectedTarget data with a keyboard action.
+			await privateBridgeJson(exec, launcher, "ping", { tabId: payload.tabId, expectedTarget }, signal);
+			await privateBridgeJson(exec, launcher, "press", payload, signal);
+			await privateBridgeJson(exec, launcher, "ping", { tabId: payload.tabId, expectedTarget }, signal);
+			return;
+		}
 		await privateBridgeJson(exec, launcher, action, { ...payload, expectedTarget }, signal);
 		return;
 	}

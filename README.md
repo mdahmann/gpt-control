@@ -2,7 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.0 adds live model and effort discovery, exact-conversation organization,
+0.4.1 adds verified project-aware Worker titles, durable caller detachment, and
+same-conversation required-connector preflight. Version 0.4.0 added live model
+and effort discovery, exact-conversation organization,
 crash-safe durable runs, and three clear orchestration routes: GPT Chat, GPT
 Worker, and GPT Sub-agent.
 
@@ -87,6 +89,15 @@ an operator-configured limit from one through ten, even across broker processes
 sharing the same state root. Additional workers queue fairly. Use `gpt_models`
 to discover the exact current model and effort labels before a run when the user
 requests a specific selection.
+
+Workers can set a live `title`. An optional short `project_id` is prefixed to
+that title and verified from ChatGPT read-back, such as
+`SEQ: Teach Reliability`. Required connector work must include literal
+`@Connector` mentions. GPT-Control sends a short read-only health check first
+in the same conversation and does not send the assignment unless every named
+connector returns a usable ready payload. An assistant-reported payload is a
+health gate, not proof of the underlying connector call; browser-visible tool
+card receipts are recorded separately when the live DOM exposes them.
 
 ## Existing ChatGPT conversations
 

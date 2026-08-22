@@ -357,6 +357,51 @@ describe("ChatGPT organization controls", () => {
 		expect((await service.store.getConversation(started.conversation.id)).providerPinned).toBe(true);
 	});
 
+	test("normalizes and verifies one live SEQ-prefixed GPT Worker title", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "titled worker",
+			title: "Teach Reliability",
+			projectId: "SEQ",
+			timeoutMs: 1000,
+		});
+		expect(started.run.status).toBe("completed");
+		expect(started.run.requestedProviderTitle).toBe("SEQ: Teach Reliability");
+		expect(started.run.receipt).toMatchObject({
+			requestedTitle: "SEQ: Teach Reliability",
+			observedTitle: "SEQ: Teach Reliability",
+			titleVerified: true,
+		});
+		expect((await service.store.getConversation(started.conversation.id)).providerTitle).toBe("SEQ: Teach Reliability");
+	});
+
+	test("does not duplicate an existing SEQ worker-title prefix", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "already prefixed",
+			title: "seq: Timing Contract",
+			projectId: "seq",
+			timeoutMs: 1000,
+		});
+		expect(started.run.receipt.observedTitle).toBe("SEQ: Timing Contract");
+	});
+
+	test("keeps a plain worker title when no project identifier is supplied", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "generic worker",
+			title: "Independent research",
+			timeoutMs: 1000,
+		});
+		expect(started.run.receipt.observedTitle).toBe("Independent research");
+	});
+
 	test("pins an ordinary chat only when requested", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -473,6 +518,13 @@ describe("honest terminal state and owned-tab boundaries", () => {
 	test("does not treat unrelated Stop recording controls as generation", () => {
 		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>complete answer</p></div></div><button aria-label="Stop recording">Voice</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation.answering).toBe(false);
+	});
+
+	test("hashes bounded browser-visible tool cards without treating them as trusted output", () => {
+		const observation = extractChatPageObservation('<main><div data-testid="tool-result-card">Zenbox computer_overview host zenbox-vm</div><form><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(observation.visibleToolCards).toHaveLength(1);
+		expect(observation.visibleToolCards[0]).toMatchObject({ label: "Zenbox computer_overview host zenbox-vm" });
+		expect(observation.visibleToolCards[0].sha256).toMatch(/^[a-f0-9]{64}$/);
 	});
 
 	test("legacy proved prompts with one code block retain full-turn hashing", () => {

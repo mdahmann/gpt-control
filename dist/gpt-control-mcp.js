@@ -29319,7 +29319,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.4.0";
+var PACKAGE_VERSION = "0.4.1";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33761,7 +33761,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.4.0";
+var PACKAGE_VERSION2 = "0.4.1";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -34464,6 +34464,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
     ...root.querySelectorAll('[data-testid*="tool"]'),
     ...root.querySelectorAll('[data-testid*="error"]')
   ]);
+  const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]')).map((node) => nodeLabel(node).replace(/\s+/g, " ").trim()).filter((label) => label.length > 0 && label.length <= 256).map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
   const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
   const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
   const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
@@ -34486,6 +34487,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
     answering: stopControl,
     thinking,
     toolRunning,
+    visibleToolCards,
     retryAvailable,
     continueAvailable,
     errorMessage: errorText,
@@ -34767,6 +34769,12 @@ async function waitForSelectorInHtml(exec, launcher, tabId, selector, deadline, 
 }
 async function privateOrBridgeAction(exec, launcher, action, payload, signal, expectedTarget) {
   if (expectedTarget) {
+    if (action === "press") {
+      await privateBridgeJson(exec, launcher, "ping", { tabId: payload.tabId, expectedTarget }, signal);
+      await privateBridgeJson(exec, launcher, "press", payload, signal);
+      await privateBridgeJson(exec, launcher, "ping", { tabId: payload.tabId, expectedTarget }, signal);
+      return;
+    }
     await privateBridgeJson(exec, launcher, action, { ...payload, expectedTarget }, signal);
     return;
   }
@@ -35433,6 +35441,10 @@ var ObservationSchema = exports_external.object({
   answering: exports_external.boolean(),
   thinking: exports_external.boolean(),
   toolRunning: exports_external.boolean(),
+  visibleToolCards: exports_external.array(exports_external.object({
+    label: exports_external.string().min(1).max(256),
+    sha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
+  }).strict()).default([]),
   retryAvailable: exports_external.boolean(),
   continueAvailable: exports_external.boolean(),
   errorMessage: exports_external.string().optional(),
@@ -35812,6 +35824,10 @@ var ReceiptSchema = exports_external.object({
   modelVerified: exports_external.boolean().optional(),
   modelEvidenceKind: exports_external.enum(["composer_selector", "provider_response", "provider_sdk"]).optional(),
   modelVerifiedAt: exports_external.string().optional(),
+  requestedTitle: exports_external.string().min(1).max(128).optional(),
+  observedTitle: exports_external.string().min(1).max(128).optional(),
+  titleVerified: exports_external.boolean().optional(),
+  titleVerifiedAt: exports_external.string().optional(),
   transportVersion: exports_external.string().optional(),
   providerEndpoint: exports_external.string().optional(),
   browserDriverId: exports_external.string().optional(),
@@ -35857,6 +35873,16 @@ var RunSchema = exports_external.object({
   conversationId: exports_external.string().regex(CONVERSATION_ID_PATTERN),
   kind: exports_external.enum(["consult", "chat", "image", "subagent"]),
   connectorIntent: exports_external.object({ names: exports_external.array(exports_external.string()), mode: exports_external.enum(["prefer", "require"]) }).optional(),
+  connectorPreflight: exports_external.object({
+    status: exports_external.enum(["required", "submitting", "submitted", "passed", "failed"]),
+    baselineMessageCount: exports_external.number().int().nonnegative().optional(),
+    providerUserMessageId: exports_external.string().min(1).max(512).optional(),
+    responseSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
+    evidenceKind: exports_external.enum(["assistant_reported_preflight", "browser_tool_card"]).optional(),
+    toolCards: exports_external.array(exports_external.object({ label: exports_external.string().min(1).max(256), sha256: exports_external.string().regex(/^[a-f0-9]{64}$/) })).max(32).optional(),
+    verifiedAt: exports_external.string().optional(),
+    error: exports_external.string().optional()
+  }).optional(),
   status: RunStatusSchema,
   executionReady: exports_external.boolean(),
   providerTurnPending: exports_external.boolean().optional(),
@@ -35871,6 +35897,7 @@ var RunSchema = exports_external.object({
   submissionState: exports_external.enum(["not_submitted", "submitting", "submitted", "not_applicable"]).optional(),
   requestedChatGptModel: exports_external.string().min(1).max(128).optional(),
   requestedChatGptEffort: exports_external.string().min(1).max(64).optional(),
+  requestedProviderTitle: exports_external.string().min(1).max(128).optional(),
   pinChatRequested: exports_external.boolean().optional(),
   timeoutMs: exports_external.number().int().positive().optional(),
   deadlineAt: exports_external.string().optional(),
@@ -37532,6 +37559,7 @@ class GptControlService {
       provider: conversation.provider,
       requestedModel: chatgptModel === "pro" ? "Pro" : chatgptModel,
       ...chatgptEffort ? { requestedEffort: chatgptEffort } : {},
+      ...request.title ? { requestedTitle: request.title, titleVerified: false } : {},
       browserDriverId: conversation.browserDriverId,
       promptSha256,
       attachments: manifest.files,
@@ -37548,6 +37576,7 @@ class GptControlService {
       conversationId: conversation.id,
       kind: request.kind,
       connectorIntent: request.connectorIntent,
+      connectorPreflight: request.connectorIntent?.mode === "require" ? { status: "required" } : undefined,
       status: "queued",
       executionReady,
       providerTurnPending: false,
@@ -37559,6 +37588,7 @@ class GptControlService {
       submissionState: "not_submitted",
       requestedChatGptModel: chatgptModel,
       requestedChatGptEffort: chatgptEffort,
+      requestedProviderTitle: request.title,
       pinChatRequested: request.pinChat,
       timeoutMs: request.timeoutMs,
       deadlineAt: new Date(Date.now() + request.timeoutMs).toISOString(),
@@ -37808,6 +37838,22 @@ class GptControlService {
     let modelVerified = run.receipt.modelVerified === true;
     let modelVerifiedAt = run.receipt.modelVerifiedAt;
     let modelEvidenceKind = run.receipt.modelEvidenceKind === "composer_selector" ? "composer_selector" : undefined;
+    if (run.connectorIntent?.mode === "require" && run.connectorPreflight?.status !== "passed") {
+      const preflight = await this.runRequiredConnectorPreflight(driver, expected, conversation, run, request, signal, recovery);
+      if ("terminal" in preflight)
+        return preflight.terminal;
+      run = preflight.run;
+      conversation = preflight.conversation;
+      observedModel = run.receipt.observedModel;
+      observedEffort = run.receipt.observedEffort;
+      modelVerified = run.receipt.modelVerified === true;
+      modelVerifiedAt = run.receipt.modelVerifiedAt;
+      modelEvidenceKind = run.receipt.modelEvidenceKind === "composer_selector" ? "composer_selector" : undefined;
+    }
+    if (run.connectorPreflight?.status === "passed" && (run.providerTurnPending || run.providerUserMessageId)) {
+      run = await this.store.updateRun(run.id, { providerUserMessageId: undefined });
+      run = await this.store.clearProviderTurnState(run.id);
+    }
     if (run.submissionState === "not_submitted" || run.submissionState === undefined) {
       if (!request)
         throw new Error("Durable browser request payload is unavailable before submission.");
@@ -37978,6 +38024,36 @@ class GptControlService {
     } else {
       throw new Error(`Invalid browser submission state ${run.submissionState}.`);
     }
+    if (run.requestedProviderTitle && run.receipt.titleVerified !== true) {
+      try {
+        const currentSession = await driver.show(expected.sessionId, signal);
+        const renamed = await driver.manageConversation(currentSession, { action: "rename", title: run.requestedProviderTitle }, signal);
+        if (renamed.title !== run.requestedProviderTitle) {
+          throw new Error(`live title read-back returned ${JSON.stringify(renamed.title)}`);
+        }
+        conversation = await this.store.updateConversation(conversation.id, {
+          providerTitle: renamed.title
+        });
+        run = await this.store.updateRun(run.id, {
+          receipt: {
+            ...run.receipt,
+            observedTitle: renamed.title,
+            titleVerified: true,
+            titleVerifiedAt: renamed.verifiedAt
+          }
+        });
+      } catch (error51) {
+        const warning = `Automatic GPT Worker title verification failed after submission: ${errorMessage2(error51)}`;
+        if (!(run.diagnostics?.organizationWarnings ?? []).includes(warning)) {
+          run = await this.store.updateRun(run.id, {
+            diagnostics: {
+              ...run.diagnostics ?? {},
+              organizationWarnings: [...run.diagnostics?.organizationWarnings ?? [], warning]
+            }
+          });
+        }
+      }
+    }
     const remaining = Math.max(1, Math.min(run.timeoutMs ?? 600000, Date.parse(run.deadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600000)));
     const outcome = await waitForCompletedDriverTurn(driver, expected, {
       baselineCount: required2(baselineCount, "assistant-turn baseline"),
@@ -38044,6 +38120,158 @@ class GptControlService {
       lastObservedUrl: outcome.lastObservedUrl,
       lastObservedUiState: outcome.lastObservedUiState
     };
+  }
+  async runRequiredConnectorPreflight(driver, expected, conversation, originalRun, request, signal, recovery) {
+    let run = originalRun;
+    const intent = run.connectorIntent;
+    if (!intent || intent.mode !== "require")
+      return { run, conversation };
+    if (!request) {
+      return { terminal: browserNeedsUser("Required connector preflight cannot start because the durable assignment payload is unavailable.", conversation, run) };
+    }
+    let state = run.connectorPreflight ?? { status: "required" };
+    if (state.status === "failed") {
+      return { terminal: browserNeedsUser(state.error ?? "Required connector preflight failed.", conversation, run) };
+    }
+    if (state.status === "submitting" && recovery) {
+      return { terminal: browserNeedsUser("Required connector preflight stopped at an ambiguous send boundary. It was not replayed, and the main assignment was not sent.", conversation, run) };
+    }
+    if (state.status === "required") {
+      let ready = await waitForDriverReady(driver, expected, {
+        timeoutMs: Math.min(60000, request.timeoutMs),
+        signal
+      });
+      if (conversation.providerConversationUrl) {
+        const exact = providerConversationIdentity(conversation.providerConversationUrl);
+        if (!exact)
+          throw new Error("Stored provider conversation URL is invalid during connector preflight.");
+        const current = providerConversationIdentity(ready.session.url);
+        if (!current || current.url !== exact.url) {
+          await driver.navigate(ready.session, exact.url, signal);
+          ready = await waitForDriverReady(driver, expected, {
+            timeoutMs: Math.min(60000, request.timeoutMs),
+            signal
+          });
+        }
+      }
+      const baseline = ready.observation.snapshot.count;
+      const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
+      const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro" ? { ...requestedModel !== "pro" ? { model: requestedModel } : {}, ...request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {} } : requestedModel;
+      const selected = await driver.selectModel(ready.session, requestedSelection, signal);
+      run = await this.store.updateRun(run.id, {
+        receipt: {
+          ...run.receipt,
+          requestedModel: selected.requestedModel,
+          observedModel: selected.observedModel,
+          ...selected.requestedEffort ? { requestedEffort: selected.requestedEffort } : {},
+          ...selected.observedEffort ? { observedEffort: selected.observedEffort } : {},
+          model: selected.observedModel,
+          modelVerified: true,
+          modelEvidenceKind: selected.modelEvidenceKind,
+          modelVerifiedAt: selected.modelVerifiedAt
+        }
+      });
+      const prompt = connectorPreflightPrompt(intent.names);
+      await driver.fill(ready.session, prompt, signal);
+      await driver.verifyModel(ready.session, requestedSelection, signal);
+      run = await this.store.updateRun(run.id, {
+        providerTurnPending: true,
+        connectorPreflight: { status: "submitting", baselineMessageCount: baseline }
+      });
+      const beforeSend = await driver.observe(ready.session, signal);
+      await driver.send(ready.session, signal);
+      const deadline = Date.now() + Math.min(15000, request.timeoutMs);
+      let bound = false;
+      while (Date.now() < deadline) {
+        const session = await assertExactDriverSession(driver, expected, signal);
+        const observation = await driver.observe(session, signal);
+        if (observation.latestUserMessageId && observation.latestUserMessageId !== beforeSend.latestUserMessageId) {
+          const identity = providerConversationIdentity(session.url);
+          if (identity) {
+            conversation = await this.persistConversationIdentity(conversation.id, identity);
+            run = await this.store.updateRun(run.id, {
+              providerUserMessageId: observation.latestUserMessageId,
+              connectorPreflight: {
+                status: "submitted",
+                baselineMessageCount: baseline,
+                providerUserMessageId: observation.latestUserMessageId
+              },
+              receipt: {
+                ...run.receipt,
+                providerConversationId: identity.id,
+                providerConversationUrl: identity.url
+              }
+            });
+            state = required2(run.connectorPreflight, "connector preflight state");
+            bound = true;
+            break;
+          }
+        }
+        await abortableSleep2(100, signal);
+      }
+      if (!bound) {
+        return { terminal: browserNeedsUser("Required connector preflight did not produce a durable provider conversation and user-message identity. It was not replayed, and the main assignment was not sent.", conversation, run) };
+      }
+    }
+    state = required2(run.connectorPreflight, "connector preflight state");
+    if (state.status !== "submitted" || !state.providerUserMessageId || state.baselineMessageCount === undefined) {
+      return { terminal: browserNeedsUser("Required connector preflight has incomplete durable state. The main assignment was not sent.", conversation, run) };
+    }
+    const remaining = Math.max(1, Date.parse(run.deadlineAt ?? "") - Date.now() || request.timeoutMs);
+    const outcome = await waitForCompletedDriverTurn(driver, expected, {
+      baselineCount: state.baselineMessageCount,
+      timeoutMs: remaining,
+      conversationUrl: conversation.providerConversationUrl,
+      providerTurnIdentityPersisted: true,
+      signal,
+      onConversationIdentity: async (identity) => {
+        await this.persistConversationIdentity(conversation.id, identity);
+      },
+      onConversationObservation: async (identity, observation) => {
+        const exact = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
+        if (!exact || exact.url !== identity.url)
+          return "mismatch";
+        if (!observation.latestUserMessageId)
+          return "unavailable";
+        return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+      }
+    });
+    if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
+      const reason = outcome.reason ?? "Required connector preflight did not complete.";
+      run = await this.store.updateRun(run.id, { connectorPreflight: { ...state, status: "failed", error: reason } });
+      return { terminal: browserNeedsUser(`${reason} The main assignment was not sent.`, conversation, run) };
+    }
+    const parsed = parseConnectorPreflight(outcome.snapshot.text, intent.names);
+    const observed = await driver.observe(await driver.show(expected.sessionId, signal), signal);
+    const matchingCards = observed.visibleToolCards.filter((card) => intent.names.some((name) => card.label.toLowerCase().includes(name.toLowerCase())));
+    const allCardNamesObserved = intent.names.every((name) => matchingCards.some((card) => card.label.toLowerCase().includes(name.toLowerCase())));
+    if (!parsed.ok) {
+      run = await this.store.clearProviderTurnState(run.id);
+      run = await this.store.updateRun(run.id, {
+        providerUserMessageId: undefined,
+        connectorPreflight: {
+          ...state,
+          status: "failed",
+          responseSha256: sha256(outcome.snapshot.text),
+          toolCards: matchingCards,
+          error: parsed.reason
+        }
+      });
+      return { terminal: browserNeedsUser(`${parsed.reason} The main assignment was not sent.`, conversation, run) };
+    }
+    run = await this.store.clearProviderTurnState(run.id);
+    run = await this.store.updateRun(run.id, {
+      providerUserMessageId: undefined,
+      connectorPreflight: {
+        ...state,
+        status: "passed",
+        responseSha256: sha256(outcome.snapshot.text),
+        evidenceKind: allCardNamesObserved ? "browser_tool_card" : "assistant_reported_preflight",
+        toolCards: matchingCards,
+        verifiedAt: nowIso()
+      }
+    });
+    return { run, conversation };
   }
   async ensureOwnedDriver(conversation, run, signal) {
     if (conversation.closedAt)
@@ -38208,7 +38436,7 @@ class GptControlService {
       providerStopRequested: providerMayBeActive ? true : current.providerStopRequested,
       cancellationRequestedAt: at,
       completedAt: at,
-      error: "Cancelled by caller. Late provider completion is ignored."
+      error: "Cancelled by explicit request. Late ChatGPT completion is ignored. Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification."
     });
   }
   observationProvesRun(run, observation) {
@@ -38389,6 +38617,14 @@ function normalizeStartRequest(request, policy) {
   if (request.kind === "subagent" && request.conversationId) {
     throw new Error("Each GPT Worker requires an independent owned conversation; conversation_id is not accepted.");
   }
+  if (request.kind !== "subagent" && (request.title !== undefined || request.projectId !== undefined)) {
+    throw new Error("title and project_id are supported only for independent GPT Workers.");
+  }
+  if (request.projectId !== undefined && request.title === undefined) {
+    throw new Error("project_id requires a GPT Worker title.");
+  }
+  const projectId = request.projectId === undefined ? undefined : normalizeProjectId(request.projectId);
+  const title = request.kind === "subagent" && request.title !== undefined ? normalizeWorkerTitle(request.title, projectId) : undefined;
   if (request.kind !== "subagent" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
     throw new Error("Connector intent is supported only for independent GPT Workers.");
   }
@@ -38397,6 +38633,12 @@ function normalizeStartRequest(request, policy) {
     throw new Error("Connector names must be 1-64 safe characters, with at most eight distinct names.");
   }
   const connectorIntent = connectorNames.length > 0 ? { names: connectorNames, mode: request.connectorMode ?? "prefer" } : undefined;
+  if (connectorIntent?.mode === "require") {
+    const missingMentions = connectorIntent.names.filter((name) => !request.prompt.includes(`@${name}`));
+    if (missingMentions.length > 0) {
+      throw new Error(`Required connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
+    }
+  }
   return {
     kind: request.kind,
     prompt: request.prompt,
@@ -38405,6 +38647,8 @@ function normalizeStartRequest(request, policy) {
     transport: "browser",
     chatgptModel,
     chatgptEffort,
+    title,
+    projectId,
     pinChat: request.kind === "subagent" || request.pinChat === true,
     idempotencyKey: request.idempotencyKey,
     connectorIntent,
@@ -38423,6 +38667,8 @@ function startRequestHash(request) {
     transport: request.transport,
     chatgptModel: request.chatgptModel,
     chatgptEffort: request.chatgptEffort,
+    title: request.title ?? null,
+    projectId: request.projectId ?? null,
     pinChat: request.pinChat,
     connectorIntent: request.connectorIntent ?? null,
     timeoutMs: request.timeoutMs
@@ -38432,6 +38678,72 @@ function startRequestHash(request) {
   if (request.allowSensitiveFiles)
     value.allowSensitiveFiles = true;
   return sha256(JSON.stringify(value));
+}
+function normalizeWorkerTitle(value, projectId) {
+  const trimmed = value.trim();
+  if (trimmed === "" || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+    throw new Error("GPT Worker title must contain visible text without control characters.");
+  }
+  const suffix = projectId ? trimmed.replace(new RegExp(`^${projectId}:\\s*`, "i"), "").trim() : trimmed;
+  if (suffix === "")
+    throw new Error("GPT Worker title must contain text after the project identifier.");
+  const title = projectId ? `${projectId}: ${suffix}` : suffix;
+  if (title.length > 128)
+    throw new Error("GPT Worker title must be at most 128 characters after the project identifier is applied.");
+  return title;
+}
+function normalizeProjectId(value) {
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z0-9][A-Z0-9_-]{0,15}$/.test(normalized)) {
+    throw new Error("project_id must be 1-16 letters, digits, underscores, or hyphens.");
+  }
+  return normalized;
+}
+function connectorPreflightPrompt(names) {
+  const checks4 = names.map((name) => {
+    const detail = name.toLowerCase() === "zenbox" ? "make one harmless read-only health call, such as computer_overview, and include one returned fact" : name.toLowerCase() === "github" ? "make one harmless read-only call and include one returned account or repository fact" : "make one harmless read-only health call and include one returned fact";
+    return `- @${name}: ${detail}`;
+  }).join(`
+`);
+  return `Before we start the assignment, please quickly check these connected tools in this same chat:
+${checks4}
+
+Do not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise fact returned by the tool"}]}. Include exactly one entry for every listed tool. If a tool is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+}
+function parseConnectorPreflight(text, names) {
+  let source = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(source);
+  if (fenced)
+    source = fenced[1].trim();
+  let value;
+  try {
+    value = JSON.parse(source);
+  } catch {
+    return { ok: false, reason: "Required connector preflight did not return the requested JSON payload." };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, reason: "Required connector preflight returned an invalid payload object." };
+  }
+  const connectors = value.connectors;
+  if (!Array.isArray(connectors) || connectors.length !== names.length) {
+    return { ok: false, reason: "Required connector preflight did not return exactly one result for every connector." };
+  }
+  const seen = new Set;
+  for (const entry of connectors) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return { ok: false, reason: "Required connector preflight contained a malformed connector result." };
+    }
+    const record3 = entry;
+    if (typeof record3.name !== "string" || !names.includes(record3.name) || seen.has(record3.name)) {
+      return { ok: false, reason: "Required connector preflight returned a missing, duplicate, or unexpected connector name." };
+    }
+    seen.add(record3.name);
+    const usablePayload = typeof record3.payload === "string" ? record3.payload.trim().length > 0 : Boolean(record3.payload && typeof record3.payload === "object" && !Array.isArray(record3.payload) && Object.keys(record3.payload).length > 0);
+    if (record3.status !== "ready" || !usablePayload) {
+      return { ok: false, reason: `Required connector @${record3.name} did not report a usable ready payload.` };
+    }
+  }
+  return { ok: true };
 }
 function normalizePickerRequest(value, maxLength, field) {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -39081,8 +39393,17 @@ function normalizePollInterval(value) {
   return Math.max(250, Math.min(Math.floor(value), 1e4));
 }
 function cancellationResult(taskId, runId, reason) {
+  const details = {
+    taskId,
+    runId,
+    status: "cancelled",
+    reason: reason ?? "Client cancelled task execution.",
+    cancellationScope: "owned_chatgpt_turn_only",
+    warning: "Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification."
+  };
   return {
-    content: [{ type: "text", text: JSON.stringify({ taskId, runId, status: "cancelled", reason: reason ?? "Client cancelled task execution." }) }],
+    content: [{ type: "text", text: JSON.stringify(details) }],
+    structuredContent: details,
     isError: true
   };
 }
@@ -39151,6 +39472,8 @@ var SUBAGENT_TASK_POLL_INTERVAL_MS = 100;
 var SUBAGENT_ACTIVATION_GRACE_MS = 250;
 var SubagentSchema = {
   prompt: exports_external.string().min(1),
+  title: exports_external.string().min(1).max(128).optional(),
+  project_id: exports_external.string().min(1).max(16).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/).optional(),
   files: exports_external.array(exports_external.string()).max(32).optional(),
   idempotency_key: IdempotencyKeySchema,
   chatgpt_model: ChatGptModelSchema.optional(),
@@ -39460,15 +39783,6 @@ function registerWorkerRun(server, service, taskStore, monitors, activationTimer
       taskStore.setStatusListener(task.taskId, async (updated) => {
         await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
       });
-      const cancelOriginatingTask = () => taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
-      extra.signal.addEventListener("abort", () => {
-        cancelOriginatingTask();
-      }, { once: true });
-      if (extra.signal.aborted) {
-        await cancelOriginatingTask();
-        taskStore.removeStatusListener(task.taskId);
-        return { task };
-      }
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned GPT Worker.");
       try {
         const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
@@ -39553,7 +39867,12 @@ function registerWorkerRecoveryTools(server, service, taskStore, monitors, codex
       const runId = identity.runId ?? await taskStore.getRunId(taskId, extra.sessionId);
       await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_worker_cancel.", extra.sessionId);
       const run = runId ? await service.cancelRun(runId) : undefined;
-      return toolPayload(`GPT Worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
+      return toolPayload(`GPT Worker ${taskId} is cancelled. ChatGPT Stop cannot cancel connected-tool operations that already started; verify their external state independently.`, {
+        taskId,
+        run: run ? publicRun(run) : undefined,
+        cancellationScope: "owned_chatgpt_turn_only",
+        warning: "Connected-tool operations already started by ChatGPT can continue after Stop and require independent verification."
+      });
     }
     if (!identity.runId)
       throw new Error("No run id was available to cancel.");
@@ -39765,6 +40084,8 @@ function subagentRequest(params, wait) {
   return {
     kind: "subagent",
     prompt: params.prompt,
+    title: params.title,
+    projectId: params.project_id,
     files: params.files,
     transport: "browser",
     chatgptModel: params.chatgpt_model ?? "pro",
@@ -39817,11 +40138,7 @@ function publicRun(run) {
     providerStopRequested: run.providerStopRequested,
     providerTurnAbandonedAt: run.providerTurnAbandonedAt,
     connectorIntent: run.connectorIntent,
-    connectorVerification: run.connectorIntent ? {
-      status: "unverified",
-      evidenceKind: "provider_prompt_intent_only",
-      note: "GPT-Control cannot observe ChatGPT connector tool calls. Verify required connector results independently before accepting the worker output."
-    } : undefined,
+    connectorVerification: connectorVerification(run),
     providerRunId: run.providerRunId,
     resultText: run.resultText,
     report: run.result,
@@ -39841,6 +40158,34 @@ function publicRun(run) {
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     completedAt: run.completedAt
+  };
+}
+function connectorVerification(run) {
+  if (!run.connectorIntent)
+    return;
+  const preflight = run.connectorPreflight;
+  if (run.connectorIntent.mode !== "require") {
+    return {
+      status: "unverified",
+      evidenceKind: "provider_prompt_intent_only",
+      note: "Preferred connector intent was not preflighted. Verify connected-tool results independently."
+    };
+  }
+  if (preflight?.status === "passed") {
+    return {
+      status: "preflight_passed",
+      evidenceKind: preflight.evidenceKind,
+      responseSha256: preflight.responseSha256,
+      toolCards: preflight.toolCards,
+      verifiedAt: preflight.verifiedAt,
+      note: preflight.evidenceKind === "browser_tool_card" ? "The same conversation returned usable preflight payloads and browser-visible connector-named tool cards. Tool output remains untrusted evidence." : "The same conversation returned usable preflight payloads, but GPT-Control did not prove connector tool calls from browser cards. Verify important external facts independently."
+    };
+  }
+  return {
+    status: preflight?.status ?? "required",
+    evidenceKind: "none",
+    error: preflight?.error,
+    note: "The main assignment is blocked until the same-conversation connector preflight passes."
   };
 }
 function publicAttachment(file2) {

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.1] - 2026-08-22
+
+### Added
+
+- Verified native GPT Worker titles with an optional generic project identifier prefix, such as `SEQ: Teach Reliability`.
+- Fail-closed, same-conversation read-only preflight for required `@Connector` assignments, with separate assistant-payload and browser-tool-card evidence levels.
+
+### Fixed
+
+- Live rename no longer sends the unsupported `expectedTarget` field with Chrome Bridge keyboard actions; the exact owned document is proved immediately before and after Enter.
+- Interrupting the originating MCP request now detaches the caller instead of cancelling a durable Worker. Only explicit task or Worker cancellation requests Stop.
+- Cancellation receipts now warn that connected-tool operations already started by ChatGPT can continue after Stop.
+
+### Ownership
+
+- Package and Codex plugin metadata now point to the independent `mdahmann/gpt-control` fork. The original repository remains a read-only upstream source only.
+
 ## [0.4.0] - 2026-08-22
 
 ### Added

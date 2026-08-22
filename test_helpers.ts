@@ -39,6 +39,7 @@ export interface FakeBridgeOptions {
 	injectEnvelopeInstruction?: boolean;
 	sendDelayMs?: number;
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
+	responseForPrompt?: (prompt: string) => string | undefined;
 }
 
 interface FakeTurn {
@@ -202,6 +203,9 @@ export class FakeChromeBridge {
 		if (!requestPath) throw new Error("private request path missing");
 		const request = JSON.parse(readFileSync(requestPath, "utf8")) as { action: string; payload: Record<string, unknown> };
 		const expected = request.payload.expectedTarget;
+		if (request.action === "press" && expected !== undefined) {
+			return failed("Chrome Bridge keyboard actions do not support expectedTarget");
+		}
 		if (expected && typeof expected === "object" && !Array.isArray(expected)) {
 			const target = expected as { sessionId?: string; tabId?: number; name?: string; url?: string };
 			const expectedTab = this.tabs.get(Number(target.tabId));
@@ -558,12 +562,12 @@ export class FakeChromeBridge {
 				turn,
 				this.options.mutateRenderedPrompt === true,
 				this.options.injectEnvelopeInstruction === true,
-			)}${this.turnHtml(turn, index === tab.turns.length - 1)}`).join("");
+			)}${index === tab.turns.length - 1 ? this.turnHtml(turn, true) : this.finalAssistant(turn)}`).join("");
 		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}</main>`;
 	}
 
 	private turnHtml(turn: FakeTurn, current: boolean): string {
-		if (!current) return finalAssistant(turn);
+		if (!current) return this.finalAssistant(turn);
 		if ((turn.idleReadsRemaining ?? 0) > 0) {
 			turn.idleReadsRemaining = (turn.idleReadsRemaining ?? 0) - 1;
 			return "";
@@ -594,7 +598,16 @@ export class FakeChromeBridge {
 		if (phase === 0 && turn.scenario === "success") {
 			return '<div role="status">Pro thinking</div><button data-testid="stop-button" aria-label="Stop answering">Stop</button>';
 		}
-		return finalAssistant(turn);
+		return this.finalAssistant(turn);
+	}
+
+	private finalAssistant(turn: FakeTurn): string {
+		const explicit = this.options.responseForPrompt?.(turn.prompt);
+		const names = [...turn.prompt.matchAll(/^- @([^:]+):/gm)].map((match) => match[1]);
+		const text = explicit ?? (names.length > 0
+			? JSON.stringify({ connectors: names.map((name) => ({ name, status: "ready", payload: `healthy ${name}` })) })
+			: `final:${turn.prompt}`);
+		return `<div data-message-author-role="assistant" data-message-id="assistant-${escapeHtml(turn.messageIdentity)}"><div class="markdown"><p>${escapeHtml(text)}</p></div></div>`;
 	}
 
 	private scenario(prompt: string): FakeScenario {
@@ -649,10 +662,6 @@ export function failed(message: string): ExecResult {
 
 function json(value: unknown, code = 0, stderr = ""): ExecResult {
 	return { stdout: JSON.stringify(value), stderr, code, killed: false };
-}
-
-function finalAssistant(turn: FakeTurn): string {
-	return `<div data-message-author-role="assistant" data-message-id="assistant-${escapeHtml(turn.messageIdentity)}"><div class="markdown"><p>final:${escapeHtml(turn.prompt)}</p></div></div>`;
 }
 
 function userTurnHtml(turn: FakeTurn, mutateRenderedPrompt: boolean, injectEnvelopeInstruction: boolean): string {
