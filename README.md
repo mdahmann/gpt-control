@@ -171,7 +171,7 @@ unverified build step.
 | `GPT_CONTROL_BROWSER_DRIVER` | External protocol-v2 command |
 | `GPT_CONTROL_BRIDGE` | Explicit Chrome Bridge launcher |
 | `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
-| `GPT_CONTROL_MAX_PRO_WORKERS` | Integer 1–3; default 3 |
+| `GPT_CONTROL_MAX_PRO_WORKERS` | Integer 1–10; default 3; 5–6 recommended after local validation; 10 experimental |
 | `GPT_CONTROL_MAX_ATTACHMENT_FILES` | Trusted file-count cap |
 | `GPT_CONTROL_MAX_ATTACHMENT_BYTES` | Trusted aggregate-byte cap |
 | `GPT_CONTROL_MAX_PROMPT_BYTES` | Trusted prompt-byte cap |

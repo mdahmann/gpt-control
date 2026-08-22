@@ -7,7 +7,7 @@ reuse a production task session or real source attachment.
 
 1. Install dependencies and run the automated suite.
 2. Configure a protocol-v2 browser driver or the Chrome Bridge private-RPC
-   adapter.
+   adapter with extension-side `expectedTarget` enforcement.
 3. Point `GPT_CONTROL_HOME`, snapshot root, and output root at a temporary
    directory.
 4. Enable active diagnostics only for this validation process.
@@ -15,8 +15,9 @@ reuse a production task session or real source attachment.
 ## Validation sequence
 
 1. Run passive diagnosis and confirm it executes no adapter.
-2. Run active diagnosis and confirm the selected driver reports protocol 2 and
-   secure input.
+2. Run active diagnosis and confirm the selected driver reports protocol 2,
+   secure input, and a ready state. A Bridge without `expectedTarget`
+   enforcement must report unavailable.
 3. Create a disposable chat run without sending sensitive text.
 4. Confirm the created session name starts with `gpt-control:` and the recorded
    page ID is unchanged after initial navigation settles.

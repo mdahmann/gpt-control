@@ -141,13 +141,51 @@ describe("truthful composer model provenance", () => {
 		const result = await service.start({ kind: "subagent", prompt: "switch Pro", timeoutMs: 1000 });
 		expect(result.run.status).toBe("completed");
 		expect(result.run.receipt.observedModel).toBe("Pro");
-		expect(bridge.calls.some((call) => call.args.includes("text=Pro"))).toBe(true);
+		expect(bridge.privateRequests.some((request) => request.action === "click" && request.payload.selector === "text=Pro")).toBe(true);
 	});
 
 	test("does not infer composer selection from the Miles Pro account-plan label", () => {
 		const observation = extractComposerModel('<main><div data-testid="account-plan">Miles Pro</div><form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">Auto</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation?.label).toBe("Auto");
 		expect(observation?.normalized).toBe("auto");
+	});
+
+	test("does not accept an Upgrade to Pro action as selected-model evidence", () => {
+		const observation = extractComposerModel('<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Upgrade to Pro">Upgrade to Pro</button><div id="prompt-textarea" contenteditable="true"></div></form>');
+		expect(observation?.label).toBe("Upgrade to Pro");
+		expect(observation?.normalized).toBe("upgrade to pro");
+	});
+
+	test("accepts a versioned Pro model label without accepting action text", () => {
+		const observation = extractComposerModel('<form data-testid="composer"><button data-testid="model-switcher-dropdown-button">GPT-5.6 Sol Pro</button><div id="prompt-textarea" contenteditable="true"></div></form>');
+		expect(observation?.normalized).toBe("pro");
+	});
+
+	test("refuses a stale session URL before a browser mutation", async () => {
+		const bridge = new FakeChromeBridge();
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const created = await driver.create("gpt-control:stale", CHATGPT_ORIGIN);
+		bridge.setUrl("https://chatgpt.com/c/foreign");
+		await expect(driver.fill(created, "must not disclose")).rejects.toThrow("drifted");
+		expect(bridge.privateRequests).toEqual([]);
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("uses a refreshed exact conversation URL for a safe follow-up turn", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const first = await service.start({ kind: "chat", prompt: "first exact turn", timeoutMs: 1000 });
+		expect(first.run.status).toBe("completed");
+		const second = await service.start({
+			kind: "chat",
+			prompt: "second exact turn",
+			conversationId: first.conversation.id,
+			timeoutMs: 1000,
+		});
+		expect(second.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["first exact turn", "second exact turn"]);
+		expect(second.run.receipt.providerConversationUrl).toBe(first.run.receipt.providerConversationUrl);
 	});
 
 	test("fails closed when the selector is absent", async () => {

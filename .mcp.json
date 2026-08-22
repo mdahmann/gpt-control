@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "gpt-control": {
+    "gpt_control": {
       "cwd": ".",
       "command": "node",
       "args": ["./dist/gpt-control-mcp.js"],

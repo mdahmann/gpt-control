@@ -27,14 +27,23 @@ uses the durable task/run IDs, not conversational polling.
 
 ## Concurrency
 
-- The trusted maximum is three workers.
+- The safe default is three workers. The operator can set
+  `GPT_CONTROL_MAX_PRO_WORKERS` from 1 through 10. Five or six is the initial
+  recommendation after local validation; ten is experimental.
 - Each worker receives a new owned browser session and ChatGPT conversation.
 - A durable global ordering prevents separate broker processes from exceeding
-  the same three-worker ceiling.
+  the configured ceiling.
 - A submitted turn keeps its slot until completion or a proved inactive Stop;
   timeout alone does not release live provider capacity.
-- A fourth worker remains queued fairly until a slot opens or its bounded
-  deadline expires.
+- Work above the configured ceiling remains queued fairly until a slot opens or
+  its bounded deadline expires.
+- The limit controls browser workers, not repository write authority. Use one
+  writer lease per repository or worktree. Research, review, and separate
+  repositories can run concurrently.
+- OpenAI does not document a fixed limit for simultaneous ordinary ChatGPT
+  conversations. Increase capacity with a staircase test at 3, 5, 7, and 10,
+  and reduce it when ChatGPT throttles, Chrome becomes unstable, or connectors
+  fail. This release does not yet adjust the configured limit automatically.
 
 ## One-result discipline
 

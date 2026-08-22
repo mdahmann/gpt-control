@@ -35,6 +35,15 @@ const Type: TypeBuilder = {
 };
 
 describe("public extension contract", () => {
+	test("keeps three workers as default and permits an operator ceiling through ten", () => {
+		const root = scratch();
+		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
+		expect(operatorPolicyFromEnv({}, common).maxConcurrentWorkers).toBe(3);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "6" }, common).maxConcurrentWorkers).toBe(6);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "10" }, common).maxConcurrentWorkers).toBe(10);
+		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");
+	});
+
 	test("operator abandonment token rotation does not change execution policy identity", () => {
 		const root = scratch();
 		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
@@ -96,11 +105,11 @@ describe("public extension contract", () => {
 describe("MCP plugin contract", () => {
 	test("advertises optional task execution and omits authority-expanding schemas", async () => {
 		const pluginMcp = JSON.parse(readFileSync(join(import.meta.dir, ".mcp.json"), "utf8")) as {
-			mcpServers: { "gpt-control": { command: string; args: string[]; env_vars: string[] } };
+			mcpServers: { gpt_control: { command: string; args: string[]; env_vars: string[] } };
 		};
-		expect(pluginMcp.mcpServers["gpt-control"].command).toBe("node");
-		expect(pluginMcp.mcpServers["gpt-control"].args).toEqual(["./dist/gpt-control-mcp.js"]);
-		expect(pluginMcp.mcpServers["gpt-control"].env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
+		expect(pluginMcp.mcpServers.gpt_control.command).toBe("node");
+		expect(pluginMcp.mcpServers.gpt_control.args).toEqual(["./dist/gpt-control-mcp.js"]);
+		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
 		const root = scratch();
 		const { service } = makeChromeService(join(root, "state"), join(root, "workspace"), new FakeChromeBridge());
 		mkdirSync(join(root, "workspace"), { recursive: true });

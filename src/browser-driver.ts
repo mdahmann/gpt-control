@@ -21,6 +21,8 @@ import {
 	tabUrl,
 	verifyChatGptModelBeforeSend,
 	openChat,
+	probeExpectedTargetEnforcement,
+	type ExactBrowserActionTarget,
 	type AssistantSnapshot,
 	type ChatPageObservation,
 	type ModelVerification,
@@ -509,16 +511,36 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	readonly id = "chrome-bridge/private-rpc-v2";
 	constructor(private readonly exec: Exec, private readonly launcher: Launcher) {}
 
+	private async assertActionTarget(session: DriverSession, signal?: AbortSignal): Promise<DriverSession> {
+		const current = await this.show(session.sessionId, signal);
+		if (String(current.pageId) !== String(session.pageId)) {
+			throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; action refused.`);
+		}
+		if (current.name !== session.name) {
+			throw new Error(`Refused action on renamed or foreign browser session ${session.sessionId}.`);
+		}
+		assertChatGptUrl(current.url, true);
+		if (canonicalActionUrl(current.url) !== canonicalActionUrl(session.url)) {
+			throw new Error(`Owned browser page drifted from ${session.url} to ${current.url}; action refused.`);
+		}
+		return current;
+	}
+
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
 		const result = await probeBridge(this.exec, this.launcher, signal);
 		const secureInput = Boolean(this.launcher.privateRpc);
+		const exactTargetEnforced = secureInput && result.ready
+			? await probeExpectedTargetEnforcement(this.exec, this.launcher, signal)
+			: false;
 		return {
-			ready: result.ready && secureInput,
+			ready: result.ready && secureInput && exactTargetEnforced,
 			driver: this.id,
 			secureInput,
 			protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION,
 			reason: !secureInput
 				? "Chrome Bridge is reachable, but its private request-file RPC adapter is unavailable; prompt submission is disabled."
+				: !exactTargetEnforced
+					? "Chrome Bridge is reachable, but exact expectedTarget enforcement is unavailable; browser mutation is disabled."
 				: result.reason,
 		};
 	}
@@ -552,23 +574,28 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void> {
-		await attachFiles(this.exec, this.launcher, numericPageId(session.pageId), files, signal);
+		await this.assertActionTarget(session, signal);
+		await attachFiles(this.exec, this.launcher, numericPageId(session.pageId), files, signal, exactActionTarget(session));
 	}
 
 	async fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
-		await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal);
+		await this.assertActionTarget(session, signal);
+		await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal, 60_000, exactActionTarget(session));
 	}
 
 	async selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
-		return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+		await this.assertActionTarget(session, signal);
+		return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal, 30_000, exactActionTarget(session));
 	}
 
 	async verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+		await this.assertActionTarget(session, signal);
 		return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
 	}
 
 	async send(session: DriverSession, signal?: AbortSignal): Promise<void> {
-		await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal);
+		await this.assertActionTarget(session, signal);
+		await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
 	}
 
 	async observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation> {
@@ -576,9 +603,11 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void> {
+		await this.assertActionTarget(session, signal);
 		const pageId = numericPageId(session.pageId);
-		if (action === "reload") return reloadPage(this.exec, this.launcher, pageId, signal);
-		return clickRecoveryControl(this.exec, this.launcher, pageId, action, signal);
+		const target = exactActionTarget(session);
+		if (action === "reload") return reloadPage(this.exec, this.launcher, pageId, signal, target);
+		return clickRecoveryControl(this.exec, this.launcher, pageId, action, signal, target);
 	}
 
 	async setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void> {
@@ -590,8 +619,22 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async screenshot(session: DriverSession, outputPath: string, signal?: AbortSignal): Promise<string | undefined> {
-		return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal);
+		await this.assertActionTarget(session, signal);
+		return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal, exactActionTarget(session));
 	}
+}
+
+function canonicalActionUrl(raw: string): string {
+	return new URL(raw).toString();
+}
+
+function exactActionTarget(session: DriverSession): ExactBrowserActionTarget {
+	return {
+		sessionId: session.sessionId,
+		tabId: numericPageId(session.pageId),
+		name: session.name,
+		url: canonicalActionUrl(session.url),
+	};
 }
 
 const DriverIdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);

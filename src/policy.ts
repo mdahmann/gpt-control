@@ -68,7 +68,7 @@ export function operatorPolicyFromEnv(
 		maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
 		maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
 		maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-		maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 3, "maxConcurrentWorkers"),
+		maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 10, "maxConcurrentWorkers"),
 		allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
 		providerTurnAbandonmentTokenHash: abandonmentToken
 			? createHash("sha256").update(abandonmentToken).digest("hex")

@@ -52,6 +52,13 @@ export interface ModelVerification {
 	modelVerifiedAt: string;
 }
 
+export interface ExactBrowserActionTarget {
+	sessionId: string;
+	tabId: number;
+	name: string;
+	url: string;
+}
+
 export interface ChatPageObservation {
 	snapshot: AssistantSnapshot;
 	latestUserMessageId?: string;
@@ -149,6 +156,39 @@ export function translatePolicyDenial(error: unknown): unknown {
 	);
 }
 
+export async function probeExpectedTargetEnforcement(
+	exec: Exec,
+	launcher: Launcher,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const name = `gpt-control:probe:${randomUUID()}`;
+	let sessionId: string | undefined;
+	try {
+		sessionId = await createSession(exec, launcher, name, signal);
+		const tabId = await openChat(exec, launcher, sessionId, CHATGPT_ORIGIN, signal);
+		let url: string | undefined;
+		const deadline = Date.now() + 10_000;
+		do {
+			url = await tabUrl(exec, launcher, tabId, signal);
+			if (url && !TRANSIENT_TAB_URLS.has(url)) break;
+			await sleep(100);
+		} while (Date.now() < deadline);
+		if (!url || TRANSIENT_TAB_URLS.has(url)) return false;
+		const target: ExactBrowserActionTarget = { sessionId, tabId, name, url };
+		const proof = resultOf(await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget: target }, signal));
+		if (readString(proof, "expectedTargetEnforcement") !== "document-v1") return false;
+		await privateBridgeJson(exec, launcher, "ping", {
+			tabId,
+			expectedTarget: { ...target, url: `${CHATGPT_ORIGIN}/c/gpt-control-probe-mismatch` },
+		}, signal);
+		return false;
+	} catch (error) {
+		return /expectedTarget exact URL changed before the browser action/.test(error instanceof Error ? error.message : String(error));
+	} finally {
+		if (sessionId) await closeSession(exec, launcher, sessionId, signal).catch(() => undefined);
+	}
+}
+
 export function tabIdFromSession(session: Record<string, unknown>): number | undefined {
 	const tabs = session.tabIds ?? session.tabs;
 	if (!Array.isArray(tabs)) return undefined;
@@ -214,11 +254,12 @@ async function actOnSelector(
 	launcher: Launcher,
 	args: (selector: string) => string[],
 	selectors: readonly string[],
-	options: { signal?: AbortSignal; deadline: number; what: string },
+	options: { signal?: AbortSignal; deadline: number; what: string; beforeAction?: () => Promise<void> },
 ): Promise<string> {
 	let lastError = "the page never became ready";
 	for (let attempt = 0; ; attempt += 1) {
 		for (const selector of selectors) {
+			await options.beforeAction?.();
 			const result = await bridge(exec, launcher, args(selector), options.signal, 60_000);
 			try {
 				parseCommandJson(result, `chrome-bridge ${options.what}`);
@@ -242,12 +283,14 @@ export async function attachFiles(
 	tabId: number,
 	files: readonly string[],
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	if (files.length === 0) return;
 	await privateBridgeJson(exec, launcher, "uploadFile", {
 		tabId,
 		selector: FILE_INPUT_SELECTOR,
 		files: [...files],
+		expectedTarget,
 	}, signal, 180_000);
 }
 
@@ -258,13 +301,14 @@ export async function fillPrompt(
 	prompt: string,
 	signal?: AbortSignal,
 	readyTimeoutMs = 60_000,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	const deadline = Date.now() + readyTimeoutMs;
 	let lastError = "the composer never became ready";
 	for (let attempt = 0; ; attempt += 1) {
 		for (const selector of PROMPT_SELECTORS) {
 			try {
-				await privateBridgeJson(exec, launcher, "fill", { tabId, selector, text: prompt }, signal, 60_000);
+				await privateBridgeJson(exec, launcher, "fill", { tabId, selector, text: prompt, expectedTarget }, signal, 60_000);
 				lastError = "";
 				break;
 			} catch (error) {
@@ -284,12 +328,44 @@ export async function clickSend(
 	launcher: Launcher,
 	tabId: number,
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
-	await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], SEND_SELECTORS, {
-		signal,
-		deadline: Date.now() + 30_000,
-		what: "click the ChatGPT send button",
+	if (!expectedTarget) {
+		await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], SEND_SELECTORS, {
+			signal, deadline: Date.now() + 30_000, what: "click the ChatGPT send button",
+		});
+		return;
+	}
+	await actOnPrivateSelector(exec, launcher, tabId, SEND_SELECTORS, expectedTarget, {
+		signal, deadline: Date.now() + 30_000, what: "click the ChatGPT send button",
 	});
+}
+
+async function actOnPrivateSelector(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	selectors: readonly string[],
+	expectedTarget: ExactBrowserActionTarget,
+	options: { signal?: AbortSignal; deadline: number; what: string },
+): Promise<string> {
+	let lastError = "the page never became ready";
+	for (let attempt = 0; ; attempt += 1) {
+		for (const selector of selectors) {
+			try {
+				await privateBridgeJson(exec, launcher, "click", { tabId, selector, expectedTarget }, options.signal);
+				return selector;
+			} catch (error) {
+				const translated = translatePolicyDenial(error);
+				if (translated instanceof PolicyDeniedError) throw translated;
+				lastError = translated instanceof Error ? translated.message : String(translated);
+				if (/expectedTarget/.test(lastError) || !isTransient(lastError)) throw translated;
+			}
+		}
+		if (Date.now() >= options.deadline || options.signal?.aborted) break;
+		await sleep(Math.min(pollIntervalMs(), 250 * 2 ** attempt, 2000));
+	}
+	throw new Error(`Could not ${options.what}. Last error: ${lastError}`);
 }
 
 /** Compatibility helper. Security-sensitive callers should fill, verify model, then clickSend. */
@@ -457,11 +533,13 @@ export async function selectAndVerifyChatGptModel(
 	requested: ChatGptModel,
 	signal?: AbortSignal,
 	timeoutMs = 30_000,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
 	let observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 	if (!observed) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
 	if (observed.normalized !== requested) {
-		await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
+		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: observed.selector, expectedTarget }, signal);
+		else await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
 		const deadline = Date.now() + timeoutMs;
 		let optionLabel: string | undefined;
 		let optionCount = 0;
@@ -477,7 +555,8 @@ export async function selectAndVerifyChatGptModel(
 			await sleep(Math.min(pollIntervalMs(), 200));
 		}
 		if (!optionLabel) throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
-		await bridgeJson(exec, launcher, ["click", String(tabId), `text=${optionLabel}`], signal);
+		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: `text=${optionLabel}`, expectedTarget }, signal);
+		else await bridgeJson(exec, launcher, ["click", String(tabId), `text=${optionLabel}`], signal);
 		for (;;) {
 			observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 			if (observed?.normalized === requested) break;
@@ -917,8 +996,10 @@ export async function reloadPage(
 	launcher: Launcher,
 	tabId: number,
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
-	await bridgeJson(exec, launcher, ["reload", String(tabId)], signal, 120_000);
+	if (expectedTarget) await privateBridgeJson(exec, launcher, "reload", { tabId, expectedTarget }, signal, 120_000);
+	else await bridgeJson(exec, launcher, ["reload", String(tabId)], signal, 120_000);
 }
 
 export async function clickRecoveryControl(
@@ -927,15 +1008,16 @@ export async function clickRecoveryControl(
 	tabId: number,
 	action: "continue" | "retry" | "stop",
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	const labels = action === "continue"
 		? ["text=Continue generating", "text=Continue response", "text=Continue"]
 		: action === "retry"
 			? ["text=Retry"]
 			: ['button[data-testid*="stop"]', 'button[aria-label*="Stop"]'];
-	await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], labels, {
-		signal, deadline: Date.now() + 15_000, what: `${action} the current ChatGPT turn`,
-	});
+	const options = { signal, deadline: Date.now() + 15_000, what: `${action} the current ChatGPT turn` };
+	if (expectedTarget) await actOnPrivateSelector(exec, launcher, tabId, labels, expectedTarget, options);
+	else await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], labels, options);
 }
 
 export async function captureOwnedScreenshot(
@@ -945,6 +1027,7 @@ export async function captureOwnedScreenshot(
 	tabId: number,
 	destination: string,
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<string | undefined> {
 	const current = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, signal);
 	if (!current) throw new Error("Owned Chrome Bridge tab URL is unavailable; screenshot refused.");
@@ -953,6 +1036,16 @@ export async function captureOwnedScreenshot(
 	if (currentUrl.origin !== CHATGPT_ORIGIN) throw new Error(`Refused tab outside ${CHATGPT_ORIGIN}: ${current}`);
 	await mkdir(resolve(destination, ".."), { recursive: true });
 	try {
+		if (expectedTarget) {
+			const payload = await privateBridgeJson(exec, launcher, "screenshot", {
+				tabId, format: "png", quiet: true, expectedTarget,
+			}, signal, 120_000);
+			const result = resultOf(payload);
+			const dataUrl = readString(result, "dataUrl");
+			if (!dataUrl?.startsWith("data:image/png;base64,")) throw new Error("Chrome Bridge screenshot returned no PNG data.");
+			await writeFile(destination, Buffer.from(dataUrl.slice("data:image/png;base64,".length), "base64"));
+			return destination;
+		}
 		await bridgeJson(exec, launcher, ["screenshot", String(tabId), destination], signal, 120_000);
 		return destination;
 	} catch {
@@ -1175,10 +1268,10 @@ function cleanModelLabel(raw: string): string {
 
 function normalizeModelLabel(label: string): string {
 	const value = label.toLowerCase().replace(/\s+/g, " ").trim();
-	if (value === "pro" || /(?:^|\s)pro$/.test(value)) return "pro";
-	if (value.includes("auto")) return "auto";
-	if (value.includes("instant")) return "instant";
-	if (value.includes("thinking")) return "thinking";
+	const exact = /^(pro|auto|instant|thinking)$/.exec(value);
+	if (exact) return exact[1];
+	const versioned = /^gpt[- ]?\d+(?:\.\d+)*(?: [a-z0-9.-]+)* (pro|auto|instant|thinking)$/.exec(value);
+	if (versioned) return versioned[1];
 	return value;
 }
 

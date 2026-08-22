@@ -33831,6 +33831,40 @@ function translatePolicyDenial(error51) {
   const grant = kind === "egress" ? "allow-egress" : "allow-origin";
   return new PolicyDeniedError(`Chrome Bridge policy blocked this action (${kind}).`, `chrome-bridge policy ${grant} ${CHATGPT_ORIGIN} ${client}`);
 }
+async function probeExpectedTargetEnforcement(exec, launcher, signal) {
+  const name = `gpt-control:probe:${randomUUID2()}`;
+  let sessionId;
+  try {
+    sessionId = await createSession(exec, launcher, name, signal);
+    const tabId = await openChat(exec, launcher, sessionId, CHATGPT_ORIGIN, signal);
+    let url2;
+    const deadline = Date.now() + 1e4;
+    do {
+      url2 = await tabUrl(exec, launcher, tabId, signal);
+      if (url2 && !TRANSIENT_TAB_URLS.has(url2))
+        break;
+      await sleep(100);
+    } while (Date.now() < deadline);
+    if (!url2 || TRANSIENT_TAB_URLS.has(url2))
+      return false;
+    const target = { sessionId, tabId, name, url: url2 };
+    const proof = resultOf(await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget: target }, signal));
+    if (readString(proof, "expectedTargetEnforcement") !== "document-v1")
+      return false;
+    await privateBridgeJson(exec, launcher, "ping", {
+      tabId,
+      expectedTarget: { ...target, url: `${CHATGPT_ORIGIN}/c/gpt-control-probe-mismatch` }
+    }, signal);
+    return false;
+  } catch (error51) {
+    return /expectedTarget exact URL changed before the browser action/.test(error51 instanceof Error ? error51.message : String(error51));
+  } finally {
+    if (sessionId)
+      await closeSession(exec, launcher, sessionId, signal).catch(() => {
+        return;
+      });
+  }
+}
 function tabIdFromSession(session) {
   const tabs = session.tabIds ?? session.tabs;
   if (!Array.isArray(tabs))
@@ -33887,6 +33921,7 @@ async function actOnSelector(exec, launcher, args, selectors, options) {
   let lastError = "the page never became ready";
   for (let attempt = 0;; attempt += 1) {
     for (const selector of selectors) {
+      await options.beforeAction?.();
       const result = await bridge(exec, launcher, args(selector), options.signal, 60000);
       try {
         parseCommandJson(result, `chrome-bridge ${options.what}`);
@@ -33906,22 +33941,23 @@ async function actOnSelector(exec, launcher, args, selectors, options) {
   }
   throw new Error(`Could not ${options.what}. Last error: ${lastError}`);
 }
-async function attachFiles(exec, launcher, tabId, files, signal) {
+async function attachFiles(exec, launcher, tabId, files, signal, expectedTarget) {
   if (files.length === 0)
     return;
   await privateBridgeJson(exec, launcher, "uploadFile", {
     tabId,
     selector: FILE_INPUT_SELECTOR,
-    files: [...files]
+    files: [...files],
+    expectedTarget
   }, signal, 180000);
 }
-async function fillPrompt(exec, launcher, tabId, prompt, signal, readyTimeoutMs = 60000) {
+async function fillPrompt(exec, launcher, tabId, prompt, signal, readyTimeoutMs = 60000, expectedTarget) {
   const deadline = Date.now() + readyTimeoutMs;
   let lastError = "the composer never became ready";
   for (let attempt = 0;; attempt += 1) {
     for (const selector of PROMPT_SELECTORS) {
       try {
-        await privateBridgeJson(exec, launcher, "fill", { tabId, selector, text: prompt }, signal, 60000);
+        await privateBridgeJson(exec, launcher, "fill", { tabId, selector, text: prompt, expectedTarget }, signal, 60000);
         lastError = "";
         break;
       } catch (error51) {
@@ -33938,12 +33974,42 @@ async function fillPrompt(exec, launcher, tabId, prompt, signal, readyTimeoutMs 
     await sleep(Math.min(pollIntervalMs(), 250 * 2 ** attempt, 2000));
   }
 }
-async function clickSend(exec, launcher, tabId, signal) {
-  await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], SEND_SELECTORS, {
+async function clickSend(exec, launcher, tabId, signal, expectedTarget) {
+  if (!expectedTarget) {
+    await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], SEND_SELECTORS, {
+      signal,
+      deadline: Date.now() + 30000,
+      what: "click the ChatGPT send button"
+    });
+    return;
+  }
+  await actOnPrivateSelector(exec, launcher, tabId, SEND_SELECTORS, expectedTarget, {
     signal,
     deadline: Date.now() + 30000,
     what: "click the ChatGPT send button"
   });
+}
+async function actOnPrivateSelector(exec, launcher, tabId, selectors, expectedTarget, options) {
+  let lastError = "the page never became ready";
+  for (let attempt = 0;; attempt += 1) {
+    for (const selector of selectors) {
+      try {
+        await privateBridgeJson(exec, launcher, "click", { tabId, selector, expectedTarget }, options.signal);
+        return selector;
+      } catch (error51) {
+        const translated = translatePolicyDenial(error51);
+        if (translated instanceof PolicyDeniedError)
+          throw translated;
+        lastError = translated instanceof Error ? translated.message : String(translated);
+        if (/expectedTarget/.test(lastError) || !isTransient(lastError))
+          throw translated;
+      }
+    }
+    if (Date.now() >= options.deadline || options.signal?.aborted)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 250 * 2 ** attempt, 2000));
+  }
+  throw new Error(`Could not ${options.what}. Last error: ${lastError}`);
 }
 function countAssistantTurns(html) {
   return parse6(html).querySelectorAll('[data-message-author-role="assistant"]').length;
@@ -33999,12 +34065,15 @@ function extractComposerModel(html) {
   }
   return [...unique.values()][0];
 }
-async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, signal, timeoutMs = 30000) {
+async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, signal, timeoutMs = 30000, expectedTarget) {
   let observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
   if (!observed)
     throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
   if (observed.normalized !== requested) {
-    await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
+    if (expectedTarget)
+      await privateBridgeJson(exec, launcher, "click", { tabId, selector: observed.selector, expectedTarget }, signal);
+    else
+      await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
     const deadline = Date.now() + timeoutMs;
     let optionLabel;
     let optionCount = 0;
@@ -34023,7 +34092,10 @@ async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, sig
     }
     if (!optionLabel)
       throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
-    await bridgeJson(exec, launcher, ["click", String(tabId), `text=${optionLabel}`], signal);
+    if (expectedTarget)
+      await privateBridgeJson(exec, launcher, "click", { tabId, selector: `text=${optionLabel}`, expectedTarget }, signal);
+    else
+      await bridgeJson(exec, launcher, ["click", String(tabId), `text=${optionLabel}`], signal);
     for (;; ) {
       observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
       if (observed?.normalized === requested)
@@ -34206,18 +34278,21 @@ async function navigateSession(exec, launcher, sessionId, url2, signal) {
   const payload = await bridgeJson(exec, launcher, ["taskSession", "navigate", sessionId, url2], signal, 120000);
   return extractTabId(payload);
 }
-async function reloadPage(exec, launcher, tabId, signal) {
-  await bridgeJson(exec, launcher, ["reload", String(tabId)], signal, 120000);
+async function reloadPage(exec, launcher, tabId, signal, expectedTarget) {
+  if (expectedTarget)
+    await privateBridgeJson(exec, launcher, "reload", { tabId, expectedTarget }, signal, 120000);
+  else
+    await bridgeJson(exec, launcher, ["reload", String(tabId)], signal, 120000);
 }
-async function clickRecoveryControl(exec, launcher, tabId, action, signal) {
+async function clickRecoveryControl(exec, launcher, tabId, action, signal, expectedTarget) {
   const labels = action === "continue" ? ["text=Continue generating", "text=Continue response", "text=Continue"] : action === "retry" ? ["text=Retry"] : ['button[data-testid*="stop"]', 'button[aria-label*="Stop"]'];
-  await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], labels, {
-    signal,
-    deadline: Date.now() + 15000,
-    what: `${action} the current ChatGPT turn`
-  });
+  const options = { signal, deadline: Date.now() + 15000, what: `${action} the current ChatGPT turn` };
+  if (expectedTarget)
+    await actOnPrivateSelector(exec, launcher, tabId, labels, expectedTarget, options);
+  else
+    await actOnSelector(exec, launcher, (selector) => ["click", String(tabId), selector], labels, options);
 }
-async function captureOwnedScreenshot(exec, launcher, sessionId, tabId, destination, signal) {
+async function captureOwnedScreenshot(exec, launcher, sessionId, tabId, destination, signal, expectedTarget) {
   const current = await assertOwnedSessionTab(exec, launcher, sessionId, tabId, signal);
   if (!current)
     throw new Error("Owned Chrome Bridge tab URL is unavailable; screenshot refused.");
@@ -34231,6 +34306,20 @@ async function captureOwnedScreenshot(exec, launcher, sessionId, tabId, destinat
     throw new Error(`Refused tab outside ${CHATGPT_ORIGIN}: ${current}`);
   await mkdir(resolve2(destination, ".."), { recursive: true });
   try {
+    if (expectedTarget) {
+      const payload = await privateBridgeJson(exec, launcher, "screenshot", {
+        tabId,
+        format: "png",
+        quiet: true,
+        expectedTarget
+      }, signal, 120000);
+      const result = resultOf(payload);
+      const dataUrl = readString(result, "dataUrl");
+      if (!dataUrl?.startsWith("data:image/png;base64,"))
+        throw new Error("Chrome Bridge screenshot returned no PNG data.");
+      await writeFile(destination, Buffer.from(dataUrl.slice("data:image/png;base64,".length), "base64"));
+      return destination;
+    }
     await bridgeJson(exec, launcher, ["screenshot", String(tabId), destination], signal, 120000);
     return destination;
   } catch {
@@ -34297,14 +34386,12 @@ function cleanModelLabel(raw) {
 }
 function normalizeModelLabel(label) {
   const value = label.toLowerCase().replace(/\s+/g, " ").trim();
-  if (value === "pro" || /(?:^|\s)pro$/.test(value))
-    return "pro";
-  if (value.includes("auto"))
-    return "auto";
-  if (value.includes("instant"))
-    return "instant";
-  if (value.includes("thinking"))
-    return "thinking";
+  const exact = /^(pro|auto|instant|thinking)$/.exec(value);
+  if (exact)
+    return exact[1];
+  const versioned = /^gpt[- ]?\d+(?:\.\d+)*(?: [a-z0-9.-]+)* (pro|auto|instant|thinking)$/.exec(value);
+  if (versioned)
+    return versioned[1];
   return value;
 }
 function composerContainer(root) {
@@ -34669,15 +34756,30 @@ class ChromeBridgeBrowserDriver {
     this.exec = exec;
     this.launcher = launcher;
   }
+  async assertActionTarget(session, signal) {
+    const current = await this.show(session.sessionId, signal);
+    if (String(current.pageId) !== String(session.pageId)) {
+      throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; action refused.`);
+    }
+    if (current.name !== session.name) {
+      throw new Error(`Refused action on renamed or foreign browser session ${session.sessionId}.`);
+    }
+    assertChatGptUrl(current.url, true);
+    if (canonicalActionUrl(current.url) !== canonicalActionUrl(session.url)) {
+      throw new Error(`Owned browser page drifted from ${session.url} to ${current.url}; action refused.`);
+    }
+    return current;
+  }
   async probe(signal) {
     const result = await probeBridge(this.exec, this.launcher, signal);
     const secureInput = Boolean(this.launcher.privateRpc);
+    const exactTargetEnforced = secureInput && result.ready ? await probeExpectedTargetEnforcement(this.exec, this.launcher, signal) : false;
     return {
-      ready: result.ready && secureInput,
+      ready: result.ready && secureInput && exactTargetEnforced,
       driver: this.id,
       secureInput,
       protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION,
-      reason: !secureInput ? "Chrome Bridge is reachable, but its private request-file RPC adapter is unavailable; prompt submission is disabled." : result.reason
+      reason: !secureInput ? "Chrome Bridge is reachable, but its private request-file RPC adapter is unavailable; prompt submission is disabled." : !exactTargetEnforced ? "Chrome Bridge is reachable, but exact expectedTarget enforcement is unavailable; browser mutation is disabled." : result.reason
     };
   }
   async create(name, url2, signal) {
@@ -34709,28 +34811,35 @@ class ChromeBridgeBrowserDriver {
     return this.show(session.sessionId, signal);
   }
   async upload(session, files, signal) {
-    await attachFiles(this.exec, this.launcher, numericPageId(session.pageId), files, signal);
+    await this.assertActionTarget(session, signal);
+    await attachFiles(this.exec, this.launcher, numericPageId(session.pageId), files, signal, exactActionTarget(session));
   }
   async fill(session, prompt, signal) {
-    await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal);
+    await this.assertActionTarget(session, signal);
+    await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal, 60000, exactActionTarget(session));
   }
   async selectModel(session, model, signal) {
-    return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+    await this.assertActionTarget(session, signal);
+    return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal, 30000, exactActionTarget(session));
   }
   async verifyModel(session, model, signal) {
+    await this.assertActionTarget(session, signal);
     return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
   }
   async send(session, signal) {
-    await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal);
+    await this.assertActionTarget(session, signal);
+    await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
   }
   async observe(session, signal) {
     return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
   async recover(session, action, signal) {
+    await this.assertActionTarget(session, signal);
     const pageId = numericPageId(session.pageId);
+    const target = exactActionTarget(session);
     if (action === "reload")
-      return reloadPage(this.exec, this.launcher, pageId, signal);
-    return clickRecoveryControl(this.exec, this.launcher, pageId, action, signal);
+      return reloadPage(this.exec, this.launcher, pageId, signal, target);
+    return clickRecoveryControl(this.exec, this.launcher, pageId, action, signal, target);
   }
   async setState(sessionId, state, signal) {
     await setSessionState(this.exec, this.launcher, sessionId, state, signal);
@@ -34739,8 +34848,20 @@ class ChromeBridgeBrowserDriver {
     await closeSession(this.exec, this.launcher, sessionId, signal);
   }
   async screenshot(session, outputPath, signal) {
-    return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal);
+    await this.assertActionTarget(session, signal);
+    return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal, exactActionTarget(session));
   }
+}
+function canonicalActionUrl(raw) {
+  return new URL(raw).toString();
+}
+function exactActionTarget(session) {
+  return {
+    sessionId: session.sessionId,
+    tabId: numericPageId(session.pageId),
+    name: session.name,
+    url: canonicalActionUrl(session.url)
+  };
 }
 var DriverIdSchema = exports_external.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
 var SessionSchema = exports_external.object({
@@ -36046,7 +36167,7 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 3, "maxConcurrentWorkers"),
+    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 3, 1, 10, "maxConcurrentWorkers"),
     allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
     providerTurnAbandonmentTokenHash: abandonmentToken ? createHash5("sha256").update(abandonmentToken).digest("hex") : undefined
   };

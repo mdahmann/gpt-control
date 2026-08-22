@@ -40,6 +40,7 @@ interface FakeTurn {
 	released: boolean;
 	recovered: boolean;
 	conversationId: string;
+	messageIdentity: string;
 	stopReadsRemaining?: number;
 	idleReadsRemaining?: number;
 	identityDelayReadsRemaining?: number;
@@ -175,6 +176,15 @@ export class FakeChromeBridge {
 		if (!requestPath) throw new Error("private request path missing");
 		const request = JSON.parse(readFileSync(requestPath, "utf8")) as { action: string; payload: Record<string, unknown> };
 		this.privateRequests.push(request);
+		const expected = request.payload.expectedTarget;
+		if (expected && typeof expected === "object" && !Array.isArray(expected)) {
+			const target = expected as { sessionId?: string; tabId?: number; name?: string; url?: string };
+			const expectedTab = this.tabs.get(Number(target.tabId));
+			if (!expectedTab || Number(request.payload.tabId) !== target.tabId) return failed("expectedTarget tab does not match the action tab");
+			const actualName = this.options.foreignSession ? "other-tool" : expectedTab.name;
+			if (expectedTab.sessionId !== target.sessionId || actualName !== target.name) return failed("expectedTarget no longer owns the named task-session tab");
+			if (canonicalFakeUrl(expectedTab.url) !== canonicalFakeUrl(String(target.url ?? ""))) return failed("expectedTarget exact URL changed before the browser action");
+		}
 		const tab = this.requireTab(Number(request.payload.tabId));
 		if (!tab.url.startsWith("https://chatgpt.com")) this.unsafeOriginActions.push(`${request.action}:${tab.url}`);
 		if (request.action === "fill") {
@@ -190,6 +200,10 @@ export class FakeChromeBridge {
 			tab.pendingAttachments.push(...files);
 			return ok({ success: true });
 		}
+		if (request.action === "click") return this.handleClick(tab.id, String(request.payload.selector));
+		if (request.action === "reload") return this.handleReload(tab.id);
+		if (request.action === "screenshot") return ok({ success: true, mimeType: "image/png", dataUrl: `data:image/png;base64,${Buffer.from("fake-png").toString("base64")}` });
+		if (request.action === "ping") return ok({ pong: true, expectedTargetEnforcement: "document-v1" });
 		return failed(`unsupported private action ${request.action}`);
 	}
 
@@ -292,7 +306,9 @@ export class FakeChromeBridge {
 			const userPrompt = tab.filled;
 			const prompt = stripRunProof(userPrompt);
 			this.submittedPrompts.push(prompt);
-			const conversationId = `fake-${tab.id}-${tab.turns.length + 1}`;
+			const conversationId = /^https:\/\/chatgpt\.com\/c\/([^/?#]+)$/.exec(tab.url)?.[1]
+				?? `fake-${tab.id}-${tab.turns.length + 1}`;
+			const messageIdentity = `${conversationId}-turn-${tab.turns.length + 1}`;
 			tab.turns.push({
 				prompt,
 				userPrompt,
@@ -301,6 +317,7 @@ export class FakeChromeBridge {
 				released: false,
 				recovered: false,
 				conversationId,
+				messageIdentity,
 				idleReadsRemaining: this.options.postSendIdleReads,
 				identityDelayReadsRemaining: this.options.postSendIdentityDelayReads,
 				attachmentNames: [...tab.pendingAttachments],
@@ -469,7 +486,7 @@ function json(value: unknown, code = 0, stderr = ""): ExecResult {
 }
 
 function finalAssistant(turn: FakeTurn): string {
-	return `<div data-message-author-role="assistant" data-message-id="assistant-${escapeHtml(turn.conversationId)}"><div class="markdown"><p>final:${escapeHtml(turn.prompt)}</p></div></div>`;
+	return `<div data-message-author-role="assistant" data-message-id="assistant-${escapeHtml(turn.messageIdentity)}"><div class="markdown"><p>final:${escapeHtml(turn.prompt)}</p></div></div>`;
 }
 
 function userTurnHtml(turn: FakeTurn, mutateRenderedPrompt: boolean, injectEnvelopeInstruction: boolean): string {
@@ -479,7 +496,7 @@ function userTurnHtml(turn: FakeTurn, mutateRenderedPrompt: boolean, injectEnvel
 	}
 	const attachments = turn.attachmentNames.map((name) => `<span data-testid="attachment-chip">${escapeHtml(name)}</span>`).join("");
 	const renderedPrompt = renderPromptEnvelopeHtml(turn.userPrompt, mutateRenderedPrompt, injectEnvelopeInstruction);
-	return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.conversationId)}"><div data-message-content>${renderedPrompt}</div>${attachments}</div>`;
+	return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.messageIdentity)}"><div data-message-content>${renderedPrompt}</div>${attachments}</div>`;
 }
 
 function stripRunProof(value: string): string {
@@ -509,6 +526,10 @@ function renderPromptEnvelopeHtml(value: string, mutatePayload: boolean, injectI
 
 function escapeHtml(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+function canonicalFakeUrl(raw: string): string {
+	return new URL(raw).toString();
 }
 
 function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {

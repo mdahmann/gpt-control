@@ -37,6 +37,12 @@ Chrome Bridge is accepted only through the private request-file RPC adapter.
 The request file is mode 0600, removed after use, and carries prompt and snapshot
 paths outside argv.
 
+The Chrome Bridge extension must also enforce `expectedTarget`. GPT-Control
+probes this behavior and refuses browser mutation if the Bridge accepts an
+invalid expected target. Each prompt fill, upload, model click, send, recovery
+action, reload, and screenshot carries the exact task-session id, tab id,
+session name, and URL in the same Bridge request as the action.
+
 ## Exact conversation ownership
 
 GPT-Control records and rechecks the driver ID, session ID, session name, page
