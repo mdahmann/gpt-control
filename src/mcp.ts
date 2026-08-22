@@ -218,7 +218,7 @@ function registerSubagentRun(
 				await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
 			});
 			extra.signal.addEventListener("abort", () => {
-				void taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.");
+				void taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
 			}, { once: true });
 			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
 			try {
@@ -230,7 +230,7 @@ function registerSubagentRun(
 					throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
 				}
 				await taskStore.bindRun(task.taskId, started.run.id);
-				const currentTask = await taskStore.getTask(task.taskId);
+				const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
 				if (currentTask?.status === "cancelled") {
 					await service.cancelRun(started.run.id);
 				} else {
@@ -252,12 +252,12 @@ function registerSubagentRun(
 			return { task };
 		},
 		async getTask(_params: SubagentParams, extra: TaskRequestHandlerExtra) {
-			const task = await taskStore.getTask(extra.taskId);
+			const task = await extra.taskStore.getTask(extra.taskId);
 			if (!task) throw new Error(`Task ${extra.taskId} is not present in durable storage.`);
 			return task;
 		},
 		async getTaskResult(_params: SubagentParams, extra: TaskRequestHandlerExtra) {
-			return await taskStore.getTaskResult(extra.taskId) as CallToolResult;
+			return await extra.taskStore.getTaskResult(extra.taskId) as CallToolResult;
 		},
 	});
 }

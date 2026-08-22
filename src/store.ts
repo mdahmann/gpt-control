@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { hostname, homedir } from "node:os";
-import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { hostname, homedir, platform } from "node:os";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -219,9 +219,10 @@ export function confinedPath(root: string, ...parts: string[]): string {
 
 export async function secureDirectory(path: string): Promise<string> {
 	const absolute = resolve(path);
-	const root = parse(absolute).root;
+	const validationPath = await canonicalSecurityPath(absolute);
+	const root = parse(validationPath).root;
 	let current = root;
-	for (const component of relative(root, absolute).split(sep).filter(Boolean)) {
+	for (const component of relative(root, validationPath).split(sep).filter(Boolean)) {
 		current = join(current, component);
 		try {
 			const info = await lstat(current);
@@ -239,8 +240,26 @@ export async function secureDirectory(path: string): Promise<string> {
 			}
 		}
 	}
-	await chmod(absolute, 0o700);
+	await chmod(validationPath, 0o700);
 	return absolute;
+}
+
+export async function canonicalSecurityPath(path: string): Promise<string> {
+	if (platform() !== "darwin") return path;
+	const root = parse(path).root;
+	const components = relative(root, path).split(sep).filter(Boolean);
+	const first = components[0];
+	if (!first || !new Set(["var", "tmp", "etc"]).has(first)) return path;
+	const alias = join(root, first);
+	try {
+		const info = await lstat(alias);
+		if (!info.isSymbolicLink()) return path;
+		const canonical = await realpath(alias);
+		if (canonical !== join(root, "private", first)) return path;
+		return join(canonical, ...components.slice(1));
+	} catch {
+		return path;
+	}
 }
 
 export class RunStore {

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdtemp, open, readFile, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import type { AttachmentManifest, AttachmentReceipt } from "./domain";
-import { secureDirectory } from "./store";
+import { canonicalSecurityPath, secureDirectory } from "./store";
 
 export const MAX_ATTACHMENTS = 20;
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -210,7 +210,7 @@ function confinedSnapshotPath(root: string, relativePath: string): string {
 }
 
 async function assertNoSymlinkComponents(path: string): Promise<void> {
-	const absolute = resolve(path);
+	const absolute = await canonicalSecurityPath(resolve(path));
 	const root = parse(absolute).root;
 	let current = root;
 	for (const component of relative(root, absolute).split(sep).filter(Boolean)) {

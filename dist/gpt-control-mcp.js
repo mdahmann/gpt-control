@@ -35063,13 +35063,13 @@ function describeCapabilities(capabilities) {
 // src/files.ts
 import { createHash as createHash4, randomUUID as randomUUID4 } from "node:crypto";
 import { constants as constants3 } from "node:fs";
-import { chmod as chmod4, lstat as lstat2, mkdtemp as mkdtemp2, open as open3, readFile as readFile3, realpath, rm as rm4, stat } from "node:fs/promises";
+import { chmod as chmod4, lstat as lstat2, mkdtemp as mkdtemp2, open as open3, readFile as readFile3, realpath as realpath2, rm as rm4, stat } from "node:fs/promises";
 import { basename as basename3, dirname as dirname3, isAbsolute as isAbsolute2, join as join4, parse as parse8, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
 
 // src/store.ts
 import { constants as constants2 } from "node:fs";
-import { hostname as hostname3, homedir as homedir2 } from "node:os";
-import { chmod as chmod3, lstat, mkdir as mkdir2, open as open2, readFile as readFile2, readdir, rename, rm as rm3, unlink, writeFile as writeFile2 } from "node:fs/promises";
+import { hostname as hostname3, homedir as homedir2, platform } from "node:os";
+import { chmod as chmod3, lstat, mkdir as mkdir2, open as open2, readFile as readFile2, readdir, realpath, rename, rm as rm3, unlink, writeFile as writeFile2 } from "node:fs/promises";
 import { basename as basename2, dirname as dirname2, join as join3, parse as parse7, relative, resolve as resolve3, sep } from "node:path";
 import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
 var ProviderSchema = exports_external.literal("browser");
@@ -35233,9 +35233,10 @@ function confinedPath(root, ...parts) {
 }
 async function secureDirectory(path) {
   const absolute = resolve3(path);
-  const root = parse7(absolute).root;
+  const validationPath = await canonicalSecurityPath(absolute);
+  const root = parse7(validationPath).root;
   let current = root;
-  for (const component of relative(root, absolute).split(sep).filter(Boolean)) {
+  for (const component of relative(root, validationPath).split(sep).filter(Boolean)) {
     current = join3(current, component);
     try {
       const info = await lstat(current);
@@ -35259,8 +35260,29 @@ async function secureDirectory(path) {
       }
     }
   }
-  await chmod3(absolute, 448);
+  await chmod3(validationPath, 448);
   return absolute;
+}
+async function canonicalSecurityPath(path) {
+  if (platform() !== "darwin")
+    return path;
+  const root = parse7(path).root;
+  const components = relative(root, path).split(sep).filter(Boolean);
+  const first = components[0];
+  if (!first || !new Set(["var", "tmp", "etc"]).has(first))
+    return path;
+  const alias = join3(root, first);
+  try {
+    const info = await lstat(alias);
+    if (!info.isSymbolicLink())
+      return path;
+    const canonical = await realpath(alias);
+    if (canonical !== join3(root, "private", first))
+      return path;
+    return join3(canonical, ...components.slice(1));
+  } catch {
+    return path;
+  }
 }
 
 class RunStore {
@@ -35811,7 +35833,7 @@ async function buildAttachmentManifest(paths, options = {}) {
   }
   const requestedWorkspace = resolve4(options.workspaceRoot ?? process.cwd());
   await assertNoSymlinkComponents(requestedWorkspace);
-  const workspaceRoot = await realpath(requestedWorkspace);
+  const workspaceRoot = await realpath2(requestedWorkspace);
   const snapshotsBase = resolve4(options.snapshotRoot ?? join4(workspaceRoot, ".gpt-control-snapshots"));
   await secureDirectory(snapshotsBase);
   const snapshotRoot = await mkdtemp2(join4(snapshotsBase, "snapshot-"));
@@ -35826,14 +35848,14 @@ async function buildAttachmentManifest(paths, options = {}) {
         throw new Error("Attachment paths must be non-empty strings.");
       const candidate = isAbsolute2(input) ? resolve4(input) : resolve4(workspaceRoot, input);
       await assertNoSymlinkComponents(candidate);
-      const beforePath = await realpath(candidate);
+      const beforePath = await realpath2(candidate);
       const handle = await open3(candidate, constants3.O_RDONLY | (constants3.O_NOFOLLOW ?? 0));
       try {
         const before = await handle.stat();
         if (!before.isFile())
           throw new Error(`Attachment must be a regular file: ${input}`);
         await options.testAfterOpen?.(input);
-        const currentPath = await realpath(candidate);
+        const currentPath = await realpath2(candidate);
         const current = await stat(currentPath);
         if (currentPath !== beforePath || current.dev !== before.dev || current.ino !== before.ino) {
           throw new Error(`Attachment changed or was replaced while being approved: ${input}`);
@@ -35946,7 +35968,7 @@ function confinedSnapshotPath(root, relativePath) {
   return path;
 }
 async function assertNoSymlinkComponents(path) {
-  const absolute = resolve4(path);
+  const absolute = await canonicalSecurityPath(resolve4(path));
   const root = parse8(absolute).root;
   let current = root;
   for (const component of relative2(root, absolute).split(sep2).filter(Boolean)) {
@@ -38091,7 +38113,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
         await extra.sendNotification({ method: "notifications/tasks/status", params: updated });
       });
       extra.signal.addEventListener("abort", () => {
-        taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.");
+        taskStore.updateTaskStatus(task.taskId, "cancelled", "Originating MCP request was cancelled.", extra.sessionId);
       }, { once: true });
       await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
       try {
@@ -38103,7 +38125,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
           throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
         }
         await taskStore.bindRun(task.taskId, started.run.id);
-        const currentTask = await taskStore.getTask(task.taskId);
+        const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
         if (currentTask?.status === "cancelled") {
           await service.cancelRun(started.run.id);
         } else {
@@ -38122,13 +38144,13 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
       return { task };
     },
     async getTask(_params, extra) {
-      const task = await taskStore.getTask(extra.taskId);
+      const task = await extra.taskStore.getTask(extra.taskId);
       if (!task)
         throw new Error(`Task ${extra.taskId} is not present in durable storage.`);
       return task;
     },
     async getTaskResult(_params, extra) {
-      return await taskStore.getTaskResult(extra.taskId);
+      return await extra.taskStore.getTaskResult(extra.taskId);
     }
   });
 }

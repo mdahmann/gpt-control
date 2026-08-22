@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAttachmentManifest, isSensitive, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from "./src/files";
 import { parseReviewReport } from "./src/review";
-import { RunStore } from "./src/store";
+import { RunStore, secureDirectory } from "./src/store";
 import { STORAGE_VERSION, nowIso, type AttachmentManifest, type ConversationRecord, type RunRecord } from "./src/domain";
 
 const roots: string[] = [];
@@ -140,6 +140,13 @@ describe("verifiable structured findings", () => {
 });
 
 describe("confined durable records and ownership-aware locks", () => {
+	test("accepts a managed directory below the platform temporary root", async () => {
+		const root = scratch();
+		const managed = join(root, "managed");
+		expect(await secureDirectory(managed)).toBe(managed);
+		expect(statSync(managed).isDirectory()).toBe(true);
+	});
+
 	test("blocks schema-v3 startup while legacy schema-v2 state remains", async () => {
 		const parent = scratch();
 		mkdirSync(join(parent, "runs"), { recursive: true });
