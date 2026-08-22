@@ -14,6 +14,9 @@ import {
 	providerConversationIdentity,
 	readChatPageObservation,
 	reloadPage,
+	discoverChatGptModels,
+	discoverChatGptProjects,
+	manageChatGptConversation,
 	selectAndVerifyChatGptModel,
 	setSessionState,
 	showSession,
@@ -25,6 +28,11 @@ import {
 	type ExactBrowserActionTarget,
 	type AssistantSnapshot,
 	type ChatPageObservation,
+	type ChatGptModelCatalog,
+	type ChatGptProjectCatalog,
+	type ChatGptConversationAction,
+	type ChatGptConversationActionResult,
+	type ChatGptSelection,
 	type ModelVerification,
 } from "./chatgpt";
 import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
@@ -59,8 +67,11 @@ export interface WebChatDriver {
 	navigate(session: DriverSession, url: string, signal?: AbortSignal): Promise<DriverSession>;
 	upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void>;
 	fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
-	selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
-	verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
+	discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog>;
+	discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog>;
+	manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult>;
+	selectModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
+	verifyModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
 	send(session: DriverSession, signal?: AbortSignal): Promise<void>;
 	observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation>;
 	recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void>;
@@ -583,14 +594,29 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal, 60_000, exactActionTarget(session));
 	}
 
-	async selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+	async discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog> {
+		await this.assertActionTarget(session, signal);
+		return discoverChatGptModels(this.exec, this.launcher, numericPageId(session.pageId), signal, 30_000, exactActionTarget(session));
+	}
+
+	async discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog> {
+		await this.assertActionTarget(session, signal);
+		return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
+	}
+
+	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {
+		await this.assertActionTarget(session, signal);
+		return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30_000, exactActionTarget(session));
+	}
+
+	async selectModel(session: DriverSession, model: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
 		await this.assertActionTarget(session, signal);
 		return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal, 30_000, exactActionTarget(session));
 	}
 
-	async verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+	async verifyModel(session: DriverSession, model: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
 		await this.assertActionTarget(session, signal);
-		return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+		return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal, exactActionTarget(session));
 	}
 
 	async send(session: DriverSession, signal?: AbortSignal): Promise<void> {
@@ -668,9 +694,30 @@ const ObservationSchema = z.object({
 const ModelVerificationSchema = z.object({
 	requestedModel: z.string().min(1),
 	observedModel: z.string().min(1),
+	requestedEffort: z.string().min(1).optional(),
+	observedEffort: z.string().min(1).optional(),
 	modelVerified: z.literal(true),
 	modelEvidenceKind: z.literal("composer_selector"),
 	modelVerifiedAt: z.string().min(1),
+}).strict();
+const CatalogOptionSchema = z.object({ label: z.string().min(1), note: z.string().min(1).optional() }).strict();
+const ModelCatalogSchema = z.object({
+	currentModel: z.string().min(1).optional(),
+	currentEffort: z.string().min(1).optional(),
+	models: z.array(CatalogOptionSchema),
+	efforts: z.array(CatalogOptionSchema),
+	discoveredAt: z.string().min(1),
+}).strict();
+const ProjectCatalogSchema = z.object({
+	projects: z.array(z.object({ name: z.string().min(1) }).strict()),
+	discoveredAt: z.string().min(1),
+}).strict();
+const ConversationActionResultSchema = z.object({
+	pinned: z.boolean().optional(),
+	archived: z.boolean().optional(),
+	title: z.string().min(1).optional(),
+	project: z.string().min(1).optional(),
+	verifiedAt: z.string().min(1),
 }).strict();
 const ProbeSchema = z.object({
 	ready: z.boolean(),
@@ -734,11 +781,23 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 		await this.call("fill", { session, prompt }, signal);
 	}
 
-	async selectModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+	async discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog> {
+		return ModelCatalogSchema.parse(await this.call("discover_models", { session }, signal));
+	}
+
+	async discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog> {
+		return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+	}
+
+	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {
+		return ConversationActionResultSchema.parse(await this.call("manage_conversation", { session, operation: action }, signal));
+	}
+
+	async selectModel(session: DriverSession, model: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
 		return ModelVerificationSchema.parse(await this.call("select_model", { session, model }, signal));
 	}
 
-	async verifyModel(session: DriverSession, model: ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
+	async verifyModel(session: DriverSession, model: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification> {
 		return ModelVerificationSchema.parse(await this.call("verify_model", { session, model }, signal));
 	}
 

@@ -2,9 +2,9 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.3.2 adds exact-conversation ownership, crash-safe durable runs, truthful live
-Pro-model evidence, immutable attachment snapshots, and six independent
-ChatGPT Pro workers by default with an operator ceiling of ten.
+0.4.0 adds live model and effort discovery, exact-conversation organization,
+crash-safe durable runs, and three clear orchestration routes: GPT Chat, GPT
+Worker, and GPT Sub-agent.
 
 The caller remains the orchestrator. GPT-Control does not merge code, widen
 repository authority, infer connected-tool access, launch a paid fallback, or
@@ -20,8 +20,9 @@ open a replacement browser when the configured driver is unavailable.
 - **Crash-safe cancellation:** cancellation is terminal and immutable before a
   provider stop. Restart retries any pending exact-turn stop before it resumes
   work. Late completion cannot overwrite cancellation.
-- **Truthful model provenance:** ChatGPT Pro is selected and read back from the
-  live composer, then verified again immediately before send.
+- **Truthful model provenance:** the requested live ChatGPT model and effort are
+  selected and read back from the composer, then verified again immediately
+  before send.
 - **Immutable attachments:** uploads use private broker-owned snapshots with
   hashes and line counts, not mutable workspace paths.
 - **No hidden fallback:** the configured secure browser driver either works or
@@ -50,6 +51,8 @@ never passed through child-process argv.
 |---|---|
 | `gpt_consult` | Structured independent review with evidence, manifest, and receipt |
 | `gpt_chat` | Start or continue one exact ChatGPT conversation |
+| `gpt_models` | Read current ChatGPT model and effort choices without sending a prompt |
+| `gpt_projects` | Read current ChatGPT project names without sending a prompt |
 | `gpt_conversation_attach` | Open an exact existing ChatGPT conversation in a new owned background tab |
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
@@ -57,19 +60,33 @@ never passed through child-process argv.
 | `gpt_run_abandon_pending` | Operator-authenticated release of an unresolved provider slot after manual review |
 | `gpt_run_claim` | Operator-authenticated claim or transfer of a run's authoritative conversation owner, including all bound tasks |
 | `gpt_conversation_close` | Close an owned local browser session; provider history remains |
-| `gpt_subagent_run` | Start one independent bounded ChatGPT Pro worker |
-| `gpt_subagent_get` | One reconnect/recovery lookup for a worker |
-| `gpt_subagent_cancel` | Durably cancel a worker |
-| `gpt_subagent_list` | Bounded recovery overview, not a polling loop |
+| `gpt_conversation_manage` | Pin, unpin, rename, move, or archive an owned conversation with live read-back |
+| `gpt_worker_run` | Start one independent bounded GPT Worker with a selected model and effort |
+| `gpt_worker_get` | One reconnect/recovery lookup for a worker |
+| `gpt_worker_cancel` | Durably cancel a worker |
+| `gpt_worker_list` | Bounded recovery overview, not a polling loop |
 | `gpt_diagnose` | Passive configuration report; executes nothing discovered |
 | `gpt_diagnose_active` | Explicit active driver smoke test when trusted policy permits |
 
-## Codex Pro workers
+## The three routes
 
-`gpt_subagent_run` requires an idempotency key and creates a fresh owned
+- **GPT Chat** uses `gpt_chat` for a literal message or an ongoing exact
+  conversation.
+- **GPT Worker** uses `gpt_worker_run` for one durable background ChatGPT job.
+- **GPT Sub-agent** is a native Codex child that owns one GPT-Control
+  conversation and uses `gpt_chat` repeatedly until its assigned goal is done.
+
+GPT-Control does not expose a `gpt_subagent_*` MCP tool. That name is reserved
+for the actual Codex-child workflow.
+
+## GPT Workers
+
+`gpt_worker_run` requires an idempotency key and creates a fresh owned
 conversation. Trusted policy defaults to six simultaneous workers and permits
 an operator-configured limit from one through ten, even across broker processes
-sharing the same state root. Additional workers queue fairly.
+sharing the same state root. Additional workers queue fairly. Use `gpt_models`
+to discover the exact current model and effort labels before a run when the user
+requests a specific selection.
 
 ## Existing ChatGPT conversations
 
@@ -78,8 +95,8 @@ sharing the same state root. Additional workers queue fairly.
 in a new GPT-Control-owned background tab, proves the exact session, page, URL,
 and ready composer, and returns a local `conversationId`. It does not send a
 message and it does not adopt or mutate a foreground tab. Use the returned ID
-with `gpt_chat`; each new send still selects and verifies Pro immediately before
-submission. `gpt_conversation_close` closes only the owned local tab. The
+with `gpt_chat`; each new send selects and verifies the requested live model and
+effort immediately before submission. `gpt_conversation_close` closes only the owned local tab. The
 provider conversation remains in ChatGPT history.
 
 Chat Manager or another thread inventory can help a Codex orchestrator find an
@@ -98,7 +115,7 @@ When Codex starts the plugin with a valid `CODEX_THREAD_ID`, GPT-Control records
 that trusted parent identity with each task. A terminal worker stages one compact
 receipt and uses `codex queue` to wake the parent thread. Nearby completions are
 combined, prompt and result text are excluded from the queued message, and the
-parent collects authoritative results with `gpt_subagent_get`. The automatic
+parent collects authoritative results with `gpt_worker_get`. The automatic
 delivery attempt is durable and at most once across restarts. If it is unavailable
 or ambiguous, the task result remains available by its durable task/run ID.
 
@@ -195,7 +212,8 @@ unverified build step.
 | `GPT_CONTROL_BROWSER_DRIVER` | External protocol-v2 command |
 | `GPT_CONTROL_BRIDGE` | Explicit Chrome Bridge launcher |
 | `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
-| `GPT_CONTROL_MAX_PRO_WORKERS` | Operator-selected worker ceiling from 1–10; default 6 |
+| `GPT_CONTROL_MAX_WORKERS` | Operator-selected GPT Worker ceiling from 1–10; default 6 |
+| `GPT_CONTROL_MAX_PRO_WORKERS` | Legacy alias for `GPT_CONTROL_MAX_WORKERS` |
 | `GPT_CONTROL_MAX_ATTACHMENT_FILES` | Trusted file-count cap |
 | `GPT_CONTROL_MAX_ATTACHMENT_BYTES` | Trusted aggregate-byte cap |
 | `GPT_CONTROL_MAX_PROMPT_BYTES` | Trusted prompt-byte cap |

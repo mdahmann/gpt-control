@@ -44,7 +44,9 @@ function startRequest(
 			? undefined
 			: typeof params.conversation_id === "string" ? params.conversation_id : undefined,
 		transport: "browser",
-		chatgptModel: "pro",
+		chatgptModel: typeof params.chatgpt_model === "string" ? params.chatgpt_model : "pro",
+		chatgptEffort: typeof params.chatgpt_effort === "string" ? params.chatgpt_effort : undefined,
+		pinChat: params.pin_chat === true,
 		idempotencyKey: typeof params.idempotency_key === "string" ? params.idempotency_key : undefined,
 		connectors: stringList(params.connectors),
 		connectorMode: params.connector_mode === "require" ? "require" : params.connector_mode === "prefer" ? "prefer" : undefined,
@@ -70,6 +72,7 @@ export default function gptControl(pi: ExtensionAPI): void {
 	const service = new GptControlService(exec);
 	applyLabel(pi, "GPT-Control");
 	const common = commonParameters(Type);
+	registerCatalogTools(pi, Type, service);
 
 	registerStartTool(
 		pi, Type, service,
@@ -82,9 +85,46 @@ export default function gptControl(pi: ExtensionAPI): void {
 		"Start or continue one exact ChatGPT conversation with durable run identity and live model provenance.",
 	);
 	registerImageTool(pi, Type, exec, service);
-	registerSubagentStart(pi, Type, service);
+	registerWorkerStart(pi, Type, service);
 	registerRunTools(pi, Type, service);
 	registerDiagnostics(pi, Type, service);
+}
+
+function registerCatalogTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
+	pi.registerTool({
+		name: "gpt_models",
+		label: "GPT Models",
+		description: "Read the live ChatGPT model and effort choices. No prompt is sent and the temporary owned tab is closed.",
+		loadMode: "discoverable",
+		approval: "read",
+		strict: true,
+		parameters: Type.Object({}),
+		execute: async () => {
+			try {
+				const catalog = await service.listModels();
+				return textResult("Live ChatGPT model catalog.", catalog);
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+	pi.registerTool({
+		name: "gpt_projects",
+		label: "GPT Projects",
+		description: "Read the live ChatGPT project names. No prompt is sent and the temporary owned tab is closed.",
+		loadMode: "discoverable",
+		approval: "read",
+		strict: true,
+		parameters: Type.Object({}),
+		execute: async () => {
+			try {
+				const catalog = await service.listProjects();
+				return textResult("Live ChatGPT project catalog.", catalog);
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
 }
 
 function registerStartTool(
@@ -151,11 +191,11 @@ function registerImageTool(pi: ExtensionAPI, Type: TypeBuilder, exec: Exec, serv
 	});
 }
 
-function registerSubagentStart(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
+function registerWorkerStart(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
 	pi.registerTool({
-		name: "gpt_subagent_run",
-		label: "GPT Pro Worker",
-		description: "Run one independent bounded ChatGPT Pro worker. Codex remains the orchestrator and receives one terminal completion or blocker result.",
+		name: "gpt_worker_run",
+		label: "GPT Worker",
+		description: "Run one independent bounded ChatGPT worker in the background. The live model and effort can be selected for each worker.",
 		loadMode: "discoverable",
 		approval: "write",
 		strict: true,
@@ -163,6 +203,8 @@ function registerSubagentStart(pi: ExtensionAPI, Type: TypeBuilder, service: Gpt
 			prompt: Type.String(),
 			files: Type.Optional(Type.Array(Type.String())),
 			idempotency_key: Type.String(),
+			chatgpt_model: Type.Optional(Type.String({ description: "Exact label from gpt_models, such as GPT-5.6 Sol." })),
+			chatgpt_effort: Type.Optional(Type.String({ description: "Exact effort label from gpt_models, such as High or Pro." })),
 			connectors: Type.Optional(Type.Array(Type.String({ description: "Connected-tool names requested for this worker; names do not grant permission." }))),
 			connector_mode: Type.Optional(Type.Union([Type.Literal("prefer"), Type.Literal("require")])),
 			timeout_ms: Type.Optional(Type.Integer()),
@@ -250,9 +292,9 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
-		name: "gpt_subagent_get",
-		label: "GPT Pro Worker Get",
-		description: "One durable recovery lookup for a Pro worker after reconnect or uncertainty.",
+		name: "gpt_worker_get",
+		label: "GPT Worker Get",
+		description: "One durable recovery lookup for a GPT Worker after reconnect or uncertainty.",
 		loadMode: "discoverable",
 		approval: "read",
 		strict: true,
@@ -260,7 +302,7 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 		execute: async (_id, params) => {
 			try {
 				const run = await service.getRun(String(params.run_id));
-				if (run.kind !== "subagent") throw new Error("Run is not a Pro worker.");
+				if (run.kind !== "subagent") throw new Error("Run is not a GPT Worker.");
 				return textResult(
 					runText(run), publicRun(run),
 					run.status === "failed" || run.status === "needs_user",
@@ -272,9 +314,9 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
-		name: "gpt_subagent_cancel",
-		label: "GPT Pro Worker Cancel",
-		description: "Durably cancel one independent Pro worker by run id.",
+		name: "gpt_worker_cancel",
+		label: "GPT Worker Cancel",
+		description: "Durably cancel one independent GPT Worker by run id.",
 		loadMode: "discoverable",
 		approval: "write",
 		strict: true,
@@ -282,7 +324,7 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 		execute: async (_id, params) => {
 			try {
 				const current = await service.getRun(String(params.run_id));
-				if (current.kind !== "subagent") throw new Error("Run is not a Pro worker.");
+				if (current.kind !== "subagent") throw new Error("Run is not a GPT Worker.");
 				const run = await service.cancelRun(current.id);
 				return textResult(runText(run), publicRun(run));
 			} catch (error) {
@@ -292,9 +334,9 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
-		name: "gpt_subagent_list",
-		label: "GPT Pro Workers",
-		description: "Bounded durable overview of Pro workers for reconnect recovery, not a polling protocol.",
+		name: "gpt_worker_list",
+		label: "GPT Workers",
+		description: "Bounded durable overview of GPT Workers for reconnect recovery, not a polling protocol.",
 		loadMode: "discoverable",
 		approval: "read",
 		strict: true,
@@ -313,7 +355,7 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 					.filter((run) => params.include_terminal === true || !isTerminal(run.status))
 					.slice(0, limit)
 					.map(publicRun);
-				return textResult(`${runs.length} Pro worker${runs.length === 1 ? "" : "s"}.`, { workers: runs });
+				return textResult(`${runs.length} GPT Worker${runs.length === 1 ? "" : "s"}.`, { workers: runs });
 			} catch (error) {
 				return describeError(error);
 			}
@@ -371,6 +413,39 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 			}
 		},
 	});
+
+	pi.registerTool({
+		name: "gpt_conversation_manage",
+		label: "GPT Conversation Manage",
+		description: "Pin, unpin, rename, move, or archive one exact GPT-Control-owned ChatGPT conversation with live read-back.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({
+			conversation_id: Type.String(),
+			action: Type.Union([Type.Literal("pin"), Type.Literal("unpin"), Type.Literal("rename"), Type.Literal("move"), Type.Literal("archive")]),
+			title: Type.Optional(Type.String()),
+			project: Type.Optional(Type.String()),
+		}),
+		execute: async (_id, params) => {
+			try {
+				const action = String(params.action);
+				const operation = action === "rename"
+					? { action: "rename" as const, title: String(params.title ?? "") }
+					: action === "move"
+						? { action: "move" as const, project: String(params.project ?? "") }
+						: { action: action as "pin" | "unpin" | "archive" };
+				const result = await service.manageConversation(String(params.conversation_id), operation);
+				return textResult(`ChatGPT conversation ${params.conversation_id} ${action} verified.`, {
+					conversationId: params.conversation_id,
+					action,
+					...result,
+				});
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
 }
 
 function registerDiagnostics(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
@@ -413,7 +488,9 @@ function commonParameters(Type: TypeBuilder): Record<string, Record<string, unkn
 	return {
 		conversation_id: Type.Optional(Type.String({ description: "Wrapper-owned exact conversation id for a follow-up." })),
 		files: Type.Optional(Type.Array(Type.String({ description: "Attachment path; trusted operator policy decides scope." }))),
-		chatgpt_model: Type.Optional(Type.Literal("pro")),
+		chatgpt_model: Type.Optional(Type.String({ description: "Exact live model label. Call gpt_models to discover current choices. Legacy value pro selects the Pro preset." })),
+		chatgpt_effort: Type.Optional(Type.String({ description: "Exact live effort label, such as High. Call gpt_models to discover current choices." })),
+		pin_chat: Type.Optional(Type.Boolean({ description: "Pin the exact provider conversation after its first message is submitted and identified." })),
 		idempotency_key: Type.Optional(Type.String()),
 		wait: Type.Optional(Type.Boolean({ description: "Default true. False returns durable ids while local monitoring continues." })),
 		timeout_ms: Type.Optional(Type.Integer()),

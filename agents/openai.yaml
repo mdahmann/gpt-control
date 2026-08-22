@@ -1,6 +1,6 @@
 interface:
-  display_name: "GPT-Control Pro Worker"
-  short_description: "Orchestrate exact, durable ChatGPT Pro web workers"
-  default_prompt: "Use GPT-Control only for a bounded independent review or task. Keep Codex as the orchestrator, require an idempotency key, request connectors explicitly when relevant, and consume one completion or blocker result instead of polling."
+  display_name: "GPT-Control"
+  short_description: "GPT Chat, background GPT Workers, and Codex-controlled GPT Sub-agents"
+  default_prompt: "Choose exactly one route. GPT Chat sends a direct message with gpt_chat. GPT Worker runs one durable background ChatGPT assignment with gpt_worker_run. GPT Sub-agent starts a native Codex child that owns one GPT-Control conversation and iterates until its goal is complete. Never call a GPT Worker a sub-agent."
 policy:
   allow_implicit_invocation: true

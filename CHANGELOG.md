@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0] - 2026-08-22
+
+### Added
+
+- Live ChatGPT model and effort discovery with exact selection and immediate pre-send read-back.
+- ChatGPT project discovery and verified pin, unpin, rename, move, and archive controls for owned conversations.
+- Optional automatic pinning for GPT Chat and automatic pinning for GPT Worker conversations.
+
+### Changed
+
+- Public orchestration now uses three distinct names: GPT Chat, GPT Worker, and GPT Sub-agent.
+- Durable direct browser-worker tools are now `gpt_worker_run`, `gpt_worker_get`, `gpt_worker_cancel`, and `gpt_worker_list`.
+- GPT Sub-agent now refers only to a native Codex child that controls one exact GPT-Control conversation.
+- GPT Workers can select any exact live model and effort; they are not restricted to the Pro effort level.
+
 ## [0.3.2] - 2026-08-22
 
 ### Added

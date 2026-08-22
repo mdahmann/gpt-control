@@ -47,6 +47,8 @@ const ReceiptSchema = z.object({
 	model: z.string().optional(),
 	requestedModel: z.string().optional(),
 	observedModel: z.string().optional(),
+	requestedEffort: z.string().optional(),
+	observedEffort: z.string().optional(),
 	modelVerified: z.boolean().optional(),
 	modelEvidenceKind: z.enum(["composer_selector", "provider_response", "provider_sdk"]).optional(),
 	modelVerifiedAt: z.string().optional(),
@@ -78,6 +80,10 @@ const ConversationSchema = z.object({
 	browserSessionName: z.string().optional(),
 	browserPageId: z.union([z.string(), z.number()]).optional(),
 	browserAssistantTurnCount: z.number().int().nonnegative().optional(),
+	providerPinned: z.boolean().optional(),
+	providerTitle: z.string().optional(),
+	providerProject: z.string().optional(),
+	providerArchivedAt: z.string().optional(),
 	workspaceRoot: z.string(),
 	policyFingerprint: z.string().optional(),
 	mcpSessionId: McpSessionIdSchema.optional(),
@@ -103,7 +109,9 @@ const RunSchema = z.object({
 	attachmentManifest: ManifestSchema,
 	baselineMessageCount: z.number().optional(),
 	submissionState: z.enum(["not_submitted", "submitting", "submitted", "not_applicable"]).optional(),
-	requestedChatGptModel: z.enum(["pro"]).optional(),
+	requestedChatGptModel: z.string().min(1).max(128).optional(),
+	requestedChatGptEffort: z.string().min(1).max(64).optional(),
+	pinChatRequested: z.boolean().optional(),
 	timeoutMs: z.number().int().positive().optional(),
 	deadlineAt: z.string().optional(),
 	idempotencyKeyHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -122,6 +130,7 @@ const RunSchema = z.object({
 		localAssistantTurnCount: z.number().int().nonnegative().optional(),
 		lastObservedUrl: z.string().optional(),
 		lastObservedUiState: z.string().optional(),
+		organizationWarnings: z.array(z.string()).optional(),
 	}).optional(),
 	receipt: ReceiptSchema,
 	error: z.string().optional(),
@@ -135,7 +144,8 @@ const DurableRunRequestSchema = z.object({
 	runId: z.string().regex(RUN_ID_PATTERN),
 	kind: z.enum(["consult", "chat", "image", "subagent"]),
 	prompt: z.string().min(1),
-	requestedChatGptModel: z.enum(["pro"]).optional(),
+	requestedChatGptModel: z.string().min(1).max(128).optional(),
+	requestedChatGptEffort: z.string().min(1).max(64).optional(),
 	timeoutMs: z.number().int().positive(),
 	createdAt: z.string(),
 });
@@ -155,6 +165,7 @@ export interface DurableRunRequest {
 	kind: RunKind;
 	prompt: string;
 	requestedChatGptModel?: ChatGptModel;
+	requestedChatGptEffort?: string;
 	timeoutMs: number;
 	createdAt: string;
 }
@@ -390,7 +401,7 @@ export class RunStore {
 		return this.withNamedLock(`record-${id}`, async () => {
 			const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id)))) as RunRecord;
 			if (current.mcpTaskId && current.mcpTaskId !== taskId) {
-				throw new Error("This Pro worker is already owned by another durable MCP task.");
+				throw new Error("This GPT Worker is already owned by another durable MCP task.");
 			}
 			if (current.mcpTaskId === taskId) return current;
 			const next = { ...current, mcpTaskId: taskId, id, updatedAt: nowIso() };

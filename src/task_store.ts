@@ -95,7 +95,7 @@ export class DurableTaskStore implements TaskStore {
 			createdAt: timestamp,
 			lastUpdatedAt: timestamp,
 			pollInterval: normalizePollInterval(taskParams.pollInterval),
-			statusMessage: "GPT-Control Pro worker is queued.",
+			statusMessage: "GPT Worker is queued.",
 		};
 		const record: DurableTaskRecord = {
 			task,
@@ -135,7 +135,7 @@ export class DurableTaskStore implements TaskStore {
 			}
 			if (!TRANSITIONS[record.task.status].has(status)) throw new Error(`Invalid task transition ${record.task.status} -> ${status}.`);
 			const timestamp = nowIso();
-			record.task = { ...record.task, status, lastUpdatedAt: timestamp, statusMessage: status === "completed" ? "Pro worker completed." : "Pro worker returned a blocker or failure." };
+			record.task = { ...record.task, status, lastUpdatedAt: timestamp, statusMessage: status === "completed" ? "GPT Worker completed." : "GPT Worker returned a blocker or failure." };
 			record.result = result;
 			record.resultHash = resultHash;
 			record.statusHistory.push({ status, at: timestamp, message: record.task.statusMessage });
@@ -241,7 +241,7 @@ export class DurableTaskStore implements TaskStore {
 			await this.lockStore.withRunTaskBindingLock(runId, async () => {
 				const existingTaskId = await this.findTaskIdByRun(runId);
 				if (existingTaskId && existingTaskId !== taskId) {
-					throw new Error("This Pro worker is already bound to another durable MCP task.");
+					throw new Error("This GPT Worker is already bound to another durable MCP task.");
 				}
 				await this.lockStore.claimMcpTask(runId, taskId);
 				if (record.runId === runId) return;

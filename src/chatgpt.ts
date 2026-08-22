@@ -48,9 +48,47 @@ export interface ComposerModelObservation {
 export interface ModelVerification {
 	requestedModel: string;
 	observedModel: string;
+	requestedEffort?: string;
+	observedEffort?: string;
 	modelVerified: true;
 	modelEvidenceKind: "composer_selector";
 	modelVerifiedAt: string;
+}
+
+export interface ChatGptSelection {
+	model?: string;
+	effort?: string;
+}
+
+export interface ChatGptCatalogOption {
+	label: string;
+	note?: string;
+}
+
+export interface ChatGptModelCatalog {
+	currentModel?: string;
+	currentEffort?: string;
+	models: ChatGptCatalogOption[];
+	efforts: ChatGptCatalogOption[];
+	discoveredAt: string;
+}
+
+export interface ChatGptProjectCatalog {
+	projects: Array<{ name: string }>;
+	discoveredAt: string;
+}
+
+export type ChatGptConversationAction =
+	| { action: "pin" | "unpin" | "archive" }
+	| { action: "rename"; title: string }
+	| { action: "move"; project: string };
+
+export interface ChatGptConversationActionResult {
+	pinned?: boolean;
+	archived?: boolean;
+	title?: string;
+	project?: string;
+	verifiedAt: string;
 }
 
 export interface ExactBrowserActionTarget {
@@ -517,7 +555,7 @@ export function extractComposerModel(html: string): ComposerModelObservation | u
 					&& (aria.includes("model")
 						|| aria.includes("intelligence")
 						|| testId.includes("model")
-						|| ["pro", "auto", "instant", "thinking"].includes(visibleModel));
+						|| ["pro", "auto", "instant", "medium", "high", "extra high", "thinking"].includes(visibleModel));
 			});
 		}
 	}
@@ -531,15 +569,135 @@ export function extractComposerModel(html: string): ComposerModelObservation | u
 	return [...unique.values()][0];
 }
 
+export async function discoverChatGptModels(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	signal?: AbortSignal,
+	timeoutMs = 30_000,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ChatGptModelCatalog> {
+	const state = await openAdvancedPicker(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+	const models = state.modelSelector
+		? await openPickerOptions(exec, launcher, tabId, state.modelSelector, Date.now() + timeoutMs, signal, expectedTarget)
+		: [];
+	if (models.length > 0) {
+		// Radix keeps the model submenu over the sibling effort trigger. ArrowLeft
+		// closes only that nested menu and returns focus to its parent row.
+		await pressPickerKey(exec, launcher, tabId, "ArrowLeft", signal, expectedTarget);
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	let effortState = state;
+	let efforts = effortState.effortSelector
+		? await openPickerOptions(
+			exec, launcher, tabId, effortState.effortSelector,
+			Date.now() + Math.min(timeoutMs, 5_000), signal, expectedTarget,
+		)
+		: [];
+	if (efforts.length === 0 && state.effortSelector) {
+		// Fresh pages can briefly leave the model submenu over the effort row.
+		// Reopen the complete picker only after the normal direct hover failed.
+		await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+		effortState = await openAdvancedPicker(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+		efforts = effortState.effortSelector
+			? await openPickerOptions(exec, launcher, tabId, effortState.effortSelector, Date.now() + timeoutMs, signal, expectedTarget)
+			: [];
+	}
+	await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+	if (models.length === 0 && efforts.length === 0) {
+		throw new Error("ChatGPT model and effort options are unavailable in the live composer picker.");
+	}
+	return {
+		currentModel: effortState.currentModel ?? state.currentModel,
+		currentEffort: effortState.currentEffort ?? state.currentEffort,
+		models,
+		efforts,
+		discoveredAt: nowIso(),
+	};
+}
+
+export async function discoverChatGptProjects(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	signal?: AbortSignal,
+	timeoutMs = 30_000,
+): Promise<ChatGptProjectCatalog> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const projects = extractChatGptProjects(await readPageHtml(exec, launcher, tabId, signal));
+		if (projects.length > 0) return { projects: projects.map((name) => ({ name })), discoveredAt: nowIso() };
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error("ChatGPT projects are unavailable in the live sidebar.");
+}
+
+export async function manageChatGptConversation(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	action: ChatGptConversationAction,
+	signal?: AbortSignal,
+	timeoutMs = 30_000,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ChatGptConversationActionResult> {
+	const identity = providerConversationIdentity(expectedTarget?.url ?? await tabUrl(exec, launcher, tabId, signal) ?? "");
+	if (!identity) throw new Error("ChatGPT organization requires one exact /c/<id> conversation.");
+	const deadline = Date.now() + timeoutMs;
+	if (action.action === "rename") {
+		const title = normalizeManagementLabel(action.title, 128, "title");
+		const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
+		await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
+		await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
+		await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
+		await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
+		await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
+		await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
+		return { title, verifiedAt: nowIso() };
+	}
+
+	await openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+	if (action.action === "move") {
+		const project = normalizeManagementLabel(action.project, 128, "project");
+		await clickLiveMenuItem(exec, launcher, tabId, "Move to project", deadline, signal, expectedTarget);
+		const option = await waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal);
+		await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+		await waitForProjectReadback(exec, launcher, tabId, identity.id, project, deadline, signal);
+		return { project, verifiedAt: nowIso() };
+	}
+	if (action.action === "archive") {
+		await clickLiveMenuItem(exec, launcher, tabId, "Archive", deadline, signal, expectedTarget);
+		await waitForArchiveReadback(exec, launcher, tabId, identity.url, deadline, signal);
+		return { archived: true, verifiedAt: nowIso() };
+	}
+	const desired = action.action === "pin";
+	const already = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+	if (already !== desired) {
+		await clickLiveMenuItem(exec, launcher, tabId, desired ? "Pin chat" : "Unpin chat", deadline, signal, expectedTarget);
+	}
+	for (;;) {
+		const pinned = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+		if (pinned === desired) return { pinned, verifiedAt: nowIso() };
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT ${action.action} read-back failed for ${identity.url}.`);
+}
+
 export async function selectAndVerifyChatGptModel(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
-	requested: ChatGptModel,
+	requested: ChatGptModel | ChatGptSelection,
 	signal?: AbortSignal,
 	timeoutMs = 30_000,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
+		return selectAndVerifyDynamicSelection(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, timeoutMs, expectedTarget);
+	}
+	const requestedPreset = "pro";
 	const deadline = Date.now() + timeoutMs;
 	let observed: ComposerModelObservation | undefined;
 	for (;;) {
@@ -548,7 +706,7 @@ export async function selectAndVerifyChatGptModel(
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	if (!observed) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
-	if (observed.normalized !== requested) {
+	if (observed.normalized !== requestedPreset) {
 		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: observed.selector, expectedTarget }, signal);
 		else await bridgeJson(exec, launcher, ["click", String(tabId), observed.selector], signal);
 		let option: ModelOptionObservation | undefined;
@@ -556,10 +714,10 @@ export async function selectAndVerifyChatGptModel(
 		let effortPickerOpened = false;
 		for (;;) {
 			const html = await readPageHtml(exec, launcher, tabId, signal);
-			const options = extractModelOptions(html, requested);
+			const options = extractModelOptions(html, requestedPreset);
 			optionCount = options.length;
 			if (optionCount > 0) {
-				if (optionCount !== 1) throw new Error(`Requested ChatGPT model ${requested} is ambiguous in the live selector.`);
+				if (optionCount !== 1) throw new Error(`Requested ChatGPT model ${requestedPreset} is ambiguous in the live selector.`);
 				option = options[0];
 				break;
 			}
@@ -585,22 +743,22 @@ export async function selectAndVerifyChatGptModel(
 			if (Date.now() >= deadline) break;
 			await sleep(Math.min(pollIntervalMs(), 200));
 		}
-		if (!option) throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
+		if (!option) throw new Error(`Requested ChatGPT model ${requestedPreset} is unavailable in the live composer selector. No prompt was sent.`);
 		if (expectedTarget) await privateBridgeJson(exec, launcher, "click", { tabId, selector: option.selector, expectedTarget }, signal);
 		else await bridgeJson(exec, launcher, ["click", String(tabId), option.selector], signal);
 		for (;;) {
 			observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
-			if (observed?.normalized === requested) break;
+			if (observed?.normalized === requestedPreset) break;
 			if (Date.now() >= deadline) {
 				throw new Error(
-					`ChatGPT model selector read-back mismatch: requested ${requested}, observed ${observed?.label ?? "unreadable"}. No prompt was sent.`,
+					`ChatGPT model selector read-back mismatch: requested ${requestedPreset}, observed ${observed?.label ?? "unreadable"}. No prompt was sent.`,
 				);
 			}
 			await sleep(Math.min(pollIntervalMs(), 200));
 		}
 	}
 	return {
-		requestedModel: requested === "pro" ? "Pro" : requested,
+		requestedModel: "Pro",
 		observedModel: observed.label,
 		modelVerified: true,
 		modelEvidenceKind: "composer_selector",
@@ -612,23 +770,166 @@ export async function verifyChatGptModelBeforeSend(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
-	requested: ChatGptModel,
+	requested: ChatGptModel | ChatGptSelection,
 	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
+		return verifyDynamicSelectionBeforeSend(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, expectedTarget);
+	}
+	const requestedPreset = "pro";
 	const observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 	if (!observed) throw new Error("ChatGPT composer model selector disappeared before send. No prompt was sent.");
-	if (observed.normalized !== requested) {
+	if (observed.normalized !== requestedPreset) {
 		throw new Error(
-			`ChatGPT model changed before send: requested ${requested}, observed ${observed.label}. No prompt was sent.`,
+			`ChatGPT model changed before send: requested ${requestedPreset}, observed ${observed.label}. No prompt was sent.`,
 		);
 	}
 	return {
-		requestedModel: requested === "pro" ? "Pro" : requested,
+		requestedModel: "Pro",
 		observedModel: observed.label,
 		modelVerified: true,
 		modelEvidenceKind: "composer_selector",
 		modelVerifiedAt: nowIso(),
 	};
+}
+
+function normalizeRequestedSelection(requested: ChatGptModel | ChatGptSelection): ChatGptSelection {
+	const selection = typeof requested === "string" ? { model: requested } : requested;
+	const model = selection.model?.replace(/\s+/g, " ").trim();
+	const effort = selection.effort?.replace(/\s+/g, " ").trim();
+	if (!model && !effort) throw new Error("A ChatGPT model or effort selection is required.");
+	if ((model?.length ?? 0) > 128 || (effort?.length ?? 0) > 64) throw new Error("ChatGPT model or effort label is too long.");
+	return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+}
+
+async function selectAndVerifyDynamicSelection(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	requested: ChatGptSelection,
+	signal?: AbortSignal,
+	timeoutMs = 30_000,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ModelVerification> {
+	const catalog = await discoverChatGptModels(exec, launcher, tabId, signal, timeoutMs, expectedTarget);
+	const requestedModel = requested.model ? exactCatalogLabel(catalog.models, requested.model, "model") : undefined;
+	const requestedEffort = requested.effort ? exactCatalogLabel(catalog.efforts, requested.effort, "effort") : undefined;
+	if (requestedModel && normalizePickerLabel(catalog.currentModel) !== normalizePickerLabel(requestedModel)) {
+		await selectAdvancedPickerValue(exec, launcher, tabId, "model", requestedModel, Date.now() + timeoutMs, signal, expectedTarget);
+	}
+	let current = await readAdvancedPickerState(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+	if (requestedEffort && normalizePickerLabel(current.currentEffort) !== normalizePickerLabel(requestedEffort)) {
+		await selectAdvancedPickerValue(exec, launcher, tabId, "effort", requestedEffort, Date.now() + timeoutMs, signal, expectedTarget);
+		current = await readAdvancedPickerState(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+	}
+	const observedModel = current.currentModel ?? catalog.currentModel;
+	const observedEffort = current.currentEffort ?? catalog.currentEffort;
+	assertSelectionReadback(requestedModel, requestedEffort, observedModel, observedEffort, "read-back mismatch");
+	await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+	return {
+		requestedModel: requestedModel ?? observedModel ?? "current live model",
+		observedModel: observedModel ?? "current live model",
+		...(requestedEffort ? { requestedEffort } : {}),
+		...(observedEffort ? { observedEffort } : {}),
+		modelVerified: true,
+		modelEvidenceKind: "composer_selector",
+		modelVerifiedAt: nowIso(),
+	};
+}
+
+async function verifyDynamicSelectionBeforeSend(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	requested: ChatGptSelection,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ModelVerification> {
+	const deadline = Date.now() + 10_000;
+	const current = await readAdvancedPickerState(exec, launcher, tabId, deadline, signal, expectedTarget);
+	try {
+		assertSelectionReadback(requested.model, requested.effort, current.currentModel, current.currentEffort, "changed before send");
+	} finally {
+		await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+	}
+	return {
+		requestedModel: requested.model ?? current.currentModel ?? "current live model",
+		observedModel: current.currentModel ?? "current live model",
+		...(requested.effort ? { requestedEffort: requested.effort } : {}),
+		...(current.currentEffort ? { observedEffort: current.currentEffort } : {}),
+		modelVerified: true,
+		modelEvidenceKind: "composer_selector",
+		modelVerifiedAt: nowIso(),
+	};
+}
+
+async function readAdvancedPickerState(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<AdvancedPickerState> {
+	return openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+}
+
+async function selectAdvancedPickerValue(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	kind: "model" | "effort",
+	requested: string,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	const state = await openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+	const rowSelector = kind === "model" ? state.modelSelector : state.effortSelector;
+	if (!rowSelector) throw new Error(`ChatGPT ${kind} picker is unavailable. No prompt was sent.`);
+	await pickerAction(exec, launcher, "click", tabId, rowSelector, signal, expectedTarget);
+	for (;;) {
+		const options = extractPickerRadioOptions(await readPageHtml(exec, launcher, tabId, signal), rowSelector);
+		const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+		if (matches.length > 1) throw new Error(`Requested ChatGPT ${kind} ${requested} is ambiguous in the live selector. No prompt was sent.`);
+		if (matches.length === 1) {
+			await pickerAction(exec, launcher, "click", tabId, matches[0].selector, signal, expectedTarget);
+			return;
+		}
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`Requested ChatGPT ${kind} ${requested} is unavailable in the live selector. No prompt was sent.`);
+}
+
+function exactCatalogLabel(options: ChatGptCatalogOption[], requested: string, kind: "model" | "effort"): string {
+	const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+	if (matches.length === 0) {
+		const observed = options.length > 0 ? options.map((option) => option.label).join(", ") : "none";
+		throw new Error(`Requested ChatGPT ${kind} ${requested} is unavailable in the live selector (observed: ${observed}). No prompt was sent.`);
+	}
+	if (matches.length > 1) throw new Error(`Requested ChatGPT ${kind} ${requested} is ambiguous in the live selector. No prompt was sent.`);
+	return matches[0].label;
+}
+
+function assertSelectionReadback(
+	requestedModel: string | undefined,
+	requestedEffort: string | undefined,
+	observedModel: string | undefined,
+	observedEffort: string | undefined,
+	reason: string,
+): void {
+	if (requestedModel && normalizePickerLabel(requestedModel) !== normalizePickerLabel(observedModel)) {
+		throw new Error(`ChatGPT model ${reason}: requested ${requestedModel}, observed ${observedModel ?? "unreadable"}. No prompt was sent.`);
+	}
+	if (requestedEffort && normalizePickerLabel(requestedEffort) !== normalizePickerLabel(observedEffort)) {
+		throw new Error(`ChatGPT effort ${reason}: requested ${requestedEffort}, observed ${observedEffort ?? "unreadable"}. No prompt was sent.`);
+	}
+}
+
+function normalizePickerLabel(value: string | undefined): string {
+	return (value ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 export async function waitForCompletedAssistantTurn(
@@ -1271,6 +1572,401 @@ function exactNeedsUserReason(observation: ChatPageObservation, prefix: string):
 interface ModelOptionObservation {
 	label: string;
 	selector: string;
+}
+
+interface AdvancedPickerState {
+	currentModel?: string;
+	currentEffort?: string;
+	modelSelector?: string;
+	effortSelector?: string;
+	composerSelector: string;
+}
+
+async function openAdvancedPicker(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<AdvancedPickerState> {
+	let html = await readPageHtml(exec, launcher, tabId, signal);
+	let composer = extractComposerModel(html);
+	while (!composer && Date.now() < deadline) {
+		await sleep(Math.min(pollIntervalMs(), 200));
+		html = await readPageHtml(exec, launcher, tabId, signal);
+		composer = extractComposerModel(html);
+	}
+	if (!composer) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
+	let state = extractAdvancedPickerState(html, composer.selector);
+	if (!state) {
+		await pickerAction(exec, launcher, "click", tabId, composer.selector, signal, expectedTarget);
+	}
+	for (;;) {
+		html = await readPageHtml(exec, launcher, tabId, signal);
+		state = extractAdvancedPickerState(html, composer.selector);
+		if (state?.modelSelector || state?.effortSelector) return state;
+		const controls = extractCurrentEffortPickerControls(html);
+		if (controls?.advancedSelector) {
+			await pickerAction(exec, launcher, "click", tabId, controls.advancedSelector, signal, expectedTarget);
+		}
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
+}
+
+async function openPickerOptions(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	selector: string,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ChatGptCatalogOption[]> {
+	await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
+	for (;;) {
+		const options = extractPickerRadioOptions(await readPageHtml(exec, launcher, tabId, signal), selector);
+		if (options.length > 0) return options.map(({ label, note }) => ({ label, ...(note ? { note } : {}) }));
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	return [];
+}
+
+async function closeAdvancedPicker(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	// ChatGPT uses one Escape for the nested radio menu and one for its parent.
+	// Closing is cleanup only: every selection already has an exact read-back, so
+	// a changed close animation must not turn a valid catalog read into failure.
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget);
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+}
+
+async function dismissPickerLayer(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	if (expectedTarget) {
+		await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+		await privateBridgeJson(exec, launcher, "press", { tabId, key: "Escape" }, signal);
+		await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+		return;
+	}
+	await bridgeJson(exec, launcher, ["press", String(tabId), "Escape"], signal);
+}
+
+async function pressPickerKey(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	key: string,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	if (expectedTarget) {
+		// Chrome Bridge cannot bind keyboard actions atomically. This key only
+		// changes picker focus and cannot submit data, so prove the exact owned
+		// document immediately before and after it.
+		await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+		await privateBridgeJson(exec, launcher, "press", { tabId, key }, signal);
+		await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+		return;
+	}
+	await bridgeJson(exec, launcher, ["press", String(tabId), key], signal);
+}
+
+async function pickerAction(
+	exec: Exec,
+	launcher: Launcher,
+	action: "click",
+	tabId: number,
+	selector: string,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	if (expectedTarget) {
+		await privateBridgeJson(exec, launcher, action, { tabId, selector, expectedTarget }, signal);
+		return;
+	}
+	await bridgeJson(exec, launcher, [action, String(tabId), selector], signal);
+}
+
+function extractAdvancedPickerState(html: string, composerSelector: string): AdvancedPickerState | undefined {
+	const root = parse(html);
+	const active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+	if (!active) return undefined;
+	const rows = active.querySelectorAll('[role="menuitem"]');
+	const model = rows.find((node) => /^Model(?:\s|$)/i.test(nodeLabel(node)));
+	const effort = rows.find((node) => /^Effort(?:\s|$)/i.test(nodeLabel(node)));
+	if (!model && !effort) return undefined;
+	return {
+		currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
+		currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
+		modelSelector: model ? exactNodeSelector(model) : undefined,
+		effortSelector: effort ? exactNodeSelector(effort) : undefined,
+		composerSelector,
+	};
+}
+
+function pickerRowValue(label: string, prefix: "Model" | "Effort"): string | undefined {
+	const value = label.replace(new RegExp(`^${prefix}\\s*`, "i"), "").trim();
+	return value || undefined;
+}
+
+function extractPickerRadioOptions(html: string, ownerSelector?: string): Array<ModelOptionObservation & { note?: string }> {
+	const root = parse(html);
+	const ownerId = ownerSelector ? /^\[id="((?:[^"\\]|\\.)+)"\]$/.exec(ownerSelector)?.[1] : undefined;
+	return uniqueElements([
+		...root.querySelectorAll('[role="menuitemradio"]'),
+		...root.querySelectorAll('[role="option"]'),
+	]).filter((node) => {
+		if (!ownerId) return true;
+		return node.closest('[role="menu"]')?.getAttribute("aria-labelledby") === ownerId;
+	}).map((node) => {
+		const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+		const label = cleanPickerOptionLabel(node.getAttribute("aria-label") ?? lines[0] ?? nodeLabel(node));
+		const full = nodeLabel(node);
+		const note = lines.slice(1).join(" ") || (full.startsWith(label) ? full.slice(label.length).trim() : "");
+		return {
+			label,
+			selector: exactNodeSelector(node) ?? "",
+			...(note ? { note } : {}),
+		};
+	}).filter((option) => Boolean(option.label && option.selector));
+}
+
+function extractChatGptProjects(html: string): string[] {
+	const root = parse(html);
+	const names = root.querySelectorAll('button[aria-label^="Open project options for "]')
+		.map((node) => (node.getAttribute("aria-label") ?? "").replace(/^Open project options for\s+/i, "").trim())
+		.filter(Boolean);
+	return [...new Set(names)];
+}
+
+async function conversationSidebarOptionsSelector(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	providerConversationId: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<string> {
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const matches = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`);
+		if (matches.length > 1) throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
+		if (matches.length === 1) return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
+}
+
+async function openConversationHeaderMenu(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const buttons = root.querySelectorAll('[data-testid="conversation-options-button"]');
+		if (buttons.length > 1) throw new Error("ChatGPT conversation action control is ambiguous.");
+		if (buttons.length === 1) {
+			await pickerAction(exec, launcher, "click", tabId, '[data-testid="conversation-options-button"]', signal, expectedTarget);
+			return;
+		}
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error("ChatGPT conversation action control is unavailable.");
+}
+
+async function clickLiveMenuItem(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	label: string,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const matches = root.querySelectorAll('[role="menuitem"]')
+			.filter((node) => nodeLabel(node).toLowerCase() === label.toLowerCase());
+		if (matches.length > 1) throw new Error(`ChatGPT menu action ${label} is ambiguous.`);
+		if (matches.length === 1) {
+			const selector = exactNodeSelector(matches[0]);
+			if (!selector) throw new Error(`ChatGPT menu action ${label} has no exact selector.`);
+			await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
+			return;
+		}
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT menu action ${label} is unavailable.`);
+}
+
+async function waitForSelectorInHtml(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	selector: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (;;) {
+		if (parse(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll(selector).length === 1) return;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT control ${selector} did not appear.`);
+}
+
+async function privateOrBridgeAction(
+	exec: Exec,
+	launcher: Launcher,
+	action: "fill" | "press",
+	payload: Record<string, unknown> & { tabId: number },
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	if (expectedTarget) {
+		await privateBridgeJson(exec, launcher, action, { ...payload, expectedTarget }, signal);
+		return;
+	}
+	if (action === "fill") {
+		await bridgeJson(exec, launcher, ["fill", String(payload.tabId), String(payload.selector), String(payload.text ?? "")], signal);
+		return;
+	}
+	await bridgeJson(exec, launcher, ["press", String(payload.tabId), String(payload.key)], signal);
+}
+
+async function waitForConversationTitle(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	providerConversationId: string,
+	title: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
+		if (links.length === 1 && nodeLabel(links[0]).includes(title)) return;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT rename read-back failed for ${title}.`);
+}
+
+async function waitForProjectMenuOption(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	project: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<ModelOptionObservation> {
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const options = root.querySelectorAll('[role="menuitem"]').map((node) => ({
+			label: projectOptionLabel(node),
+			selector: exactNodeSelector(node) ?? "",
+		})).filter((option) => option.label && option.selector);
+		const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(project));
+		if (matches.length > 1) throw new Error(`ChatGPT project ${project} is ambiguous.`);
+		if (matches.length === 1) return matches[0];
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT project ${project} is unavailable.`);
+}
+
+function projectOptionLabel(node: HTMLElement): string {
+	const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+	const last = lines.at(-1) ?? nodeLabel(node);
+	return last.replace(/^Default color.*?Folder\s+/i, "").trim();
+}
+
+async function waitForProjectReadback(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	providerConversationId: string,
+	project: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (;;) {
+		const html = await readPageHtml(exec, launcher, tabId, signal);
+		const root = parse(html);
+		const notices = [...root.querySelectorAll('[role="status"]'), ...root.querySelectorAll('[role="alert"]')];
+		if (notices.some((node) => /mov/i.test(nodeLabel(node)) && normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project)))) return;
+		const current = await tabUrl(exec, launcher, tabId, signal);
+		const inProjectConversation = current ? new RegExp(`/g/[^/]+/c/${providerConversationId}(?:[?#]|$)`).test(new URL(current).pathname) : false;
+		const projectMarkers = root.querySelectorAll('[data-testid*="project"], [aria-label*="project"], [aria-label*="Project"]');
+		if (inProjectConversation && projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project)))) return;
+		if (root.querySelector(`[data-gpt-control-project="${cssString(project)}"]`)) return;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT move read-back failed for project ${project}.`);
+}
+
+async function waitForArchiveReadback(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	exactUrl: string,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (;;) {
+		const current = await tabUrl(exec, launcher, tabId, signal);
+		const html = await readPageHtml(exec, launcher, tabId, signal);
+		const identity = providerConversationIdentity(exactUrl);
+		const stillListed = identity ? parse(html).querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
+		if (current && new URL(current).toString() !== exactUrl && !stillListed) return;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT archive read-back failed for ${exactUrl}.`);
+}
+
+function isConversationPinned(html: string, providerConversationId: string): boolean {
+	const root = parse(html);
+	const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
+	return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "")
+		|| link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+}
+
+function normalizeManagementLabel(value: string, maxLength: number, field: string): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (!normalized || normalized.length > maxLength || /[\u0000-\u001f\u007f]/.test(normalized)) {
+		throw new Error(`ChatGPT ${field} must be 1-${maxLength} printable characters.`);
+	}
+	return normalized;
+}
+
+function cleanPickerOptionLabel(value: string): string {
+	return value.replace(/^(?:selected|current)\s+/i, "").replace(/\s+/g, " ").trim();
 }
 
 function extractModelOptions(html: string, requested: ChatGptModel): ModelOptionObservation[] {

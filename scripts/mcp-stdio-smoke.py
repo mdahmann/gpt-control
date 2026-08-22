@@ -85,16 +85,16 @@ def main() -> int:
     if 2 not in responses or "result" not in responses[2]:
         fail(f"tools/list response missing or failed: {responses.get(2)}", process)
     server = responses[1]["result"].get("serverInfo", {})
-    if server.get("name") != "gpt-control" or server.get("version") != "0.3.2":
+    if server.get("name") != "gpt-control" or server.get("version") != "0.4.0":
         fail(f"unexpected server identity: {server}", process)
     tools = responses[2]["result"].get("tools", [])
     names = {tool.get("name") for tool in tools}
-    required = {"gpt_diagnose", "gpt_subagent_run", "gpt_subagent_get", "gpt_subagent_cancel"}
+    required = {"gpt_diagnose", "gpt_worker_run", "gpt_worker_get", "gpt_worker_cancel"}
     if not required.issubset(names):
         fail(f"required tools missing: {sorted(required - names)}", process)
-    subagent = next(tool for tool in tools if tool.get("name") == "gpt_subagent_run")
-    if subagent.get("execution", {}).get("taskSupport") != "optional":
-        fail(f"subagent taskSupport is not optional: {subagent.get('execution')}", process)
+    worker = next(tool for tool in tools if tool.get("name") == "gpt_worker_run")
+    if worker.get("execution", {}).get("taskSupport") != "optional":
+        fail(f"worker taskSupport is not optional: {worker.get('execution')}", process)
 
     process.stdin.close()
     try:

@@ -15,11 +15,18 @@ export interface FakeBridgeOptions {
 	firstTabRaceReads?: number;
 	attachRedirectUrl?: string;
 	initialModel?: string;
+	initialUnderlyingModel?: string;
+	availableModels?: string[];
+	availableEfforts?: string[];
+	availableProjects?: string[];
 	modelSelectorAbsent?: boolean;
+	modelSelectorDelayReads?: number;
 	modelAvailable?: boolean;
 	modelReadbackMismatch?: boolean;
 	modelChangesBeforeSend?: boolean;
 	currentEffortPicker?: boolean;
+	retainedInactiveAdvancedView?: boolean;
+	hideComposerModelWhenSubmenuOpen?: boolean;
 	foreignSession?: boolean;
 	reloadToHome?: boolean;
 	conversationRenderNeedsReload?: boolean;
@@ -55,18 +62,25 @@ interface FakeTab {
 	url: string;
 	newTabReads: number;
 	model: string;
+	underlyingModel: string;
 	menuOpen: boolean;
-	pickerStage?: "compact" | "advanced" | "effort";
+	pickerStage?: "compact" | "advanced" | "model" | "effort";
 	filled: string;
 	turns: FakeTurn[];
 	state: string;
 	restoredUrl?: string;
 	reloadsAtConversation: number;
 	conversationUrlReads: number;
+	htmlReads: number;
 	didDriftConversation: boolean;
 	foreignConversation: boolean;
 	pendingAttachments: string[];
 	name: string;
+	title: string;
+	pinned: boolean;
+	archived: boolean;
+	project?: string;
+	conversationMenu?: "header" | "sidebar" | "move" | "rename";
 }
 
 export class FakeChromeBridge {
@@ -199,6 +213,10 @@ export class FakeChromeBridge {
 		const tab = this.requireTab(Number(request.payload.tabId));
 		if (!tab.url.startsWith("https://chatgpt.com")) this.unsafeOriginActions.push(`${request.action}:${tab.url}`);
 		if (request.action === "fill") {
+			if (String(request.payload.selector ?? "").includes("Chat title")) {
+				tab.title = String(request.payload.text ?? "");
+				return ok({ success: true });
+			}
 			const text = String(request.payload.text ?? "");
 			if (this.scenario(text) === "fail_fill") return failed("deterministic fill failure");
 			tab.filled = text;
@@ -212,6 +230,23 @@ export class FakeChromeBridge {
 			return ok({ success: true });
 		}
 		if (request.action === "click") return this.handleClick(tab.id, String(request.payload.selector));
+		if (request.action === "hover") return this.handleHover(tab.id, String(request.payload.selector));
+		if (request.action === "press") {
+			if (String(request.payload.key) === "ArrowLeft" && (tab.pickerStage === "model" || tab.pickerStage === "effort")) {
+				tab.pickerStage = "advanced";
+				return ok({ success: true });
+			}
+			if (String(request.payload.key) === "Escape") {
+				tab.menuOpen = false;
+				tab.pickerStage = undefined;
+				return ok({ success: true });
+			}
+			if (tab.conversationMenu === "rename" && String(request.payload.key) === "Enter") {
+				tab.conversationMenu = undefined;
+				return ok({ success: true });
+			}
+			return failed("unsupported press");
+		}
 		if (request.action === "reload") return this.handleReload(tab.id);
 		if (request.action === "screenshot") return ok({ success: true, mimeType: "image/png", dataUrl: `data:image/png;base64,${Buffer.from("fake-png").toString("base64")}` });
 		if (request.action === "ping") return ok({ pong: true, expectedTargetEnforcement: "document-v1" });
@@ -251,6 +286,12 @@ export class FakeChromeBridge {
 			const url = this.options.attachRedirectUrl ?? requestedUrl;
 			const existing = [...this.tabs.values()].find((tab) => tab.sessionId === sessionId);
 			if (existing) {
+				if (this.options.conversationRenderNeedsReload
+					&& existing.url === "https://chatgpt.com/"
+					&& requestedUrl.includes("/c/")) {
+					const turn = existing.turns.at(-1);
+					if (turn) turn.recovered = true;
+				}
 				existing.url = url;
 				existing.restoredUrl = url;
 				existing.foreignConversation = url.includes("/c/foreign");
@@ -263,16 +304,21 @@ export class FakeChromeBridge {
 				url: (this.options.firstTabRaceReads ?? 0) > 0 ? "chrome://newtab/" : url,
 				newTabReads: 0,
 				model: this.options.initialModel ?? "Pro",
+				underlyingModel: this.options.initialUnderlyingModel ?? "GPT-5.6 Sol",
 				menuOpen: false,
 				filled: "",
 				turns: [],
 				state: "working",
 				reloadsAtConversation: 0,
 				conversationUrlReads: 0,
+				htmlReads: 0,
 				didDriftConversation: false,
 				foreignConversation: false,
 				pendingAttachments: [],
 				name: this.sessionNames.get(sessionId) ?? "",
+				title: "Fake conversation",
+				pinned: false,
+				archived: false,
 			});
 			return ok({ tabId: id });
 		}
@@ -303,17 +349,72 @@ export class FakeChromeBridge {
 
 	private handleClick(tabId: number, selector: string): ExecResult {
 		const tab = this.requireTab(tabId);
+		if (selector === '[data-testid="conversation-options-button"]') {
+			tab.conversationMenu = "header";
+			return ok({ success: true });
+		}
+		if (selector.startsWith('a[href$="/c/')) {
+			tab.conversationMenu = "sidebar";
+			return ok({ success: true });
+		}
+		if (selector === "role=menuitem[name=Pin chat]") {
+			tab.pinned = true;
+			tab.conversationMenu = undefined;
+			return ok({ success: true });
+		}
+		if (selector === "role=menuitem[name=Unpin chat]") {
+			tab.pinned = false;
+			tab.conversationMenu = undefined;
+			return ok({ success: true });
+		}
+		if (selector === "role=menuitem[name=Rename]") {
+			tab.conversationMenu = "rename";
+			return ok({ success: true });
+		}
+		if (selector === "role=menuitem[name=Move to project]") {
+			tab.conversationMenu = "move";
+			return ok({ success: true });
+		}
+		if (selector === "role=menuitem[name=Archive]") {
+			tab.archived = true;
+			tab.conversationMenu = undefined;
+			tab.url = "https://chatgpt.com/";
+			return ok({ success: true });
+		}
+		const projectOption = /^role=menuitem\[name=(.+)\]$/.exec(selector);
+		if (projectOption && tab.conversationMenu === "move" && (this.options.availableProjects ?? []).includes(projectOption[1])) {
+			tab.project = projectOption[1];
+			tab.conversationMenu = undefined;
+			return ok({ success: true });
+		}
 		if (selector.includes("model-switcher") || selector.includes("model-selector") || selector.includes("composer-model") || selector.includes("radix-picker")) {
-			tab.menuOpen = true;
-			tab.pickerStage = this.options.currentEffortPicker ? "compact" : undefined;
+			tab.menuOpen = !tab.menuOpen;
+			tab.pickerStage = tab.menuOpen && this.options.currentEffortPicker ? "compact" : undefined;
 			return ok({ success: true });
 		}
 		if (selector.includes("Show advanced options")) {
 			tab.pickerStage = "advanced";
 			return ok({ success: true });
 		}
+		if (selector.includes("picker-model")) {
+			tab.pickerStage = "model";
+			return ok({ success: true });
+		}
 		if (selector.includes("picker-effort")) {
 			tab.pickerStage = "effort";
+			return ok({ success: true });
+		}
+		const radio = /^role=menuitemradio\[name=(.+)\]$/.exec(selector);
+		if (radio && tab.pickerStage === "model") {
+			tab.underlyingModel = radio[1];
+			tab.menuOpen = false;
+			tab.pickerStage = undefined;
+			return ok({ success: true });
+		}
+		if (radio && tab.pickerStage === "effort") {
+			tab.model = radio[1];
+			tab.menuOpen = false;
+			tab.pickerStage = undefined;
 			return ok({ success: true });
 		}
 		if (selector === "text=Pro" || selector === "role=menuitem[name=Pro]" || selector === "role=menuitemradio[name=Pro]") {
@@ -369,6 +470,19 @@ export class FakeChromeBridge {
 		return failed("No element found");
 	}
 
+	private handleHover(tabId: number, selector: string): ExecResult {
+		const tab = this.requireTab(tabId);
+		if (selector.includes("picker-model")) {
+			tab.pickerStage = "model";
+			return ok({ success: true });
+		}
+		if (selector.includes("picker-effort")) {
+			tab.pickerStage = "effort";
+			return ok({ success: true });
+		}
+		return failed("No element found");
+	}
+
 	private handleReload(tabId: number): ExecResult {
 		const tab = this.requireTab(tabId);
 		const turn = tab.turns.at(-1);
@@ -400,18 +514,40 @@ export class FakeChromeBridge {
 	}
 
 	private html(tab: FakeTab): string {
+		tab.htmlReads += 1;
 		const account = '<div data-testid="account-plan">Miles Pro</div>';
-		const composer = this.options.modelSelectorAbsent
+		const projects = (this.options.availableProjects ?? []).map((name) => `<button aria-label="Open project options for ${escapeHtml(name)}"></button>`).join("");
+		const identity = providerConversationIdentityForFake(tab.url);
+		const conversationLink = identity && !tab.archived
+			? `<a href="/c/${escapeHtml(identity)}">${escapeHtml(tab.title)}<button aria-label="${tab.pinned ? "Unpin" : "Pin"} ${escapeHtml(tab.title)}"></button><button aria-label="Open conversation options for ${escapeHtml(tab.title)}"></button></a>`
+			: "";
+		const header = identity ? '<header><button data-testid="conversation-options-button" aria-label="More"></button></header>' : "";
+		const conversationActions = tab.conversationMenu === "header" || tab.conversationMenu === "sidebar"
+			? `<div role="menu"><div role="menuitem">${tab.pinned ? "Unpin chat" : "Pin chat"}</div><div role="menuitem">Rename</div><div role="menuitem">Archive</div><div role="menuitem">Move to project</div></div>`
+			: tab.conversationMenu === "move"
+				? `<div role="menu">${(this.options.availableProjects ?? []).map((name) => `<div role="menuitem">${escapeHtml(name)}</div>`).join("")}</div>`
+				: tab.conversationMenu === "rename" ? `<input aria-label="Chat title" value="${escapeHtml(tab.title)}">` : "";
+		const organizationReadback = tab.project ? `<div data-gpt-control-project="${escapeHtml(tab.project)}"></div>` : "";
+		const composerModelHidden = this.options.hideComposerModelWhenSubmenuOpen
+			&& (tab.pickerStage === "model" || tab.pickerStage === "effort");
+		const modelSelectorDelayed = tab.htmlReads <= (this.options.modelSelectorDelayReads ?? 0);
+		const composer = this.options.modelSelectorAbsent || modelSelectorDelayed || composerModelHidden
 			? '<form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>'
 			: this.options.currentEffortPicker
 				? `<form data-testid="composer"><button id="radix-picker" aria-haspopup="menu">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`
 				: `<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`;
+		const advancedRows = `<div data-testid="composer-model-picker-slider-advanced-view" data-active="true"><div id="picker-model" role="menuitem">Model ${escapeHtml(tab.underlyingModel)}</div><div id="picker-effort" role="menuitem">Effort ${escapeHtml(tab.model)}</div></div>`;
+		const radioOptions = (tab.pickerStage === "model" ? this.options.availableModels ?? [tab.underlyingModel] : this.options.availableEfforts ?? ["Instant", "Pro"])
+			.map((label) => `<div role="menuitemradio" aria-checked="${label === (tab.pickerStage === "model" ? tab.underlyingModel : tab.model) ? "true" : "false"}">${escapeHtml(label)}</div>`).join("");
+		const retainedInactivePicker = this.options.retainedInactiveAdvancedView && !tab.menuOpen
+			? `<div data-testid="composer-model-picker-slider-advanced-view" data-active="false"><div id="stale-picker-model" role="menuitem">Model Stale hidden model</div><div id="stale-picker-effort" role="menuitem">Effort Stale hidden effort</div></div>`
+			: "";
 		const currentPicker = tab.menuOpen && this.options.currentEffortPicker
-			? tab.pickerStage === "effort"
-				? '<div role="menu"><div role="menuitemradio">Instant</div><div role="menuitemradio">Pro</div></div>'
+			? tab.pickerStage === "model" || tab.pickerStage === "effort"
+				? `<div role="menu">${advancedRows}</div><div role="menu" aria-labelledby="${tab.pickerStage === "model" ? "picker-model" : "picker-effort"}">${radioOptions}</div>`
 				: tab.pickerStage === "advanced"
-					? '<div role="menu"><div role="menuitem" aria-label="Show compact options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="true"><div id="picker-effort" role="menuitem">Effort Instant</div></div></div>'
-					: '<div role="menu"><div role="menuitem" aria-label="Show advanced options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="false"><div id="picker-effort" role="menuitem">Effort Instant</div></div></div>'
+					? `<div role="menu"><div role="menuitem" aria-label="Show compact options">Advanced</div>${advancedRows}</div>`
+					: '<div role="menu"><div role="menuitem" aria-label="Show advanced options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="false"></div></div>'
 			: "";
 		const menu = currentPicker || (tab.menuOpen && this.options.modelAvailable !== false
 			? '<div role="menu"><button role="menuitem">Pro</button></div>'
@@ -423,7 +559,7 @@ export class FakeChromeBridge {
 				this.options.mutateRenderedPrompt === true,
 				this.options.injectEnvelopeInstruction === true,
 			)}${this.turnHtml(turn, index === tab.turns.length - 1)}`).join("");
-		return `<main>${account}${turns}${composer}${menu}</main>`;
+		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}</main>`;
 	}
 
 	private turnHtml(turn: FakeTurn, current: boolean): string {
@@ -452,7 +588,7 @@ export class FakeChromeBridge {
 		if (turn.scenario === "slow" && !turn.released) {
 			return '<div data-message-author-role="assistant"><div class="markdown"><p>partial work</p></div></div><div role="status">Running tool</div><button data-testid="stop-button" aria-label="Stop answering">Stop</button>';
 		}
-		if (this.options.conversationRenderNeedsReload && !turn.recovered && phase < 3) {
+		if (this.options.conversationRenderNeedsReload && !turn.recovered && phase < 10) {
 			return '<div role="alert">Connection lost</div><button>Retry</button>';
 		}
 		if (phase === 0 && turn.scenario === "success") {
@@ -563,6 +699,10 @@ function escapeHtml(value: string): string {
 
 function canonicalFakeUrl(raw: string): string {
 	return new URL(raw).toString();
+}
+
+function providerConversationIdentityForFake(raw: string): string | undefined {
+	return /^https:\/\/chatgpt\.com\/c\/([^/?#]+)$/.exec(raw)?.[1];
 }
 
 function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {

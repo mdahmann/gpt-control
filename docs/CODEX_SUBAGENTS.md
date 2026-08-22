@@ -1,14 +1,34 @@
-# Codex Pro-worker architecture
+# GPT Chat, GPT Worker, and GPT Sub-agent architecture
 
-GPT-Control keeps Codex as the orchestrator and ChatGPT Pro as a bounded,
-independent web worker. It does not delegate orchestration, repository authority,
-or merge decisions to the worker.
+GPT-Control keeps Codex as the orchestrator. The three public concepts are:
+
+- **GPT Chat:** one direct `gpt_chat` turn or a follow-up in an exact owned
+  conversation.
+- **GPT Worker:** one durable background ChatGPT assignment started by
+  `gpt_worker_run`. The Worker can use any live model and effort listed by
+  `gpt_models`.
+- **GPT Sub-agent:** a native Codex child agent that owns one GPT-Control
+  conversation and uses `gpt_chat` for as many turns as its goal requires.
+
+GPT Sub-agent is a Codex orchestration workflow, not an MCP tool name. GPT-Control
+does not register public `gpt_subagent_*` tools. This prevents a direct browser
+worker from being mistaken for a Codex child agent.
+
+## GPT Sub-agent path
+
+The parent starts a native Codex child and gives it one bounded goal. The child
+starts or attaches one GPT Chat, retains its returned `conversation_id`, and
+uses that same ID for every follow-up. It can let ChatGPT perform work through
+available connected tools, or it can use ChatGPT as a reviewer while the child
+performs local work. The child returns one verified result or one blocker to
+the parent. If native Codex subagents are unavailable, GPT-Control does not
+replace this path with an unmanaged shell loop.
 
 ## Client paths
 
 ### MCP task-capable client
 
-`gpt_subagent_run` advertises optional task execution. The server creates and
+`gpt_worker_run` advertises optional task execution. The server creates and
 persists the run, binds exactly one MCP task to that run, returns `taskCreated`,
 and observes a short cancellation grace before provider work becomes eligible.
 It publishes task status/progress when supported and exposes
@@ -26,7 +46,7 @@ model-visible callback. In Codex 0.149 or newer, the plugin can also bind a task
 to the trusted `CODEX_THREAD_ID` supplied by the runtime. When that task becomes
 terminal, GPT-Control stages a compact receipt and invokes `codex queue` for the
 bound parent. The parent then reads the authoritative result with
-`gpt_subagent_get`; no repeated polling is required.
+`gpt_worker_get`; no repeated polling is required.
 
 Nearby terminal receipts for one parent are coalesced into one queued message.
 The receipt contains only task/run IDs and statuses, never the worker prompt or
@@ -41,10 +61,11 @@ be found, only the callback is disabled; the worker and its durable result still
 operate normally. This release uses the local `codex queue` route and does not
 configure a remote app-server callback.
 
-## Concurrency
+## GPT Worker concurrency
 
-- The default worker ceiling is six. The operator can set
-  `GPT_CONTROL_MAX_PRO_WORKERS` from 1 through 10. Ten is the hard ceiling.
+- The default GPT Worker ceiling is six. The operator can set
+  `GPT_CONTROL_MAX_WORKERS` from 1 through 10. Ten is the hard ceiling. The old
+  `GPT_CONTROL_MAX_PRO_WORKERS` name remains a compatibility alias.
 - Each worker receives a new owned browser session and ChatGPT conversation.
 - A durable global ordering prevents separate broker processes from exceeding
   the configured ceiling.
@@ -63,11 +84,11 @@ configure a remote app-server callback.
 ## One-result discipline
 
 Normal orchestration consumes the original terminal tool/task result. Use
-`gpt_subagent_get` once after reconnect or uncertainty. Do not send model-visible
+`gpt_worker_get` once after reconnect or uncertainty. Do not send model-visible
 “are you done?” prompts: they create extra ChatGPT turns and weaken result
 identity.
 
-## Connector intent
+## GPT Worker connector intent
 
 The optional `connectors` list is included in the hashed provider prompt and
 stored in the durable run. It names connected tools the worker should verify.
@@ -86,7 +107,7 @@ harmless connector result and its source before it accepts the worker output.
 
 ## Cancellation and restart
 
-`tasks/cancel` and `gpt_subagent_cancel` first seal the durable run as cancelled,
+`tasks/cancel` and `gpt_worker_cancel` first seal the durable run as cancelled,
 then seal the task, then attempt to stop the exact browser turn. A crash between
 these steps cannot leave a cancelled task bound to runnable work. A late
 completion is ignored.
@@ -96,11 +117,11 @@ work is observed in the same driver/session/page/conversation with the original
 assistant-turn baseline. A run at an ambiguous send boundary is never
 resubmitted. In a short bounded window immediately after the send click,
 GPT-Control records the first new provider-issued `/c/<id>` URL and user-message
-ID with the run. The first new user turn must match the broker-owned proof. A
-different first turn fails closed, and identity is never adopted after the
-window. Prompt text, hashes, and the visible per-run
-marker are additional checks; they are never enough to adopt a conversation by
-themselves because transcript text can be copied. If the provider-issued
+ID with the run. New 0.4 runs send the assignment as ordinary prompt text with
+no visible automation marker. They bind identity only in that immediate guarded
+send window on the exact owned page; identity is never adopted later from
+transcript text alone. Legacy records that already contain a proof token still
+require its exact prompt-hash match. If the provider-issued
 identity was not durably recorded before a crash, the run fails closed and
 keeps its global worker slot sealed. After manual inspection, an operator can use
 `gpt_run_abandon_pending` with the exact confirmation `ABANDON <run_id>` to

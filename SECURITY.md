@@ -1,6 +1,6 @@
 # Security model
 
-GPT-Control 0.3.2 treats the model-facing tool call, browser page, connected
+GPT-Control 0.4.0 treats the model-facing tool call, browser page, connected
 tools, provider output, attachment paths, child-process output, and recovered
 local state as untrusted.
 
@@ -89,7 +89,7 @@ are rejected.
 
 ## Connected tools
 
-Connector names in a Pro-worker request express intent only. They do not grant
+Connector names in a GPT Worker request express intent only. They do not grant
 permissions or prove availability. Required connectors must be verified by the
 worker; unavailable required connectors produce a blocker. Connector output is
 untrusted evidence and must retain attribution.

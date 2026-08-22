@@ -39,9 +39,12 @@ describe("public extension contract", () => {
 		const root = scratch();
 		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
 		expect(operatorPolicyFromEnv({}, common).maxConcurrentWorkers).toBe(6);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "8" }, common).maxConcurrentWorkers).toBe(8);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "7", GPT_CONTROL_MAX_PRO_WORKERS: "4" }, common).maxConcurrentWorkers).toBe(7);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "6" }, common).maxConcurrentWorkers).toBe(6);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "10" }, common).maxConcurrentWorkers).toBe(10);
 		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");
+		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");
 	});
 
 	test("operator abandonment token rotation does not change execution policy identity", () => {
@@ -53,7 +56,7 @@ describe("public extension contract", () => {
 		expect(first.providerTurnAbandonmentTokenHash).not.toBe(second.providerTurnAbandonmentTokenHash);
 	});
 
-	test("registers image, bounded Pro worker, durable recovery, and split diagnostics", () => {
+	test("registers image, bounded GPT Worker, durable recovery, and split diagnostics", () => {
 		const tools: ToolDefinition[] = [];
 		let label = "";
 		const api: ExtensionAPI = {
@@ -66,8 +69,9 @@ describe("public extension contract", () => {
 		expect(label).toBe("GPT-Control");
 		const names = tools.map((tool) => tool.name);
 		for (const expected of [
-			"gpt_consult", "gpt_chat", "gpt_image", "gpt_subagent_run", "gpt_subagent_get", "gpt_subagent_cancel", "gpt_subagent_list",
+			"gpt_consult", "gpt_chat", "gpt_image", "gpt_models", "gpt_projects", "gpt_worker_run", "gpt_worker_get", "gpt_worker_cancel", "gpt_worker_list",
 			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_attach", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
+			"gpt_conversation_manage",
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");
 		expect(tools.find((tool) => tool.name === "gpt_diagnose_active")?.approval).toBe("exec");
@@ -81,9 +85,11 @@ describe("public extension contract", () => {
 			const properties = ((tool.parameters as { properties?: Record<string, SchemaNode> }).properties ?? {});
 			for (const field of forbidden) expect(properties).not.toHaveProperty(field);
 		}
-		const subagent = tools.find((tool) => tool.name === "gpt_subagent_run")!;
+		const subagent = tools.find((tool) => tool.name === "gpt_worker_run")!;
 		const subagentProperties = (subagent.parameters as { properties: Record<string, SchemaNode> }).properties;
 		expect(subagentProperties).toHaveProperty("idempotency_key");
+		expect(subagentProperties).toHaveProperty("chatgpt_model");
+		expect(subagentProperties).toHaveProperty("chatgpt_effort");
 		expect(subagentProperties).toHaveProperty("connectors");
 		expect(subagentProperties).toHaveProperty("connector_mode");
 		expect(subagentProperties).not.toHaveProperty("conversation_id");
@@ -126,6 +132,7 @@ describe("MCP plugin contract", () => {
 		expect(pluginMcp.mcpServers.gpt_control.command).toBe("node");
 		expect(pluginMcp.mcpServers.gpt_control.args).toEqual(["./dist/gpt-control-mcp.js"]);
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
+		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_MAX_WORKERS");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("CODEX_THREAD_ID");
 		const root = scratch();
 		const { service } = makeChromeService(join(root, "state"), join(root, "workspace"), new FakeChromeBridge());
@@ -139,9 +146,11 @@ describe("MCP plugin contract", () => {
 		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 		try {
 			const listed = await client.listTools();
-			const subagent = listed.tools.find((tool) => tool.name === "gpt_subagent_run");
+			const subagent = listed.tools.find((tool) => tool.name === "gpt_worker_run");
 			expect(subagent?.execution?.taskSupport).toBe("optional");
 			expect(subagent?.inputSchema.required).toContain("idempotency_key");
+			expect(subagent?.inputSchema.properties).toHaveProperty("chatgpt_model");
+			expect(subagent?.inputSchema.properties).toHaveProperty("chatgpt_effort");
 			expect(subagent?.inputSchema.properties).toHaveProperty("connectors");
 			expect(subagent?.inputSchema.properties).toHaveProperty("connector_mode");
 			const properties = subagent?.inputSchema.properties ?? {};
@@ -149,6 +158,9 @@ describe("MCP plugin contract", () => {
 				expect(properties).not.toHaveProperty(field);
 			}
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_image");
+			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_models");
+			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_projects");
+			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_conversation_manage");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_abandon_pending");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_run_claim");
 		} finally {
@@ -218,7 +230,7 @@ describe("MCP plugin contract", () => {
 			const legacyTask = await taskStore.createTask(
 				{ ttl: 60_000 },
 				2,
-				{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+				{ method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never,
 				"mcp-session-a",
 			);
 			await taskStore.bindRun(legacyTask.taskId, legacy.run.id);
@@ -263,7 +275,7 @@ describe("MCP plugin contract", () => {
 			expect((transferredOwnerRead.structuredContent as { runId?: string } | undefined)?.runId).toBe(legacyOrdinary.run.id);
 
 			const fallbackStarted = await clientFallback.callTool({
-				name: "gpt_subagent_run",
+				name: "gpt_worker_run",
 				arguments: { prompt: "taskless fallback owner", idempotency_key: "taskless-fallback-owner", timeout_ms: 1000 },
 			});
 			const fallbackRunId = ((fallbackStarted.structuredContent as { run?: { runId?: string } } | undefined)?.run?.runId)!;

@@ -21,6 +21,10 @@ import {
 	CHATGPT_ORIGIN,
 	canonicalPromptObservationText,
 	providerConversationIdentity,
+	type ChatGptModelCatalog,
+	type ChatGptProjectCatalog,
+	type ChatGptConversationAction,
+	type ChatGptConversationActionResult,
 	type ChatPageObservation,
 } from "./chatgpt";
 import {
@@ -63,6 +67,8 @@ export interface StartRequest {
 	conversationId?: string;
 	transport?: TransportChoice;
 	chatgptModel?: ChatGptModel;
+	chatgptEffort?: string;
+	pinChat?: boolean;
 	/** Retained only to reject false browser provenance from older clients. */
 	providerModel?: string;
 	/** Legacy aliases retained only for safe compatibility checks. */
@@ -116,6 +122,7 @@ interface ProviderTurnResult {
 	providerConversationUrl?: string;
 	providerRunId?: string;
 	observedModel?: string;
+	observedEffort?: string;
 	modelVerified?: boolean;
 	modelEvidenceKind?: "composer_selector";
 	modelVerifiedAt?: string;
@@ -203,6 +210,70 @@ export class GptControlService {
 		});
 		this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
 		this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
+	}
+
+	async listModels(): Promise<ChatGptModelCatalog & { browserDriverId: string }> {
+		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+		const route = selectRoute(capabilities, { transport: "browser" });
+		assertTransportAllowed(this.policy, route.kind);
+		const name = `gpt-control:catalog:${opaqueId("task")}`;
+		const session = await route.driver.create(name, CHATGPT_ORIGIN);
+		const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+		try {
+			const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
+			const catalog = await route.driver.discoverModels(ready.session);
+			return { ...catalog, browserDriverId: route.driver.id };
+		} finally {
+			await route.driver.close(session.sessionId).catch(() => undefined);
+		}
+	}
+
+	async listProjects(): Promise<ChatGptProjectCatalog & { browserDriverId: string }> {
+		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+		const route = selectRoute(capabilities, { transport: "browser" });
+		assertTransportAllowed(this.policy, route.kind);
+		const name = `gpt-control:projects:${opaqueId("task")}`;
+		const session = await route.driver.create(name, CHATGPT_ORIGIN);
+		const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+		try {
+			const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
+			const catalog = await route.driver.discoverProjects(ready.session);
+			return { ...catalog, browserDriverId: route.driver.id };
+		} finally {
+			await route.driver.close(session.sessionId).catch(() => undefined);
+		}
+	}
+
+	async manageConversation(
+		conversationId: string,
+		action: ChatGptConversationAction,
+		mcpSessionId?: string,
+	): Promise<ChatGptConversationActionResult> {
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
+			if (conversation.closedAt) throw new Error(`Conversation ${conversationId} is closed.`);
+			const active = (await this.store.listRuns({ limit: null })).find((run) =>
+				run.conversationId === conversationId && (run.status === "queued" || run.status === "running" || run.providerTurnPending === true));
+			if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; organization changes are refused until it is terminal.`);
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			await assertExactDriverSession(driver, expected);
+			const result = await driver.manageConversation(await driver.show(expected.sessionId), action);
+			if (action.action === "archive") {
+				await driver.close(expected.sessionId);
+				const archivedAt = nowIso();
+				await this.store.updateConversation(conversationId, { closedAt: archivedAt, providerArchivedAt: archivedAt });
+			} else if (action.action === "pin" || action.action === "unpin") {
+				await this.store.updateConversation(conversationId, { providerPinned: action.action === "pin" });
+			} else if (action.action === "rename") {
+				await this.store.updateConversation(conversationId, { providerTitle: result.title });
+			} else if (action.action === "move") {
+				await this.store.updateConversation(conversationId, { providerProject: result.project });
+			}
+			return result;
+		});
 	}
 
 	async start(request: StartRequest, options: StartOptions = {}): Promise<StartResult> {
@@ -701,9 +772,11 @@ export class GptControlService {
 		const id = opaqueId("run");
 		const { prompt, promptProofToken, promptSha256, promptObservationSha256 } = preparedPrompt;
 		const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
+		const chatgptEffort = request.chatgptEffort;
 		const receipt: ReviewReceipt = {
 			provider: conversation.provider,
 			requestedModel: chatgptModel === "pro" ? "Pro" : chatgptModel,
+			...(chatgptEffort ? { requestedEffort: chatgptEffort } : {}),
 			browserDriverId: conversation.browserDriverId,
 			promptSha256,
 			attachments: manifest.files,
@@ -730,6 +803,8 @@ export class GptControlService {
 			attachmentManifest: manifest,
 			submissionState: "not_submitted",
 			requestedChatGptModel: chatgptModel,
+			requestedChatGptEffort: chatgptEffort,
+			pinChatRequested: request.pinChat,
 			timeoutMs: request.timeoutMs,
 			deadlineAt: new Date(Date.now() + request.timeoutMs).toISOString(),
 			idempotencyKeyHash: idempotencyHash,
@@ -744,6 +819,7 @@ export class GptControlService {
 			kind: request.kind,
 			prompt,
 			requestedChatGptModel: chatgptModel,
+			requestedChatGptEffort: chatgptEffort,
 			timeoutMs: request.timeoutMs,
 			createdAt: timestamp,
 		};
@@ -837,7 +913,7 @@ export class GptControlService {
 			if (Number.isFinite(deadline) && Date.now() >= deadline) {
 				await this.store.updateRun(runId, {
 					status: "needs_user", completedAt: nowIso(),
-					error: "The Pro worker exceeded its bounded global admission deadline before a trusted concurrency slot became available.",
+					error: "The GPT Worker exceeded its bounded global admission deadline before a trusted concurrency slot became available.",
 				});
 				return false;
 			}
@@ -895,6 +971,7 @@ export class GptControlService {
 					...run.receipt,
 					model: result.observedModel,
 					observedModel: result.observedModel,
+					observedEffort: result.observedEffort,
 					modelVerified: result.modelVerified ?? false,
 					modelEvidenceKind: result.modelEvidenceKind,
 					modelVerifiedAt: result.modelVerifiedAt,
@@ -975,6 +1052,7 @@ export class GptControlService {
 		let run = originalRun;
 		let baselineCount = run.baselineMessageCount;
 		let observedModel = run.receipt.observedModel;
+		let observedEffort = run.receipt.observedEffort;
 		let modelVerified = run.receipt.modelVerified === true;
 		let modelVerifiedAt = run.receipt.modelVerifiedAt;
 		let modelEvidenceKind = run.receipt.modelEvidenceKind === "composer_selector"
@@ -1009,8 +1087,12 @@ export class GptControlService {
 
 			baselineCount = ready.observation.snapshot.count;
 			const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
-			const selected = await driver.selectModel(ready.session, requestedModel, signal);
+			const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro"
+				? { ...(requestedModel !== "pro" ? { model: requestedModel } : {}), ...(request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {}) }
+				: requestedModel;
+			const selected = await driver.selectModel(ready.session, requestedSelection, signal);
 			observedModel = selected.observedModel;
+			observedEffort = selected.observedEffort;
 			modelVerified = true;
 			modelVerifiedAt = selected.modelVerifiedAt;
 			modelEvidenceKind = selected.modelEvidenceKind;
@@ -1020,6 +1102,8 @@ export class GptControlService {
 					...run.receipt,
 					requestedModel: selected.requestedModel,
 					observedModel,
+					...(selected.requestedEffort ? { requestedEffort: selected.requestedEffort } : {}),
+					...(observedEffort ? { observedEffort } : {}),
 					model: observedModel,
 					modelVerified: true,
 					modelEvidenceKind,
@@ -1028,8 +1112,9 @@ export class GptControlService {
 			});
 			await driver.upload(ready.session, run.attachmentManifest.files.map((file) => file.path), signal);
 			await driver.fill(ready.session, request.prompt, signal);
-			const verified = await driver.verifyModel(ready.session, requestedModel, signal);
+			const verified = await driver.verifyModel(ready.session, requestedSelection, signal);
 			observedModel = verified.observedModel;
+			observedEffort = verified.observedEffort;
 			modelVerifiedAt = verified.modelVerifiedAt;
 			modelEvidenceKind = verified.modelEvidenceKind;
 			run = await this.store.updateRun(run.id, {
@@ -1039,6 +1124,8 @@ export class GptControlService {
 					...run.receipt,
 					requestedModel: verified.requestedModel,
 					observedModel,
+					...(verified.requestedEffort ? { requestedEffort: verified.requestedEffort } : {}),
+					...(observedEffort ? { observedEffort } : {}),
 					model: observedModel,
 					modelVerified: true,
 					modelEvidenceKind,
@@ -1089,7 +1176,7 @@ export class GptControlService {
 					firstNewProviderUserMessageId = observedUserMessageId;
 					if (run.promptProofToken && !this.observationProvesPrompt(run, observation)) {
 						return browserNeedsUser(
-							"The first new provider user turn did not match the broker-owned send-boundary proof. Completion was not attributed to this run.",
+							"The first new provider user turn did not match the legacy broker-owned send-boundary proof. Completion was not attributed to this run.",
 							conversation, run,
 						);
 					}
@@ -1123,6 +1210,22 @@ export class GptControlService {
 					"The bounded send-boundary observation did not provide a matching provider-issued conversation and first new user-message identity. Later transcript text was not adopted.",
 					conversation, run,
 				);
+			}
+			if ((run.kind === "subagent" || run.pinChatRequested === true) && conversation.providerPinned !== true) {
+				try {
+					const currentSession = await driver.show(expected.sessionId, signal);
+					const pinned = await driver.manageConversation(currentSession, { action: "pin" }, signal);
+					if (pinned.pinned !== true) throw new Error("live pin read-back did not report pinned=true");
+					conversation = await this.store.updateConversation(conversation.id, { providerPinned: true });
+				} catch (error) {
+					const warning = `Automatic GPT Worker pinning failed after submission: ${errorMessage(error)}`;
+					run = await this.store.updateRun(run.id, {
+						diagnostics: {
+							...(run.diagnostics ?? {}),
+							organizationWarnings: [...(run.diagnostics?.organizationWarnings ?? []), warning],
+						},
+					});
+				}
 			}
 		} else if (run.submissionState === "submitting" || run.submissionState === "submitted") {
 			if (baselineCount === undefined) {
@@ -1196,7 +1299,7 @@ export class GptControlService {
 		if (outcome.terminalStatus === "needs_user") {
 			await driver.setState(expected.sessionId, "needs_user", signal).catch(() => undefined);
 			return completionOutcomeToProviderResult(driver.id, outcome, {
-				observedModel, modelVerified, modelEvidenceKind, modelVerifiedAt,
+				observedModel, observedEffort, modelVerified, modelEvidenceKind, modelVerifiedAt,
 			});
 		}
 		const snapshot = required(outcome.snapshot, "stable final assistant turn");
@@ -1210,6 +1313,7 @@ export class GptControlService {
 			providerConversationUrl: outcome.providerConversationUrl,
 			providerRunId: snapshot.messageId,
 			observedModel,
+			observedEffort,
 			modelVerified,
 			modelEvidenceKind,
 			modelVerifiedAt,
@@ -1543,6 +1647,7 @@ export class GptControlService {
 			receipt: {
 				...run.receipt,
 				observedModel: result?.observedModel ?? run.receipt.observedModel,
+				observedEffort: result?.observedEffort ?? run.receipt.observedEffort,
 				model: result?.observedModel ?? run.receipt.model,
 				modelVerified: result?.modelVerified ?? run.receipt.modelVerified ?? false,
 				modelEvidenceKind: result?.modelEvidenceKind ?? run.receipt.modelEvidenceKind,
@@ -1568,6 +1673,8 @@ interface NormalizedStartRequest {
 	conversationId?: string;
 	transport: "browser";
 	chatgptModel: ChatGptModel;
+	chatgptEffort?: string;
+	pinChat: boolean;
 	idempotencyKey?: string;
 	connectorIntent?: { names: string[]; mode: "prefer" | "require" };
 	wait: boolean;
@@ -1600,10 +1707,10 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 		throw new Error("The legacy model field may only narrow to live-verified ChatGPT Pro.");
 	}
 	if (request.providerModel) {
-		throw new Error("provider_model cannot establish ChatGPT composer provenance. Use the live verified Pro selector.");
+		throw new Error("provider_model cannot establish ChatGPT composer provenance. Use chatgpt_model with an exact label from gpt_models.");
 	}
 	if (request.transport && request.transport !== "browser") {
-		throw new Error(`Transport ${request.transport} is disabled by the hardened 0.3 broker.`);
+		throw new Error(`Transport ${request.transport} is disabled by the hardened broker.`);
 	}
 	if (request.apiConfirmed) {
 		throw new Error("api_confirmed cannot grant paid-provider authority and no paid fallback is enabled.");
@@ -1611,14 +1718,15 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	if (request.allowFocusSteal) {
 		throw new Error("allow_focus_steal cannot grant browser authority and no focus-stealing fallback is enabled.");
 	}
-	if (request.chatgptModel && request.chatgptModel !== "pro") {
-		throw new Error("The hardened browser contract currently supports only a live-verified ChatGPT Pro selection.");
-	}
+	const chatgptModel = normalizePickerRequest(request.chatgptModel ?? policy.defaultChatGptModel, 128, "chatgpt_model");
+	const chatgptEffort = request.chatgptEffort === undefined
+		? undefined
+		: normalizePickerRequest(request.chatgptEffort, 64, "chatgpt_effort");
 	if (request.kind === "subagent" && request.conversationId) {
-		throw new Error("Each Pro subagent requires an independent owned conversation; conversation_id is not accepted.");
+		throw new Error("Each GPT Worker requires an independent owned conversation; conversation_id is not accepted.");
 	}
 	if (request.kind !== "subagent" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
-		throw new Error("Connector intent is supported only for independent Pro subagents.");
+		throw new Error("Connector intent is supported only for independent GPT Workers.");
 	}
 	const connectorNames = [...new Set((request.connectors ?? []).map((name) => name.trim()))];
 	if (connectorNames.length > 8 || connectorNames.some((name) => !/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/.test(name))) {
@@ -1633,7 +1741,9 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 		files: [...(request.files ?? [])],
 		conversationId: request.conversationId,
 		transport: "browser",
-		chatgptModel: "pro",
+		chatgptModel,
+		chatgptEffort,
+		pinChat: request.kind === "subagent" || request.pinChat === true,
 		idempotencyKey: request.idempotencyKey,
 		connectorIntent,
 		wait: request.wait !== false,
@@ -1651,6 +1761,8 @@ function startRequestHash(request: NormalizedStartRequest): string {
 		conversationId: request.conversationId ?? null,
 		transport: request.transport,
 		chatgptModel: request.chatgptModel,
+		chatgptEffort: request.chatgptEffort,
+		pinChat: request.pinChat,
 		connectorIntent: request.connectorIntent ?? null,
 		timeoutMs: request.timeoutMs,
 	};
@@ -1659,6 +1771,14 @@ function startRequestHash(request: NormalizedStartRequest): string {
 	if (request.allowOutsideWorkspace) value.allowOutsideWorkspace = true;
 	if (request.allowSensitiveFiles) value.allowSensitiveFiles = true;
 	return sha256(JSON.stringify(value));
+}
+
+function normalizePickerRequest(value: string, maxLength: number, field: string): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (!normalized || normalized.length > maxLength || /[\u0000-\u001f\u007f]/.test(normalized)) {
+		throw new Error(`${field} must be a non-empty printable label no longer than ${maxLength} characters.`);
+	}
+	return normalized.toLowerCase() === "pro" ? "pro" : normalized;
 }
 
 function publicPolicy(policy: OperatorPolicy): Record<string, unknown> {
@@ -1687,6 +1807,7 @@ function completionOutcomeToProviderResult(
 	outcome: DriverCompletionOutcome,
 	model: {
 		observedModel?: string;
+		observedEffort?: string;
 		modelVerified: boolean;
 		modelEvidenceKind?: "composer_selector";
 		modelVerifiedAt?: string;
@@ -1700,6 +1821,7 @@ function completionOutcomeToProviderResult(
 		providerConversationId: outcome.providerConversationId,
 		providerConversationUrl: outcome.providerConversationUrl,
 		observedModel: model.observedModel,
+		observedEffort: model.observedEffort,
 		modelVerified: model.modelVerified,
 		modelEvidenceKind: model.modelEvidenceKind,
 		modelVerifiedAt: model.modelVerifiedAt,

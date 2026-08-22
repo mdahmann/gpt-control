@@ -1,7 +1,7 @@
 {
   "name": "gpt-control",
-  "version": "0.3.2",
-  "description": "Hardened signed-in ChatGPT web control with exact conversations, durable runs, and bounded Codex Pro workers",
+  "version": "0.4.0",
+  "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/wolfiesch/gpt-control",

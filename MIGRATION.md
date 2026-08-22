@@ -1,6 +1,6 @@
 # Migration to storage schema v3
 
-GPT-Control 0.3.2 stores state under `~/.gpt-control/v3` by default. Schema v3
+GPT-Control 0.4.0 stores state under `~/.gpt-control/v3` by default. Schema v3
 is intentionally isolated because previous 0.2 and early 0.3 builds both used a
 version-2 marker for incompatible record shapes.
 
@@ -18,7 +18,7 @@ and cancellation semantics cannot be proven under the new contract.
 ## Safe procedure
 
 1. Leave the old state directory unchanged as an archive.
-2. Install 0.3.2 and confirm `gpt_diagnose` reports the expected trusted roots.
+2. Install 0.4.0 and confirm `gpt_diagnose` reports the expected trusted roots.
 3. Start a new disposable run and verify its v3 receipt.
 4. Recreate any desired follow-up as a new explicit prompt. Do not infer an
    exact-conversation continuation from a legacy local session identifier.

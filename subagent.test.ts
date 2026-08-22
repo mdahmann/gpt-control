@@ -35,7 +35,7 @@ async function waitUntil(check: () => boolean | Promise<boolean>, timeoutMs = 20
 	throw new Error("condition did not become true before timeout");
 }
 
-describe("bounded Pro worker scheduler", () => {
+describe("bounded GPT Worker scheduler", () => {
 	test("runs one successful worker in one independently owned tab", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -392,7 +392,7 @@ describe("bounded Pro worker scheduler", () => {
 	test("rejects connector intent on ordinary chats and unsafe connector names", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
-		await expect(service.start({ kind: "chat", prompt: "no", connectors: ["GitHub"] })).rejects.toThrow("only for independent Pro subagents");
+		await expect(service.start({ kind: "chat", prompt: "no", connectors: ["GitHub"] })).rejects.toThrow("only for independent GPT Workers");
 		await expect(service.start({ kind: "subagent", prompt: "no", connectors: ["GitHub\nmalice"] })).rejects.toThrow("Connector names");
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
@@ -596,7 +596,7 @@ async function connectMcp(options: {
 async function collectTask(client: Client, prompt: string, key: string): Promise<Array<Record<string, unknown>>> {
 	const events: Array<Record<string, unknown>> = [];
 	const stream = client.experimental.tasks.callToolStream({
-		name: "gpt_subagent_run",
+		name: "gpt_worker_run",
 		arguments: { prompt, idempotency_key: key, timeout_ms: 1500 },
 	}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 });
 	for await (const event of stream) events.push(event as unknown as Record<string, unknown>);
@@ -614,6 +614,41 @@ function taskIdFrom(events: Array<Record<string, unknown>>): string {
 }
 
 describe("MCP task delivery", () => {
+	test("passes an exact live model and effort into a GPT Worker", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["High", "Pro"],
+		});
+		const harness = await connectMcp({ bridge });
+		try {
+			const stream = harness.client.experimental.tasks.callToolStream({
+				name: "gpt_worker_run",
+				arguments: {
+					prompt: "worker with exact selection",
+					idempotency_key: "worker-exact-selection",
+					chatgpt_model: "GPT-5.6 Sol",
+					chatgpt_effort: "High",
+					timeout_ms: 1500,
+				},
+			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 });
+			const events: Array<Record<string, unknown>> = [];
+			for await (const event of stream) events.push(event as unknown as Record<string, unknown>);
+			const result = resultEvents(events)[0]?.result.structuredContent as { run?: { receipt?: Record<string, unknown> } };
+			expect(result.run?.receipt).toMatchObject({
+				requestedModel: "GPT-5.6 Sol",
+				observedModel: "GPT-5.6 Sol",
+				requestedEffort: "High",
+				observedEffort: "High",
+			});
+			expect(bridge.submittedPrompts).toEqual(["worker with exact selection"]);
+		} finally {
+			await harness.close();
+		}
+	});
+
 	test("exposes exact existing-conversation attachment through the public MCP tools", async () => {
 		const harness = await connectMcp();
 		try {
@@ -653,7 +688,7 @@ describe("MCP task delivery", () => {
 	test("isolates task listing, reads, results, and cancellation by MCP session", async () => {
 		const root = scratch();
 		const store = new DurableTaskStore(join(root, "mcp-tasks"));
-		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const request = { method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never;
 		const taskA = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
 		const taskB = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
 		await store.storeTaskResult(taskA.taskId, "completed", { content: [{ type: "text", text: "owned result" }] });
@@ -679,7 +714,7 @@ describe("MCP task delivery", () => {
 			timeoutMs: 1000,
 		}, { deferExecution: true });
 		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
-		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const request = { method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never;
 		const taskA = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
 		const taskB = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
 		await store.bindRun(taskA.taskId, prepared.run.id);
@@ -701,7 +736,7 @@ describe("MCP task delivery", () => {
 			wait: false,
 		}, { deferExecution: true });
 		const store = new DurableTaskStore(join(root, "state", "mcp-tasks"), service.store);
-		const request = { method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never;
+		const request = { method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never;
 		const cancelledTask = await store.createTask({ ttl: 60_000 }, 1, request, "session-a");
 		const ownerTask = await store.createTask({ ttl: 60_000 }, 2, request, "session-b");
 		await store.bindRun(ownerTask.taskId, prepared.run.id);
@@ -743,7 +778,7 @@ describe("MCP task delivery", () => {
 		const task = await store.createTask(
 			{ ttl: 60_000 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never,
 			"session-a",
 		);
 		await store.updateTaskStatus(task.taskId, "cancelled", "cancel won before binding", "session-a");
@@ -795,9 +830,9 @@ describe("MCP task delivery", () => {
 			expect(calls[0].command).toBe("/trusted/bin/codex");
 			expect(calls[0].args.slice(0, 4)).toEqual(["queue", "--thread", threadId, "--message"]);
 			const message = calls[0].args[4] ?? "";
-			expect(message).toContain("A ChatGPT Pro worker finished");
+			expect(message).toContain("A GPT worker finished");
 			expect(message).toContain(taskId);
-			expect(message).toContain("gpt_subagent_get");
+			expect(message).toContain("gpt_worker_get");
 			expect(message).not.toContain("wake the parent");
 		} finally {
 			await harness.close();
@@ -855,7 +890,7 @@ describe("MCP task delivery", () => {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 			expect(calls).toHaveLength(1);
 			const message = calls[0].args[4] ?? "";
-			expect(message).toContain("2 ChatGPT Pro workers finished");
+			expect(message).toContain("2 GPT workers finished");
 			expect(message).toContain(taskIdFrom(completed[0]));
 			expect(message).toContain(taskIdFrom(completed[1]));
 		} finally {
@@ -981,7 +1016,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: {} } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: {} } } as never,
 		);
 		await first.service.store.claimMcpTask(prepared.run.id, task.taskId);
 		expect(await taskStore.getRunId(task.taskId)).toBeUndefined();
@@ -1010,7 +1045,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "cancel-crash-restart" } } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "cancel-crash-restart" } } } as never,
 		);
 		await taskStore.bindRun(task.taskId, prepared.run.id);
 		await first.service.store.updateRun(prepared.run.id, { mcpTaskId: task.taskId });
@@ -1047,7 +1082,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			tasks.push(await taskStore.createTask(
 				{ ttl: 60_000, pollInterval: 100 },
 				index + 1,
-				{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: `pagination-${index}` } } } as never,
+				{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: `pagination-${index}` } } } as never,
 			));
 		}
 		const target = tasks.slice().sort((a, b) => a.taskId.localeCompare(b.taskId)).at(-1)!;
@@ -1091,7 +1126,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "cancelled-provider-stop-retry" } } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "cancelled-provider-stop-retry" } } } as never,
 		);
 		await taskStore.bindRun(task.taskId, started.run.id);
 		await taskStore.updateTaskStatus(task.taskId, "cancelled", "cancel before stop listener");
@@ -1173,7 +1208,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect(abandoned.providerTurnAbandonedAt).toBeDefined();
 	});
 
-	test("uses the final broker proof marker when caller text quotes marker syntax", async () => {
+	test("treats caller text resembling a legacy proof marker as ordinary prompt text", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const started = await service.start({
@@ -1312,7 +1347,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "completion-wins-cancel-race" } } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "completion-wins-cancel-race" } } } as never,
 		);
 		await taskStore.bindRun(task.taskId, completed.run.id);
 
@@ -1328,7 +1363,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const harness = await connectMcp({ bridge: new FakeChromeBridge({ firstTabRaceReads: 20 }) });
 		try {
 			const iterator = harness.client.experimental.tasks.callToolStream({
-				name: "gpt_subagent_run",
+				name: "gpt_worker_run",
 				arguments: { prompt: "must never submit", idempotency_key: "cancel-before-submit", timeout_ms: 1500 },
 			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
 			const created = await iterator.next();
@@ -1350,7 +1385,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const harness = await connectMcp();
 		try {
 			const iterator = harness.client.experimental.tasks.callToolStream({
-				name: "gpt_subagent_run",
+				name: "gpt_worker_run",
 				arguments: { prompt: "[slow] protocol cancel", idempotency_key: "protocol-cancel", timeout_ms: 1500 },
 			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
 			const created = await iterator.next();
@@ -1374,7 +1409,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const harness = await connectMcp({ bridge: new FakeChromeBridge({ sendDelayMs: 500 }) });
 		try {
 			const iterator = harness.client.experimental.tasks.callToolStream({
-				name: "gpt_subagent_run",
+				name: "gpt_worker_run",
 				arguments: { prompt: "must abort before click", idempotency_key: "cancel-in-flight-send", timeout_ms: 1500 },
 			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
 			const created = await iterator.next();
@@ -1398,7 +1433,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const root = scratch();
 		const harness = await connectMcp({ root });
 		const iterator = harness.client.experimental.tasks.callToolStream({
-			name: "gpt_subagent_run",
+			name: "gpt_worker_run",
 			arguments: { prompt: "[slow] reconnect", idempotency_key: "reconnect", timeout_ms: 2000 },
 		}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
 		const created = await iterator.next();
@@ -1445,7 +1480,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "restart-worker" } } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "restart-worker" } } } as never,
 		);
 		await taskStore.bindRun(task.taskId, started.run.id);
 		await first.service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
@@ -1501,7 +1536,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const task = await taskStore.createTask(
 			{ ttl: 60_000, pollInterval: 100 },
 			1,
-			{ method: "tools/call", params: { name: "gpt_subagent_run", arguments: { idempotency_key: "ambiguous-conversation-recovery" } } } as never,
+			{ method: "tools/call", params: { name: "gpt_worker_run", arguments: { idempotency_key: "ambiguous-conversation-recovery" } } } as never,
 		);
 		await taskStore.bindRun(task.taskId, started.run.id);
 		await second.service.store.updateRun(started.run.id, { mcpTaskId: task.taskId });
@@ -1600,7 +1635,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		const harness = await connectMcp({ taskSupport: false, clientTasks: false });
 		try {
 			const result = await harness.client.callTool({
-				name: "gpt_subagent_run",
+				name: "gpt_worker_run",
 				arguments: {
 					prompt: "fallback worker",
 					idempotency_key: "fallback-worker",

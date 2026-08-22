@@ -1,7 +1,7 @@
 {
   "name": "gpt-control",
-  "version": "0.3.2",
-  "description": "Hardened signed-in ChatGPT web control with exact conversations, durable runs, and bounded Codex Pro workers.",
+  "version": "0.4.0",
+  "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents.",
   "author": {
     "name": "GPT-Control contributors"
   },
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "GPT-Control",
-    "shortDescription": "Run exact, durable ChatGPT Pro web workers from Codex",
-      "longDescription": "Use Codex as the orchestrator for signed-in ChatGPT web reviews, exact conversation follow-ups, image work, and durable Pro workers with a default ceiling of six and an operator ceiling of ten.",
+    "shortDescription": "Use GPT Chat, Workers, and Sub-agents from Codex",
+    "longDescription": "Use Codex as the orchestrator for signed-in GPT Chat, exact conversation follow-ups, durable background GPT Workers, and native Codex GPT Sub-agents. Select live ChatGPT models and effort levels per run.",
     "developerName": "GPT-Control contributors",
     "category": "Developer Tools",
     "capabilities": [
@@ -31,8 +31,9 @@
     ],
     "websiteURL": "https://github.com/wolfiesch/gpt-control",
     "defaultPrompt": [
-      "Start an independent ChatGPT Pro worker for this bounded task and return its completion or blocker.",
-      "Ask ChatGPT Pro to review these files, then verify every cited finding locally.",
+      "Start a GPT Chat and send this exact message.",
+      "Start a GPT Worker for this bounded task with GPT-5.6 Sol at High effort.",
+      "Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete.",
       "Continue the exact GPT-Control conversation without creating or resubmitting a replacement turn."
     ],
     "screenshots": []

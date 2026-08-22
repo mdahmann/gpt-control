@@ -127,6 +127,114 @@ describe("observed Chrome failures", () => {
 });
 
 describe("truthful composer model provenance", () => {
+	test("discovers the live underlying models and effort levels without sending", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5", "o3"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:catalog", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog).toMatchObject({
+			currentModel: "GPT-5.6 Sol",
+			currentEffort: "Pro",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.5" }, { label: "o3" }],
+			efforts: [{ label: "Instant" }, { label: "Medium" }, { label: "High" }, { label: "Extra High" }, { label: "Pro" }],
+		});
+		expect(bridge.submittedPrompts).toEqual([]);
+		const pickerRowClicks = bridge.privateRequests.filter((request) => request.action === "click" && /picker-(model|effort)/.test(String(request.payload.selector)));
+		expect(pickerRowClicks.length).toBeGreaterThanOrEqual(2);
+		expect(pickerRowClicks.every((request) => request.payload.expectedTarget !== undefined)).toBe(true);
+		const pickerKeyRequests = bridge.privateRequests.filter((request) => request.action === "press" && request.payload.key === "ArrowLeft");
+		expect(pickerKeyRequests).toHaveLength(1);
+		expect(pickerKeyRequests[0].payload.expectedTarget).toBeUndefined();
+		expect(bridge.privateRequests.filter((request) => request.action === "ping").length).toBeGreaterThanOrEqual(2);
+	});
+
+	test("ignores a retained inactive advanced picker before opening the live picker", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			retainedInactiveAdvancedView: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:inactive-picker", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog.currentModel).toBe("GPT-5.6 Sol");
+		expect(catalog.currentEffort).toBe("Pro");
+		expect(catalog.models.map((option) => option.label)).toEqual(["GPT-5.6 Sol", "GPT-5.5"]);
+		expect(bridge.privateRequests.some((request) => request.action === "click" && String(request.payload.selector).includes("Show advanced options"))).toBe(true);
+	});
+
+	test("reuses the proven advanced rows when the composer label is transiently hidden by a submenu", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			hideComposerModelWhenSubmenuOpen: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:transient-composer-label", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog.models.map((option) => option.label)).toEqual(["GPT-5.6 Sol", "GPT-5.5"]);
+		expect(catalog.efforts.map((option) => option.label)).toEqual(["High", "Pro"]);
+	});
+
+	test("waits for the model pill after the fresh composer becomes ready", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			modelSelectorDelayReads: 4,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol"],
+			availableEfforts: ["High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:delayed-model-pill", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog.currentModel).toBe("GPT-5.6 Sol");
+		expect(catalog.currentEffort).toBe("Pro");
+	});
+
+	test("switches the underlying model and effort and verifies both before sending", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "use exact live selection",
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "High",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.receipt).toMatchObject({
+			requestedModel: "GPT-5.6 Sol",
+			observedModel: "GPT-5.6 Sol",
+			requestedEffort: "High",
+			observedEffort: "High",
+			modelVerified: true,
+		});
+		expect(bridge.submittedPrompts).toEqual(["use exact live selection"]);
+	});
+
 	test("records already-selected Pro from the actual composer selector", async () => {
 		const bridge = new FakeChromeBridge({ initialModel: "Pro" });
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -167,6 +275,11 @@ describe("truthful composer model provenance", () => {
 	test("accepts the current composer Pro pill without adopting the account plan label", () => {
 		const observation = extractComposerModel('<main><button aria-label="Miles Pro, open profile menu">Miles Pro</button><form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button id="radix-model-live" aria-haspopup="menu"><span>Pro</span></button></form></main>');
 		expect(observation).toMatchObject({ label: "Pro", normalized: "pro", selector: '[id="radix-model-live"]' });
+	});
+
+	test("accepts the current fresh-chat Pro pill in the live composer layout", () => {
+		const observation = extractComposerModel('<main><form class="group/composer"><div class="composer-shell"><div id="prompt-textarea" contenteditable="true"></div><div class="trailing"><button id="radix-fresh-model" aria-haspopup="menu" aria-expanded="false"><span class="uFxlGa_SliderTriggerChatSelectionLabel">Pro</span></button></div></div></form></main>');
+		expect(observation).toMatchObject({ label: "Pro", normalized: "pro", selector: '[id="radix-fresh-model"]' });
 	});
 
 	test("does not accept an Upgrade to Pro action as selected-model evidence", () => {
@@ -232,6 +345,43 @@ describe("truthful composer model provenance", () => {
 		expect(result.run.status).toBe("failed");
 		expect(result.run.error).toContain("changed before send");
 		expect(bridge.submittedPrompts).toEqual([]);
+	});
+});
+
+describe("ChatGPT organization controls", () => {
+	test("pins a direct GPT Worker as soon as its exact provider conversation exists", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({ kind: "subagent", prompt: "visible worker", timeoutMs: 1000 });
+		expect(started.run.status).toBe("completed");
+		expect((await service.store.getConversation(started.conversation.id)).providerPinned).toBe(true);
+	});
+
+	test("pins an ordinary chat only when requested", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({ kind: "chat", prompt: "pin this chat", pinChat: true, timeoutMs: 1000 });
+		expect((await service.store.getConversation(started.conversation.id)).providerPinned).toBe(true);
+	});
+
+	test("discovers the live project names without sending a prompt", async () => {
+		const bridge = new FakeChromeBridge({ availableProjects: ["Health", "Zenbox", "Sequence"] });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.listProjects();
+		expect(result.projects).toEqual([{ name: "Health" }, { name: "Zenbox" }, { name: "Sequence" }]);
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("pins, renames, moves, and archives one exact owned conversation with read-back", async () => {
+		const bridge = new FakeChromeBridge({ availableProjects: ["Zenbox", "Sequence"] });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({ kind: "chat", prompt: "organization target", timeoutMs: 1000 });
+		const conversationId = started.conversation.id;
+		expect(await service.manageConversation(conversationId, { action: "pin" })).toMatchObject({ pinned: true });
+		expect(await service.manageConversation(conversationId, { action: "rename", title: "Controlled greeting" })).toMatchObject({ title: "Controlled greeting" });
+		expect(await service.manageConversation(conversationId, { action: "move", project: "Zenbox" })).toMatchObject({ project: "Zenbox" });
+		expect(await service.manageConversation(conversationId, { action: "archive" })).toMatchObject({ archived: true });
+		expect((await service.store.getConversation(conversationId)).closedAt).toBeDefined();
 	});
 });
 

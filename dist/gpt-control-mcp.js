@@ -29319,7 +29319,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.3.2";
+var PACKAGE_VERSION = "0.4.0";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33761,7 +33761,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.3.2";
+var PACKAGE_VERSION2 = "0.4.0";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -34054,7 +34054,7 @@ function extractComposerModel(html) {
         const aria = (button.getAttribute("aria-label") ?? "").toLowerCase();
         const testId = (button.getAttribute("data-testid") ?? "").toLowerCase();
         const visibleModel = normalizeModelLabel(cleanModelLabel(nodeLabel(button)));
-        return button.getAttribute("aria-haspopup") === "menu" && (aria.includes("model") || aria.includes("intelligence") || testId.includes("model") || ["pro", "auto", "instant", "thinking"].includes(visibleModel));
+        return button.getAttribute("aria-haspopup") === "menu" && (aria.includes("model") || aria.includes("intelligence") || testId.includes("model") || ["pro", "auto", "instant", "medium", "high", "extra high", "thinking"].includes(visibleModel));
       });
     }
   }
@@ -34068,7 +34068,94 @@ function extractComposerModel(html) {
   }
   return [...unique.values()][0];
 }
+async function discoverChatGptModels(exec, launcher, tabId, signal, timeoutMs = 30000, expectedTarget) {
+  const state = await openAdvancedPicker(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+  const models = state.modelSelector ? await openPickerOptions(exec, launcher, tabId, state.modelSelector, Date.now() + timeoutMs, signal, expectedTarget) : [];
+  if (models.length > 0) {
+    await pressPickerKey(exec, launcher, tabId, "ArrowLeft", signal, expectedTarget);
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  let effortState = state;
+  let efforts = effortState.effortSelector ? await openPickerOptions(exec, launcher, tabId, effortState.effortSelector, Date.now() + Math.min(timeoutMs, 5000), signal, expectedTarget) : [];
+  if (efforts.length === 0 && state.effortSelector) {
+    await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+    effortState = await openAdvancedPicker(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+    efforts = effortState.effortSelector ? await openPickerOptions(exec, launcher, tabId, effortState.effortSelector, Date.now() + timeoutMs, signal, expectedTarget) : [];
+  }
+  await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+  if (models.length === 0 && efforts.length === 0) {
+    throw new Error("ChatGPT model and effort options are unavailable in the live composer picker.");
+  }
+  return {
+    currentModel: effortState.currentModel ?? state.currentModel,
+    currentEffort: effortState.currentEffort ?? state.currentEffort,
+    models,
+    efforts,
+    discoveredAt: nowIso()
+  };
+}
+async function discoverChatGptProjects(exec, launcher, tabId, signal, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;; ) {
+    const projects = extractChatGptProjects(await readPageHtml(exec, launcher, tabId, signal));
+    if (projects.length > 0)
+      return { projects: projects.map((name) => ({ name })), discoveredAt: nowIso() };
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("ChatGPT projects are unavailable in the live sidebar.");
+}
+async function manageChatGptConversation(exec, launcher, tabId, action, signal, timeoutMs = 30000, expectedTarget) {
+  const identity = providerConversationIdentity(expectedTarget?.url ?? await tabUrl(exec, launcher, tabId, signal) ?? "");
+  if (!identity)
+    throw new Error("ChatGPT organization requires one exact /c/<id> conversation.");
+  const deadline = Date.now() + timeoutMs;
+  if (action.action === "rename") {
+    const title = normalizeManagementLabel(action.title, 128, "title");
+    const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
+    await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
+    await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
+    await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
+    await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
+    await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
+    await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
+    return { title, verifiedAt: nowIso() };
+  }
+  await openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+  if (action.action === "move") {
+    const project = normalizeManagementLabel(action.project, 128, "project");
+    await clickLiveMenuItem(exec, launcher, tabId, "Move to project", deadline, signal, expectedTarget);
+    const option = await waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal);
+    await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+    await waitForProjectReadback(exec, launcher, tabId, identity.id, project, deadline, signal);
+    return { project, verifiedAt: nowIso() };
+  }
+  if (action.action === "archive") {
+    await clickLiveMenuItem(exec, launcher, tabId, "Archive", deadline, signal, expectedTarget);
+    await waitForArchiveReadback(exec, launcher, tabId, identity.url, deadline, signal);
+    return { archived: true, verifiedAt: nowIso() };
+  }
+  const desired = action.action === "pin";
+  const already = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+  if (already !== desired) {
+    await clickLiveMenuItem(exec, launcher, tabId, desired ? "Pin chat" : "Unpin chat", deadline, signal, expectedTarget);
+  }
+  for (;; ) {
+    const pinned = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+    if (pinned === desired)
+      return { pinned, verifiedAt: nowIso() };
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT ${action.action} read-back failed for ${identity.url}.`);
+}
 async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, signal, timeoutMs = 30000, expectedTarget) {
+  if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
+    return selectAndVerifyDynamicSelection(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, timeoutMs, expectedTarget);
+  }
+  const requestedPreset = "pro";
   const deadline = Date.now() + timeoutMs;
   let observed;
   for (;; ) {
@@ -34079,7 +34166,7 @@ async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, sig
   }
   if (!observed)
     throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
-  if (observed.normalized !== requested) {
+  if (observed.normalized !== requestedPreset) {
     if (expectedTarget)
       await privateBridgeJson(exec, launcher, "click", { tabId, selector: observed.selector, expectedTarget }, signal);
     else
@@ -34089,11 +34176,11 @@ async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, sig
     let effortPickerOpened = false;
     for (;; ) {
       const html = await readPageHtml(exec, launcher, tabId, signal);
-      const options = extractModelOptions(html, requested);
+      const options = extractModelOptions(html, requestedPreset);
       optionCount = options.length;
       if (optionCount > 0) {
         if (optionCount !== 1)
-          throw new Error(`Requested ChatGPT model ${requested} is ambiguous in the live selector.`);
+          throw new Error(`Requested ChatGPT model ${requestedPreset} is ambiguous in the live selector.`);
         option = options[0];
         break;
       }
@@ -34126,43 +34213,148 @@ async function selectAndVerifyChatGptModel(exec, launcher, tabId, requested, sig
       await sleep(Math.min(pollIntervalMs(), 200));
     }
     if (!option)
-      throw new Error(`Requested ChatGPT model ${requested} is unavailable in the live composer selector. No prompt was sent.`);
+      throw new Error(`Requested ChatGPT model ${requestedPreset} is unavailable in the live composer selector. No prompt was sent.`);
     if (expectedTarget)
       await privateBridgeJson(exec, launcher, "click", { tabId, selector: option.selector, expectedTarget }, signal);
     else
       await bridgeJson(exec, launcher, ["click", String(tabId), option.selector], signal);
     for (;; ) {
       observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
-      if (observed?.normalized === requested)
+      if (observed?.normalized === requestedPreset)
         break;
       if (Date.now() >= deadline) {
-        throw new Error(`ChatGPT model selector read-back mismatch: requested ${requested}, observed ${observed?.label ?? "unreadable"}. No prompt was sent.`);
+        throw new Error(`ChatGPT model selector read-back mismatch: requested ${requestedPreset}, observed ${observed?.label ?? "unreadable"}. No prompt was sent.`);
       }
       await sleep(Math.min(pollIntervalMs(), 200));
     }
   }
   return {
-    requestedModel: requested === "pro" ? "Pro" : requested,
+    requestedModel: "Pro",
     observedModel: observed.label,
     modelVerified: true,
     modelEvidenceKind: "composer_selector",
     modelVerifiedAt: nowIso()
   };
 }
-async function verifyChatGptModelBeforeSend(exec, launcher, tabId, requested, signal) {
+async function verifyChatGptModelBeforeSend(exec, launcher, tabId, requested, signal, expectedTarget) {
+  if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
+    return verifyDynamicSelectionBeforeSend(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, expectedTarget);
+  }
+  const requestedPreset = "pro";
   const observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
   if (!observed)
     throw new Error("ChatGPT composer model selector disappeared before send. No prompt was sent.");
-  if (observed.normalized !== requested) {
-    throw new Error(`ChatGPT model changed before send: requested ${requested}, observed ${observed.label}. No prompt was sent.`);
+  if (observed.normalized !== requestedPreset) {
+    throw new Error(`ChatGPT model changed before send: requested ${requestedPreset}, observed ${observed.label}. No prompt was sent.`);
   }
   return {
-    requestedModel: requested === "pro" ? "Pro" : requested,
+    requestedModel: "Pro",
     observedModel: observed.label,
     modelVerified: true,
     modelEvidenceKind: "composer_selector",
     modelVerifiedAt: nowIso()
   };
+}
+function normalizeRequestedSelection(requested) {
+  const selection = typeof requested === "string" ? { model: requested } : requested;
+  const model = selection.model?.replace(/\s+/g, " ").trim();
+  const effort = selection.effort?.replace(/\s+/g, " ").trim();
+  if (!model && !effort)
+    throw new Error("A ChatGPT model or effort selection is required.");
+  if ((model?.length ?? 0) > 128 || (effort?.length ?? 0) > 64)
+    throw new Error("ChatGPT model or effort label is too long.");
+  return { ...model ? { model } : {}, ...effort ? { effort } : {} };
+}
+async function selectAndVerifyDynamicSelection(exec, launcher, tabId, requested, signal, timeoutMs = 30000, expectedTarget) {
+  const catalog = await discoverChatGptModels(exec, launcher, tabId, signal, timeoutMs, expectedTarget);
+  const requestedModel = requested.model ? exactCatalogLabel(catalog.models, requested.model, "model") : undefined;
+  const requestedEffort = requested.effort ? exactCatalogLabel(catalog.efforts, requested.effort, "effort") : undefined;
+  if (requestedModel && normalizePickerLabel(catalog.currentModel) !== normalizePickerLabel(requestedModel)) {
+    await selectAdvancedPickerValue(exec, launcher, tabId, "model", requestedModel, Date.now() + timeoutMs, signal, expectedTarget);
+  }
+  let current = await readAdvancedPickerState(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+  if (requestedEffort && normalizePickerLabel(current.currentEffort) !== normalizePickerLabel(requestedEffort)) {
+    await selectAdvancedPickerValue(exec, launcher, tabId, "effort", requestedEffort, Date.now() + timeoutMs, signal, expectedTarget);
+    current = await readAdvancedPickerState(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
+  }
+  const observedModel = current.currentModel ?? catalog.currentModel;
+  const observedEffort = current.currentEffort ?? catalog.currentEffort;
+  assertSelectionReadback(requestedModel, requestedEffort, observedModel, observedEffort, "read-back mismatch");
+  await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
+  return {
+    requestedModel: requestedModel ?? observedModel ?? "current live model",
+    observedModel: observedModel ?? "current live model",
+    ...requestedEffort ? { requestedEffort } : {},
+    ...observedEffort ? { observedEffort } : {},
+    modelVerified: true,
+    modelEvidenceKind: "composer_selector",
+    modelVerifiedAt: nowIso()
+  };
+}
+async function verifyDynamicSelectionBeforeSend(exec, launcher, tabId, requested, signal, expectedTarget) {
+  const deadline = Date.now() + 1e4;
+  const current = await readAdvancedPickerState(exec, launcher, tabId, deadline, signal, expectedTarget);
+  try {
+    assertSelectionReadback(requested.model, requested.effort, current.currentModel, current.currentEffort, "changed before send");
+  } finally {
+    await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+      return;
+    });
+  }
+  return {
+    requestedModel: requested.model ?? current.currentModel ?? "current live model",
+    observedModel: current.currentModel ?? "current live model",
+    ...requested.effort ? { requestedEffort: requested.effort } : {},
+    ...current.currentEffort ? { observedEffort: current.currentEffort } : {},
+    modelVerified: true,
+    modelEvidenceKind: "composer_selector",
+    modelVerifiedAt: nowIso()
+  };
+}
+async function readAdvancedPickerState(exec, launcher, tabId, deadline, signal, expectedTarget) {
+  return openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+}
+async function selectAdvancedPickerValue(exec, launcher, tabId, kind, requested, deadline, signal, expectedTarget) {
+  const state = await openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+  const rowSelector = kind === "model" ? state.modelSelector : state.effortSelector;
+  if (!rowSelector)
+    throw new Error(`ChatGPT ${kind} picker is unavailable. No prompt was sent.`);
+  await pickerAction(exec, launcher, "click", tabId, rowSelector, signal, expectedTarget);
+  for (;; ) {
+    const options = extractPickerRadioOptions(await readPageHtml(exec, launcher, tabId, signal), rowSelector);
+    const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+    if (matches.length > 1)
+      throw new Error(`Requested ChatGPT ${kind} ${requested} is ambiguous in the live selector. No prompt was sent.`);
+    if (matches.length === 1) {
+      await pickerAction(exec, launcher, "click", tabId, matches[0].selector, signal, expectedTarget);
+      return;
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`Requested ChatGPT ${kind} ${requested} is unavailable in the live selector. No prompt was sent.`);
+}
+function exactCatalogLabel(options, requested, kind) {
+  const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+  if (matches.length === 0) {
+    const observed = options.length > 0 ? options.map((option) => option.label).join(", ") : "none";
+    throw new Error(`Requested ChatGPT ${kind} ${requested} is unavailable in the live selector (observed: ${observed}). No prompt was sent.`);
+  }
+  if (matches.length > 1)
+    throw new Error(`Requested ChatGPT ${kind} ${requested} is ambiguous in the live selector. No prompt was sent.`);
+  return matches[0].label;
+}
+function assertSelectionReadback(requestedModel, requestedEffort, observedModel, observedEffort, reason) {
+  if (requestedModel && normalizePickerLabel(requestedModel) !== normalizePickerLabel(observedModel)) {
+    throw new Error(`ChatGPT model ${reason}: requested ${requestedModel}, observed ${observedModel ?? "unreadable"}. No prompt was sent.`);
+  }
+  if (requestedEffort && normalizePickerLabel(requestedEffort) !== normalizePickerLabel(observedEffort)) {
+    throw new Error(`ChatGPT effort ${reason}: requested ${requestedEffort}, observed ${observedEffort ?? "unreadable"}. No prompt was sent.`);
+  }
+}
+function normalizePickerLabel(value) {
+  return (value ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 var IMAGE_HOSTS = ["oaiusercontent.com", "files.openai.com"];
 function approvedImageUrl(raw) {
@@ -34392,6 +34584,281 @@ function providerConversationIdentity(raw) {
   if (!match)
     return;
   return { id: match[1], url: `${url2.origin}/c/${match[1]}` };
+}
+async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget) {
+  let html = await readPageHtml(exec, launcher, tabId, signal);
+  let composer = extractComposerModel(html);
+  while (!composer && Date.now() < deadline) {
+    await sleep(Math.min(pollIntervalMs(), 200));
+    html = await readPageHtml(exec, launcher, tabId, signal);
+    composer = extractComposerModel(html);
+  }
+  if (!composer)
+    throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
+  let state = extractAdvancedPickerState(html, composer.selector);
+  if (!state) {
+    await pickerAction(exec, launcher, "click", tabId, composer.selector, signal, expectedTarget);
+  }
+  for (;; ) {
+    html = await readPageHtml(exec, launcher, tabId, signal);
+    state = extractAdvancedPickerState(html, composer.selector);
+    if (state?.modelSelector || state?.effortSelector)
+      return state;
+    const controls = extractCurrentEffortPickerControls(html);
+    if (controls?.advancedSelector) {
+      await pickerAction(exec, launcher, "click", tabId, controls.advancedSelector, signal, expectedTarget);
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
+}
+async function openPickerOptions(exec, launcher, tabId, selector, deadline, signal, expectedTarget) {
+  await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
+  for (;; ) {
+    const options = extractPickerRadioOptions(await readPageHtml(exec, launcher, tabId, signal), selector);
+    if (options.length > 0)
+      return options.map(({ label, note }) => ({ label, ...note ? { note } : {} }));
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  return [];
+}
+async function closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget) {
+  for (let attempt = 0;attempt < 2; attempt += 1) {
+    await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget);
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+}
+async function dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget) {
+  if (expectedTarget) {
+    await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+    await privateBridgeJson(exec, launcher, "press", { tabId, key: "Escape" }, signal);
+    await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+    return;
+  }
+  await bridgeJson(exec, launcher, ["press", String(tabId), "Escape"], signal);
+}
+async function pressPickerKey(exec, launcher, tabId, key, signal, expectedTarget) {
+  if (expectedTarget) {
+    await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+    await privateBridgeJson(exec, launcher, "press", { tabId, key }, signal);
+    await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+    return;
+  }
+  await bridgeJson(exec, launcher, ["press", String(tabId), key], signal);
+}
+async function pickerAction(exec, launcher, action, tabId, selector, signal, expectedTarget) {
+  if (expectedTarget) {
+    await privateBridgeJson(exec, launcher, action, { tabId, selector, expectedTarget }, signal);
+    return;
+  }
+  await bridgeJson(exec, launcher, [action, String(tabId), selector], signal);
+}
+function extractAdvancedPickerState(html, composerSelector) {
+  const root = parse6(html);
+  const active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+  if (!active)
+    return;
+  const rows = active.querySelectorAll('[role="menuitem"]');
+  const model = rows.find((node) => /^Model(?:\s|$)/i.test(nodeLabel(node)));
+  const effort = rows.find((node) => /^Effort(?:\s|$)/i.test(nodeLabel(node)));
+  if (!model && !effort)
+    return;
+  return {
+    currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
+    currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
+    modelSelector: model ? exactNodeSelector(model) : undefined,
+    effortSelector: effort ? exactNodeSelector(effort) : undefined,
+    composerSelector
+  };
+}
+function pickerRowValue(label, prefix) {
+  const value = label.replace(new RegExp(`^${prefix}\\s*`, "i"), "").trim();
+  return value || undefined;
+}
+function extractPickerRadioOptions(html, ownerSelector) {
+  const root = parse6(html);
+  const ownerId = ownerSelector ? /^\[id="((?:[^"\\]|\\.)+)"\]$/.exec(ownerSelector)?.[1] : undefined;
+  return uniqueElements([
+    ...root.querySelectorAll('[role="menuitemradio"]'),
+    ...root.querySelectorAll('[role="option"]')
+  ]).filter((node) => {
+    if (!ownerId)
+      return true;
+    return node.closest('[role="menu"]')?.getAttribute("aria-labelledby") === ownerId;
+  }).map((node) => {
+    const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+    const label = cleanPickerOptionLabel(node.getAttribute("aria-label") ?? lines[0] ?? nodeLabel(node));
+    const full = nodeLabel(node);
+    const note = lines.slice(1).join(" ") || (full.startsWith(label) ? full.slice(label.length).trim() : "");
+    return {
+      label,
+      selector: exactNodeSelector(node) ?? "",
+      ...note ? { note } : {}
+    };
+  }).filter((option) => Boolean(option.label && option.selector));
+}
+function extractChatGptProjects(html) {
+  const root = parse6(html);
+  const names = root.querySelectorAll('button[aria-label^="Open project options for "]').map((node) => (node.getAttribute("aria-label") ?? "").replace(/^Open project options for\s+/i, "").trim()).filter(Boolean);
+  return [...new Set(names)];
+}
+async function conversationSidebarOptionsSelector(exec, launcher, tabId, providerConversationId, deadline, signal) {
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const matches = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`);
+    if (matches.length > 1)
+      throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
+    if (matches.length === 1)
+      return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
+}
+async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const buttons = root.querySelectorAll('[data-testid="conversation-options-button"]');
+    if (buttons.length > 1)
+      throw new Error("ChatGPT conversation action control is ambiguous.");
+    if (buttons.length === 1) {
+      await pickerAction(exec, launcher, "click", tabId, '[data-testid="conversation-options-button"]', signal, expectedTarget);
+      return;
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("ChatGPT conversation action control is unavailable.");
+}
+async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal, expectedTarget) {
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const matches = root.querySelectorAll('[role="menuitem"]').filter((node) => nodeLabel(node).toLowerCase() === label.toLowerCase());
+    if (matches.length > 1)
+      throw new Error(`ChatGPT menu action ${label} is ambiguous.`);
+    if (matches.length === 1) {
+      const selector = exactNodeSelector(matches[0]);
+      if (!selector)
+        throw new Error(`ChatGPT menu action ${label} has no exact selector.`);
+      await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
+      return;
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT menu action ${label} is unavailable.`);
+}
+async function waitForSelectorInHtml(exec, launcher, tabId, selector, deadline, signal) {
+  for (;; ) {
+    if (parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll(selector).length === 1)
+      return;
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT control ${selector} did not appear.`);
+}
+async function privateOrBridgeAction(exec, launcher, action, payload, signal, expectedTarget) {
+  if (expectedTarget) {
+    await privateBridgeJson(exec, launcher, action, { ...payload, expectedTarget }, signal);
+    return;
+  }
+  if (action === "fill") {
+    await bridgeJson(exec, launcher, ["fill", String(payload.tabId), String(payload.selector), String(payload.text ?? "")], signal);
+    return;
+  }
+  await bridgeJson(exec, launcher, ["press", String(payload.tabId), String(payload.key)], signal);
+}
+async function waitForConversationTitle(exec, launcher, tabId, providerConversationId, title, deadline, signal) {
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
+    if (links.length === 1 && nodeLabel(links[0]).includes(title))
+      return;
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT rename read-back failed for ${title}.`);
+}
+async function waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal) {
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const options = root.querySelectorAll('[role="menuitem"]').map((node) => ({
+      label: projectOptionLabel(node),
+      selector: exactNodeSelector(node) ?? ""
+    })).filter((option) => option.label && option.selector);
+    const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(project));
+    if (matches.length > 1)
+      throw new Error(`ChatGPT project ${project} is ambiguous.`);
+    if (matches.length === 1)
+      return matches[0];
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT project ${project} is unavailable.`);
+}
+function projectOptionLabel(node) {
+  const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const last = lines.at(-1) ?? nodeLabel(node);
+  return last.replace(/^Default color.*?Folder\s+/i, "").trim();
+}
+async function waitForProjectReadback(exec, launcher, tabId, providerConversationId, project, deadline, signal) {
+  for (;; ) {
+    const html = await readPageHtml(exec, launcher, tabId, signal);
+    const root = parse6(html);
+    const notices = [...root.querySelectorAll('[role="status"]'), ...root.querySelectorAll('[role="alert"]')];
+    if (notices.some((node) => /mov/i.test(nodeLabel(node)) && normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
+      return;
+    const current = await tabUrl(exec, launcher, tabId, signal);
+    const inProjectConversation = current ? new RegExp(`/g/[^/]+/c/${providerConversationId}(?:[?#]|$)`).test(new URL(current).pathname) : false;
+    const projectMarkers = root.querySelectorAll('[data-testid*="project"], [aria-label*="project"], [aria-label*="Project"]');
+    if (inProjectConversation && projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
+      return;
+    if (root.querySelector(`[data-gpt-control-project="${cssString(project)}"]`))
+      return;
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT move read-back failed for project ${project}.`);
+}
+async function waitForArchiveReadback(exec, launcher, tabId, exactUrl, deadline, signal) {
+  for (;; ) {
+    const current = await tabUrl(exec, launcher, tabId, signal);
+    const html = await readPageHtml(exec, launcher, tabId, signal);
+    const identity = providerConversationIdentity(exactUrl);
+    const stillListed = identity ? parse6(html).querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
+    if (current && new URL(current).toString() !== exactUrl && !stillListed)
+      return;
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT archive read-back failed for ${exactUrl}.`);
+}
+function isConversationPinned(html, providerConversationId) {
+  const root = parse6(html);
+  const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
+  return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "") || link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+}
+function normalizeManagementLabel(value, maxLength, field) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length > maxLength || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`ChatGPT ${field} must be 1-${maxLength} printable characters.`);
+  }
+  return normalized;
+}
+function cleanPickerOptionLabel(value) {
+  return value.replace(/^(?:selected|current)\s+/i, "").replace(/\s+/g, " ").trim();
 }
 function extractModelOptions(html, requested) {
   const root = parse6(html);
@@ -34886,13 +35353,25 @@ class ChromeBridgeBrowserDriver {
     await this.assertActionTarget(session, signal);
     await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal, 60000, exactActionTarget(session));
   }
+  async discoverModels(session, signal) {
+    await this.assertActionTarget(session, signal);
+    return discoverChatGptModels(this.exec, this.launcher, numericPageId(session.pageId), signal, 30000, exactActionTarget(session));
+  }
+  async discoverProjects(session, signal) {
+    await this.assertActionTarget(session, signal);
+    return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
+  }
+  async manageConversation(session, action, signal) {
+    await this.assertActionTarget(session, signal);
+    return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30000, exactActionTarget(session));
+  }
   async selectModel(session, model, signal) {
     await this.assertActionTarget(session, signal);
     return selectAndVerifyChatGptModel(this.exec, this.launcher, numericPageId(session.pageId), model, signal, 30000, exactActionTarget(session));
   }
   async verifyModel(session, model, signal) {
     await this.assertActionTarget(session, signal);
-    return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal);
+    return verifyChatGptModelBeforeSend(this.exec, this.launcher, numericPageId(session.pageId), model, signal, exactActionTarget(session));
   }
   async send(session, signal) {
     await this.assertActionTarget(session, signal);
@@ -34962,9 +35441,30 @@ var ObservationSchema = exports_external.object({
 var ModelVerificationSchema = exports_external.object({
   requestedModel: exports_external.string().min(1),
   observedModel: exports_external.string().min(1),
+  requestedEffort: exports_external.string().min(1).optional(),
+  observedEffort: exports_external.string().min(1).optional(),
   modelVerified: exports_external.literal(true),
   modelEvidenceKind: exports_external.literal("composer_selector"),
   modelVerifiedAt: exports_external.string().min(1)
+}).strict();
+var CatalogOptionSchema = exports_external.object({ label: exports_external.string().min(1), note: exports_external.string().min(1).optional() }).strict();
+var ModelCatalogSchema = exports_external.object({
+  currentModel: exports_external.string().min(1).optional(),
+  currentEffort: exports_external.string().min(1).optional(),
+  models: exports_external.array(CatalogOptionSchema),
+  efforts: exports_external.array(CatalogOptionSchema),
+  discoveredAt: exports_external.string().min(1)
+}).strict();
+var ProjectCatalogSchema = exports_external.object({
+  projects: exports_external.array(exports_external.object({ name: exports_external.string().min(1) }).strict()),
+  discoveredAt: exports_external.string().min(1)
+}).strict();
+var ConversationActionResultSchema = exports_external.object({
+  pinned: exports_external.boolean().optional(),
+  archived: exports_external.boolean().optional(),
+  title: exports_external.string().min(1).optional(),
+  project: exports_external.string().min(1).optional(),
+  verifiedAt: exports_external.string().min(1)
 }).strict();
 var ProbeSchema = exports_external.object({
   ready: exports_external.boolean(),
@@ -35018,6 +35518,15 @@ class ExternalCommandBrowserDriver {
   }
   async fill(session, prompt, signal) {
     await this.call("fill", { session, prompt }, signal);
+  }
+  async discoverModels(session, signal) {
+    return ModelCatalogSchema.parse(await this.call("discover_models", { session }, signal));
+  }
+  async discoverProjects(session, signal) {
+    return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+  }
+  async manageConversation(session, action, signal) {
+    return ConversationActionResultSchema.parse(await this.call("manage_conversation", { session, operation: action }, signal));
   }
   async selectModel(session, model, signal) {
     return ModelVerificationSchema.parse(await this.call("select_model", { session, model }, signal));
@@ -35298,6 +35807,8 @@ var ReceiptSchema = exports_external.object({
   model: exports_external.string().optional(),
   requestedModel: exports_external.string().optional(),
   observedModel: exports_external.string().optional(),
+  requestedEffort: exports_external.string().optional(),
+  observedEffort: exports_external.string().optional(),
   modelVerified: exports_external.boolean().optional(),
   modelEvidenceKind: exports_external.enum(["composer_selector", "provider_response", "provider_sdk"]).optional(),
   modelVerifiedAt: exports_external.string().optional(),
@@ -35329,6 +35840,10 @@ var ConversationSchema = exports_external.object({
   browserSessionName: exports_external.string().optional(),
   browserPageId: exports_external.union([exports_external.string(), exports_external.number()]).optional(),
   browserAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
+  providerPinned: exports_external.boolean().optional(),
+  providerTitle: exports_external.string().optional(),
+  providerProject: exports_external.string().optional(),
+  providerArchivedAt: exports_external.string().optional(),
   workspaceRoot: exports_external.string(),
   policyFingerprint: exports_external.string().optional(),
   mcpSessionId: McpSessionIdSchema.optional(),
@@ -35354,7 +35869,9 @@ var RunSchema = exports_external.object({
   attachmentManifest: ManifestSchema,
   baselineMessageCount: exports_external.number().optional(),
   submissionState: exports_external.enum(["not_submitted", "submitting", "submitted", "not_applicable"]).optional(),
-  requestedChatGptModel: exports_external.enum(["pro"]).optional(),
+  requestedChatGptModel: exports_external.string().min(1).max(128).optional(),
+  requestedChatGptEffort: exports_external.string().min(1).max(64).optional(),
+  pinChatRequested: exports_external.boolean().optional(),
   timeoutMs: exports_external.number().int().positive().optional(),
   deadlineAt: exports_external.string().optional(),
   idempotencyKeyHash: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -35372,7 +35889,8 @@ var RunSchema = exports_external.object({
     terminalReason: exports_external.string().optional(),
     localAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
     lastObservedUrl: exports_external.string().optional(),
-    lastObservedUiState: exports_external.string().optional()
+    lastObservedUiState: exports_external.string().optional(),
+    organizationWarnings: exports_external.array(exports_external.string()).optional()
   }).optional(),
   receipt: ReceiptSchema,
   error: exports_external.string().optional(),
@@ -35385,7 +35903,8 @@ var DurableRunRequestSchema = exports_external.object({
   runId: exports_external.string().regex(RUN_ID_PATTERN),
   kind: exports_external.enum(["consult", "chat", "image", "subagent"]),
   prompt: exports_external.string().min(1),
-  requestedChatGptModel: exports_external.enum(["pro"]).optional(),
+  requestedChatGptModel: exports_external.string().min(1).max(128).optional(),
+  requestedChatGptEffort: exports_external.string().min(1).max(64).optional(),
   timeoutMs: exports_external.number().int().positive(),
   createdAt: exports_external.string()
 });
@@ -35596,7 +36115,7 @@ class RunStore {
     return this.withNamedLock(`record-${id}`, async () => {
       const current = RunSchema.parse(JSON.parse(await safeRead(this.runPath(id))));
       if (current.mcpTaskId && current.mcpTaskId !== taskId) {
-        throw new Error("This Pro worker is already owned by another durable MCP task.");
+        throw new Error("This GPT Worker is already owned by another durable MCP task.");
       }
       if (current.mcpTaskId === taskId)
         return current;
@@ -36257,7 +36776,7 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 6, 1, 10, "maxConcurrentWorkers"),
+    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 6, 1, 10, "maxConcurrentWorkers"),
     allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
     providerTurnAbandonmentTokenHash: abandonmentToken ? createHash5("sha256").update(abandonmentToken).digest("hex") : undefined
   };
@@ -36473,6 +36992,68 @@ class GptControlService {
     });
     this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
     this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
+  }
+  async listModels() {
+    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+    const route = selectRoute(capabilities, { transport: "browser" });
+    assertTransportAllowed(this.policy, route.kind);
+    const name = `gpt-control:catalog:${opaqueId("task")}`;
+    const session = await route.driver.create(name, CHATGPT_ORIGIN);
+    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+    try {
+      const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
+      const catalog = await route.driver.discoverModels(ready.session);
+      return { ...catalog, browserDriverId: route.driver.id };
+    } finally {
+      await route.driver.close(session.sessionId).catch(() => {
+        return;
+      });
+    }
+  }
+  async listProjects() {
+    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+    const route = selectRoute(capabilities, { transport: "browser" });
+    assertTransportAllowed(this.policy, route.kind);
+    const name = `gpt-control:projects:${opaqueId("task")}`;
+    const session = await route.driver.create(name, CHATGPT_ORIGIN);
+    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+    try {
+      const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
+      const catalog = await route.driver.discoverProjects(ready.session);
+      return { ...catalog, browserDriverId: route.driver.id };
+    } finally {
+      await route.driver.close(session.sessionId).catch(() => {
+        return;
+      });
+    }
+  }
+  async manageConversation(conversationId, action, mcpSessionId) {
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
+      const conversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
+      if (conversation.closedAt)
+        throw new Error(`Conversation ${conversationId} is closed.`);
+      const active = (await this.store.listRuns({ limit: null })).find((run) => run.conversationId === conversationId && (run.status === "queued" || run.status === "running" || run.providerTurnPending === true));
+      if (active)
+        throw new Error(`Conversation ${conversationId} still has active run ${active.id}; organization changes are refused until it is terminal.`);
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      await assertExactDriverSession(driver, expected);
+      const result = await driver.manageConversation(await driver.show(expected.sessionId), action);
+      if (action.action === "archive") {
+        await driver.close(expected.sessionId);
+        const archivedAt = nowIso();
+        await this.store.updateConversation(conversationId, { closedAt: archivedAt, providerArchivedAt: archivedAt });
+      } else if (action.action === "pin" || action.action === "unpin") {
+        await this.store.updateConversation(conversationId, { providerPinned: action.action === "pin" });
+      } else if (action.action === "rename") {
+        await this.store.updateConversation(conversationId, { providerTitle: result.title });
+      } else if (action.action === "move") {
+        await this.store.updateConversation(conversationId, { providerProject: result.project });
+      }
+      return result;
+    });
   }
   async start(request, options = {}) {
     const normalized = normalizeStartRequest(request, this.policy);
@@ -36946,9 +37527,11 @@ class GptControlService {
     const id = opaqueId("run");
     const { prompt, promptProofToken, promptSha256, promptObservationSha256 } = preparedPrompt;
     const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
+    const chatgptEffort = request.chatgptEffort;
     const receipt = {
       provider: conversation.provider,
       requestedModel: chatgptModel === "pro" ? "Pro" : chatgptModel,
+      ...chatgptEffort ? { requestedEffort: chatgptEffort } : {},
       browserDriverId: conversation.browserDriverId,
       promptSha256,
       attachments: manifest.files,
@@ -36975,6 +37558,8 @@ class GptControlService {
       attachmentManifest: manifest,
       submissionState: "not_submitted",
       requestedChatGptModel: chatgptModel,
+      requestedChatGptEffort: chatgptEffort,
+      pinChatRequested: request.pinChat,
       timeoutMs: request.timeoutMs,
       deadlineAt: new Date(Date.now() + request.timeoutMs).toISOString(),
       idempotencyKeyHash: idempotencyHash,
@@ -36989,6 +37574,7 @@ class GptControlService {
       kind: request.kind,
       prompt,
       requestedChatGptModel: chatgptModel,
+      requestedChatGptEffort: chatgptEffort,
       timeoutMs: request.timeoutMs,
       createdAt: timestamp
     };
@@ -37075,7 +37661,7 @@ class GptControlService {
         await this.store.updateRun(runId, {
           status: "needs_user",
           completedAt: nowIso(),
-          error: "The Pro worker exceeded its bounded global admission deadline before a trusted concurrency slot became available."
+          error: "The GPT Worker exceeded its bounded global admission deadline before a trusted concurrency slot became available."
         });
         return false;
       }
@@ -37141,6 +37727,7 @@ class GptControlService {
           ...run.receipt,
           model: result.observedModel,
           observedModel: result.observedModel,
+          observedEffort: result.observedEffort,
           modelVerified: result.modelVerified ?? false,
           modelEvidenceKind: result.modelEvidenceKind,
           modelVerifiedAt: result.modelVerifiedAt,
@@ -37217,6 +37804,7 @@ class GptControlService {
     let run = originalRun;
     let baselineCount = run.baselineMessageCount;
     let observedModel = run.receipt.observedModel;
+    let observedEffort = run.receipt.observedEffort;
     let modelVerified = run.receipt.modelVerified === true;
     let modelVerifiedAt = run.receipt.modelVerifiedAt;
     let modelEvidenceKind = run.receipt.modelEvidenceKind === "composer_selector" ? "composer_selector" : undefined;
@@ -37249,8 +37837,10 @@ class GptControlService {
       }
       baselineCount = ready.observation.snapshot.count;
       const requestedModel = request.requestedChatGptModel ?? this.policy.defaultChatGptModel;
-      const selected = await driver.selectModel(ready.session, requestedModel, signal);
+      const requestedSelection = request.requestedChatGptEffort || requestedModel !== "pro" ? { ...requestedModel !== "pro" ? { model: requestedModel } : {}, ...request.requestedChatGptEffort ? { effort: request.requestedChatGptEffort } : {} } : requestedModel;
+      const selected = await driver.selectModel(ready.session, requestedSelection, signal);
       observedModel = selected.observedModel;
+      observedEffort = selected.observedEffort;
       modelVerified = true;
       modelVerifiedAt = selected.modelVerifiedAt;
       modelEvidenceKind = selected.modelEvidenceKind;
@@ -37260,6 +37850,8 @@ class GptControlService {
           ...run.receipt,
           requestedModel: selected.requestedModel,
           observedModel,
+          ...selected.requestedEffort ? { requestedEffort: selected.requestedEffort } : {},
+          ...observedEffort ? { observedEffort } : {},
           model: observedModel,
           modelVerified: true,
           modelEvidenceKind,
@@ -37268,8 +37860,9 @@ class GptControlService {
       });
       await driver.upload(ready.session, run.attachmentManifest.files.map((file2) => file2.path), signal);
       await driver.fill(ready.session, request.prompt, signal);
-      const verified = await driver.verifyModel(ready.session, requestedModel, signal);
+      const verified = await driver.verifyModel(ready.session, requestedSelection, signal);
       observedModel = verified.observedModel;
+      observedEffort = verified.observedEffort;
       modelVerifiedAt = verified.modelVerifiedAt;
       modelEvidenceKind = verified.modelEvidenceKind;
       run = await this.store.updateRun(run.id, {
@@ -37279,6 +37872,8 @@ class GptControlService {
           ...run.receipt,
           requestedModel: verified.requestedModel,
           observedModel,
+          ...verified.requestedEffort ? { requestedEffort: verified.requestedEffort } : {},
+          ...observedEffort ? { observedEffort } : {},
           model: observedModel,
           modelVerified: true,
           modelEvidenceKind,
@@ -37313,7 +37908,7 @@ class GptControlService {
           }
           firstNewProviderUserMessageId = observedUserMessageId;
           if (run.promptProofToken && !this.observationProvesPrompt(run, observation)) {
-            return browserNeedsUser("The first new provider user turn did not match the broker-owned send-boundary proof. Completion was not attributed to this run.", conversation, run);
+            return browserNeedsUser("The first new provider user turn did not match the legacy broker-owned send-boundary proof. Completion was not attributed to this run.", conversation, run);
           }
           submittedIdentity = providerConversationIdentity(submittedSession.url);
           if (submittedIdentity) {
@@ -37343,6 +37938,23 @@ class GptControlService {
       }
       if (!submittedIdentity || !providerUserMessageId) {
         return browserNeedsUser("The bounded send-boundary observation did not provide a matching provider-issued conversation and first new user-message identity. Later transcript text was not adopted.", conversation, run);
+      }
+      if ((run.kind === "subagent" || run.pinChatRequested === true) && conversation.providerPinned !== true) {
+        try {
+          const currentSession = await driver.show(expected.sessionId, signal);
+          const pinned = await driver.manageConversation(currentSession, { action: "pin" }, signal);
+          if (pinned.pinned !== true)
+            throw new Error("live pin read-back did not report pinned=true");
+          conversation = await this.store.updateConversation(conversation.id, { providerPinned: true });
+        } catch (error51) {
+          const warning = `Automatic GPT Worker pinning failed after submission: ${errorMessage2(error51)}`;
+          run = await this.store.updateRun(run.id, {
+            diagnostics: {
+              ...run.diagnostics ?? {},
+              organizationWarnings: [...run.diagnostics?.organizationWarnings ?? [], warning]
+            }
+          });
+        }
       }
     } else if (run.submissionState === "submitting" || run.submissionState === "submitted") {
       if (baselineCount === undefined) {
@@ -37402,6 +38014,7 @@ class GptControlService {
       });
       return completionOutcomeToProviderResult(driver.id, outcome, {
         observedModel,
+        observedEffort,
         modelVerified,
         modelEvidenceKind,
         modelVerifiedAt
@@ -37420,6 +38033,7 @@ class GptControlService {
       providerConversationUrl: outcome.providerConversationUrl,
       providerRunId: snapshot.messageId,
       observedModel,
+      observedEffort,
       modelVerified,
       modelEvidenceKind,
       modelVerifiedAt,
@@ -37721,6 +38335,7 @@ class GptControlService {
       receipt: {
         ...run.receipt,
         observedModel: result?.observedModel ?? run.receipt.observedModel,
+        observedEffort: result?.observedEffort ?? run.receipt.observedEffort,
         model: result?.observedModel ?? run.receipt.model,
         modelVerified: result?.modelVerified ?? run.receipt.modelVerified ?? false,
         modelEvidenceKind: result?.modelEvidenceKind ?? run.receipt.modelEvidenceKind,
@@ -37758,10 +38373,10 @@ function normalizeStartRequest(request, policy) {
     throw new Error("The legacy model field may only narrow to live-verified ChatGPT Pro.");
   }
   if (request.providerModel) {
-    throw new Error("provider_model cannot establish ChatGPT composer provenance. Use the live verified Pro selector.");
+    throw new Error("provider_model cannot establish ChatGPT composer provenance. Use chatgpt_model with an exact label from gpt_models.");
   }
   if (request.transport && request.transport !== "browser") {
-    throw new Error(`Transport ${request.transport} is disabled by the hardened 0.3 broker.`);
+    throw new Error(`Transport ${request.transport} is disabled by the hardened broker.`);
   }
   if (request.apiConfirmed) {
     throw new Error("api_confirmed cannot grant paid-provider authority and no paid fallback is enabled.");
@@ -37769,14 +38384,13 @@ function normalizeStartRequest(request, policy) {
   if (request.allowFocusSteal) {
     throw new Error("allow_focus_steal cannot grant browser authority and no focus-stealing fallback is enabled.");
   }
-  if (request.chatgptModel && request.chatgptModel !== "pro") {
-    throw new Error("The hardened browser contract currently supports only a live-verified ChatGPT Pro selection.");
-  }
+  const chatgptModel = normalizePickerRequest(request.chatgptModel ?? policy.defaultChatGptModel, 128, "chatgpt_model");
+  const chatgptEffort = request.chatgptEffort === undefined ? undefined : normalizePickerRequest(request.chatgptEffort, 64, "chatgpt_effort");
   if (request.kind === "subagent" && request.conversationId) {
-    throw new Error("Each Pro subagent requires an independent owned conversation; conversation_id is not accepted.");
+    throw new Error("Each GPT Worker requires an independent owned conversation; conversation_id is not accepted.");
   }
   if (request.kind !== "subagent" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
-    throw new Error("Connector intent is supported only for independent Pro subagents.");
+    throw new Error("Connector intent is supported only for independent GPT Workers.");
   }
   const connectorNames = [...new Set((request.connectors ?? []).map((name) => name.trim()))];
   if (connectorNames.length > 8 || connectorNames.some((name) => !/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/.test(name))) {
@@ -37789,7 +38403,9 @@ function normalizeStartRequest(request, policy) {
     files: [...request.files ?? []],
     conversationId: request.conversationId,
     transport: "browser",
-    chatgptModel: "pro",
+    chatgptModel,
+    chatgptEffort,
+    pinChat: request.kind === "subagent" || request.pinChat === true,
     idempotencyKey: request.idempotencyKey,
     connectorIntent,
     wait: request.wait !== false,
@@ -37806,6 +38422,8 @@ function startRequestHash(request) {
     conversationId: request.conversationId ?? null,
     transport: request.transport,
     chatgptModel: request.chatgptModel,
+    chatgptEffort: request.chatgptEffort,
+    pinChat: request.pinChat,
     connectorIntent: request.connectorIntent ?? null,
     timeoutMs: request.timeoutMs
   };
@@ -37814,6 +38432,13 @@ function startRequestHash(request) {
   if (request.allowSensitiveFiles)
     value.allowSensitiveFiles = true;
   return sha256(JSON.stringify(value));
+}
+function normalizePickerRequest(value, maxLength, field) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length > maxLength || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`${field} must be a non-empty printable label no longer than ${maxLength} characters.`);
+  }
+  return normalized.toLowerCase() === "pro" ? "pro" : normalized;
 }
 function publicPolicy(policy) {
   return {
@@ -37844,6 +38469,7 @@ function completionOutcomeToProviderResult(driverId, outcome, model) {
     providerConversationId: outcome.providerConversationId,
     providerConversationUrl: outcome.providerConversationUrl,
     observedModel: model.observedModel,
+    observedEffort: model.observedEffort,
     modelVerified: model.modelVerified,
     modelEvidenceKind: model.modelEvidenceKind,
     modelVerifiedAt: model.modelVerifiedAt,
@@ -37982,7 +38608,7 @@ class DurableTaskStore {
       createdAt: timestamp,
       lastUpdatedAt: timestamp,
       pollInterval: normalizePollInterval(taskParams.pollInterval),
-      statusMessage: "GPT-Control Pro worker is queued."
+      statusMessage: "GPT Worker is queued."
     };
     const record3 = {
       task,
@@ -38020,7 +38646,7 @@ class DurableTaskStore {
       if (!TRANSITIONS2[record3.task.status].has(status))
         throw new Error(`Invalid task transition ${record3.task.status} -> ${status}.`);
       const timestamp = nowIso();
-      record3.task = { ...record3.task, status, lastUpdatedAt: timestamp, statusMessage: status === "completed" ? "Pro worker completed." : "Pro worker returned a blocker or failure." };
+      record3.task = { ...record3.task, status, lastUpdatedAt: timestamp, statusMessage: status === "completed" ? "GPT Worker completed." : "GPT Worker returned a blocker or failure." };
       record3.result = result;
       record3.resultHash = resultHash;
       record3.statusHistory.push({ status, at: timestamp, message: record3.task.statusMessage });
@@ -38127,7 +38753,7 @@ class DurableTaskStore {
       await this.lockStore.withRunTaskBindingLock(runId, async () => {
         const existingTaskId = await this.findTaskIdByRun(runId);
         if (existingTaskId && existingTaskId !== taskId) {
-          throw new Error("This Pro worker is already bound to another durable MCP task.");
+          throw new Error("This GPT Worker is already bound to another durable MCP task.");
         }
         await this.lockStore.claimMcpTask(runId, taskId);
         if (record3.runId === runId)
@@ -38504,7 +39130,8 @@ function findOnPath2(name, env = process.env) {
 
 // src/mcp.ts
 var TransportSchema = exports_external.literal("browser");
-var ChatGptModelSchema = exports_external.literal("pro");
+var ChatGptModelSchema = exports_external.string().min(1).max(128);
+var ChatGptEffortSchema = exports_external.string().min(1).max(64);
 var IdempotencyKeySchema = exports_external.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 var ConnectorNameSchema = exports_external.string().regex(/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/);
 var ConnectorModeSchema = exports_external.enum(["prefer", "require"]);
@@ -38513,6 +39140,8 @@ var CommonSchema = {
   files: exports_external.array(exports_external.string()).max(32).optional(),
   transport: TransportSchema.optional(),
   chatgpt_model: ChatGptModelSchema.optional(),
+  chatgpt_effort: ChatGptEffortSchema.optional(),
+  pin_chat: exports_external.boolean().optional(),
   idempotency_key: IdempotencyKeySchema.optional(),
   wait: exports_external.boolean().optional(),
   timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
@@ -38524,6 +39153,8 @@ var SubagentSchema = {
   prompt: exports_external.string().min(1),
   files: exports_external.array(exports_external.string()).max(32).optional(),
   idempotency_key: IdempotencyKeySchema,
+  chatgpt_model: ChatGptModelSchema.optional(),
+  chatgpt_effort: ChatGptEffortSchema.optional(),
   connectors: exports_external.array(ConnectorNameSchema).max(8).optional(),
   connector_mode: ConnectorModeSchema.optional(),
   timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
@@ -38598,7 +39229,7 @@ class CodexCallbackCoordinator {
       return;
     const noun = receipts.length === 1 ? "worker" : "workers";
     const identities = receipts.map((receipt) => `${receipt.taskId}${receipt.runId ? ` (${receipt.runId})` : ""}: ${receipt.status}`).join(", ");
-    const message = `${receipts.length === 1 ? "A" : receipts.length} ChatGPT Pro ${noun} finished. ` + `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_subagent_get and update the user. ${identities}`;
+    const message = `${receipts.length === 1 ? "A" : receipts.length} GPT ${noun} finished. ` + `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_worker_get and update the user. ${identities}`;
     let result;
     try {
       result = await this.options.exec(this.options.command, [
@@ -38653,11 +39284,21 @@ function createMcpServer(serviceOrOptions = {}) {
     return;
   });
   registerCoreTools(server, service, taskStore);
-  registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback);
-  registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
+  registerWorkerRecoveryTools(server, service, taskStore, monitors, codexCallback);
+  registerWorkerRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
   return server;
 }
 function registerCoreTools(server, service, taskStore) {
+  server.registerTool("gpt_models", {
+    description: "Read the currently available ChatGPT model and effort choices from the live picker. No prompt is sent and the temporary owned tab is closed.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true }
+  }, async () => toolPayload("Live ChatGPT model catalog.", await service.listModels()));
+  server.registerTool("gpt_projects", {
+    description: "Read the currently available ChatGPT project names from the live sidebar. No prompt is sent and the temporary owned tab is closed.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true }
+  }, async () => toolPayload("Live ChatGPT project catalog.", await service.listProjects()));
   server.registerTool("gpt_consult", {
     description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",
     inputSchema: { question: exports_external.string().min(1), ...CommonSchema },
@@ -38679,6 +39320,7 @@ function registerCoreTools(server, service, taskStore) {
       conversation_id: exports_external.string().optional(),
       files: exports_external.array(exports_external.string()).max(32).optional(),
       chatgpt_model: ChatGptModelSchema.optional(),
+      chatgpt_effort: ChatGptEffortSchema.optional(),
       idempotency_key: IdempotencyKeySchema.optional(),
       timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
     },
@@ -38691,6 +39333,7 @@ function registerCoreTools(server, service, taskStore) {
       conversationId: params.conversation_id,
       transport: "browser",
       chatgptModel: params.chatgpt_model,
+      chatgptEffort: params.chatgpt_effort,
       idempotencyKey: params.idempotency_key,
       timeoutMs: params.timeout_ms
     }, { mcpSessionId: extra.sessionId }));
@@ -38760,6 +39403,24 @@ function registerCoreTools(server, service, taskStore) {
       closedAt: conversation.closedAt
     });
   });
+  server.registerTool("gpt_conversation_manage", {
+    description: "Pin, unpin, rename, move, or archive one exact GPT-Control-owned ChatGPT conversation with live read-back. Archive also closes the local owned tab.",
+    inputSchema: {
+      conversation_id: exports_external.string(),
+      action: exports_external.enum(["pin", "unpin", "rename", "move", "archive"]),
+      title: exports_external.string().min(1).max(128).optional(),
+      project: exports_external.string().min(1).max(128).optional()
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params, extra) => {
+    const operation = params.action === "rename" ? { action: "rename", title: params.title ?? "" } : params.action === "move" ? { action: "move", project: params.project ?? "" } : { action: params.action };
+    const result = await service.manageConversation(params.conversation_id, operation, extra.sessionId);
+    return toolPayload(`ChatGPT conversation ${params.conversation_id} ${params.action} verified.`, {
+      conversationId: params.conversation_id,
+      action: params.action,
+      ...result
+    });
+  });
   server.registerTool("gpt_diagnose", {
     description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
     inputSchema: {},
@@ -38771,16 +39432,16 @@ function registerCoreTools(server, service, taskStore) {
     annotations: { readOnlyHint: false, destructiveHint: false }
   }, async () => toolPayload("GPT-Control active smoke test.", await service.activeSmokeTest()));
 }
-function registerSubagentRun(server, service, taskStore, monitors, activationTimers, taskSupport, recoveryReady, codexCallback) {
+function registerWorkerRun(server, service, taskStore, monitors, activationTimers, taskSupport, recoveryReady, codexCallback) {
   const config2 = {
-    title: "Run ChatGPT Pro worker",
-    description: "Start one bounded ChatGPT Pro worker in its own owned browser conversation. Codex remains the orchestrator. Do not poll while the task result is pending.",
+    title: "Run GPT Worker",
+    description: "Start one bounded GPT Worker in its own owned browser conversation. The live model and effort can be selected for each worker. Do not poll while the task result is pending.",
     inputSchema: SubagentSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     execution: { taskSupport: "optional" }
   };
   if (!taskSupport || typeof server.experimental.tasks.registerToolTask !== "function") {
-    server.registerTool("gpt_subagent_run", {
+    server.registerTool("gpt_worker_run", {
       ...config2,
       description: `${config2.description} This runtime lacks MCP task registration, so the call returns exactly once when terminal.`
     }, async (params, extra) => {
@@ -38789,7 +39450,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
     });
     return;
   }
-  server.experimental.tasks.registerToolTask("gpt_subagent_run", config2, {
+  server.experimental.tasks.registerToolTask("gpt_worker_run", config2, {
     async createTask(params, extra) {
       await recoveryReady;
       const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
@@ -38808,22 +39469,22 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
         taskStore.removeStatusListener(task.taskId);
         return { task };
       }
-      await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
+      await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned GPT Worker.");
       try {
         const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
         preparedRunId = started.run.id;
         if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
-          throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
+          throw new Error("This idempotent GPT Worker is already owned by another durable MCP task.");
         }
         if (started.run.executionReady && !started.run.mcpTaskId) {
-          throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
+          throw new Error("This idempotent GPT Worker was created outside MCP task ownership and cannot be adopted.");
         }
         await taskStore.bindRun(task.taskId, started.run.id);
         const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
         if (currentTask?.status === "cancelled") {
           await service.cancelRun(started.run.id);
         } else {
-          await taskStore.updateTaskStatus(task.taskId, "working", `Pro worker ${started.run.id} is prepared for activation after the cancellation grace.`);
+          await taskStore.updateTaskStatus(task.taskId, "working", `GPT Worker ${started.run.id} is prepared for activation after the cancellation grace.`);
           await sendProgress(extra.sendNotification, progressToken, 0.1, "Owned worker prepared; browser execution begins after taskCreated and the bounded cancellation grace.");
           scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId, codexCallback);
         }
@@ -38834,7 +39495,7 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
           taskStore.removeStatusListener(task.taskId);
           return { task };
         }
-        await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`Pro worker could not start: ${errorMessage3(error51)}`, {
+        await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`GPT Worker could not start: ${errorMessage3(error51)}`, {
           taskId: task.taskId,
           status: "failed",
           reason: errorMessage3(error51)
@@ -38855,16 +39516,16 @@ function registerSubagentRun(server, service, taskStore, monitors, activationTim
     }
   });
 }
-function registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback) {
-  server.registerTool("gpt_subagent_get", {
-    description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
+function registerWorkerRecoveryTools(server, service, taskStore, monitors, codexCallback) {
+  server.registerTool("gpt_worker_get", {
+    description: "Durable read-only lookup for one GPT Worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
     inputSchema: { run_id: exports_external.string().optional(), task_id: exports_external.string().optional() },
     annotations: { readOnlyHint: true }
   }, async (params, extra) => {
     const identity = requireOneIdentity(params.run_id, params.task_id);
     const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId, extra.sessionId);
     if (identity.runId && extra.sessionId !== undefined && !taskId) {
-      throw new Error("No Pro worker owned by this MCP session matched that run id.");
+      throw new Error("No GPT Worker owned by this MCP session matched that run id.");
     }
     const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
     if (taskId)
@@ -38872,34 +39533,34 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors, cod
     const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
     const run = runId ? await service.getRun(runId) : undefined;
     if (!task && !run)
-      throw new Error("No durable Pro worker matched that identity.");
+      throw new Error("No durable GPT Worker matched that identity.");
     return toolPayload(run ? runText(run) : `Task ${taskId}: ${task?.status}.`, {
       task: task ? publicTask(task) : undefined,
       run: run ? publicRun(run) : undefined
     });
   });
-  server.registerTool("gpt_subagent_cancel", {
-    description: "Cancel one Pro worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
+  server.registerTool("gpt_worker_cancel", {
+    description: "Cancel one GPT Worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
     inputSchema: { run_id: exports_external.string().optional(), task_id: exports_external.string().optional() },
     annotations: { readOnlyHint: false, destructiveHint: true }
   }, async (params, extra) => {
     const identity = requireOneIdentity(params.run_id, params.task_id);
     const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId, extra.sessionId);
     if (identity.runId && extra.sessionId !== undefined && !taskId) {
-      throw new Error("No Pro worker owned by this MCP session matched that run id.");
+      throw new Error("No GPT Worker owned by this MCP session matched that run id.");
     }
     if (taskId) {
       const runId = identity.runId ?? await taskStore.getRunId(taskId, extra.sessionId);
-      await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.", extra.sessionId);
+      await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_worker_cancel.", extra.sessionId);
       const run = runId ? await service.cancelRun(runId) : undefined;
-      return toolPayload(`Pro worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
+      return toolPayload(`GPT Worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
     }
     if (!identity.runId)
       throw new Error("No run id was available to cancel.");
     return runPayload(await service.cancelRun(identity.runId));
   });
-  server.registerTool("gpt_subagent_list", {
-    description: "Bounded overview of active Pro workers. This is a recovery aid, not a polling requirement.",
+  server.registerTool("gpt_worker_list", {
+    description: "Bounded overview of active GPT Workers. This is a recovery aid, not a polling requirement.",
     inputSchema: { limit: exports_external.number().int().positive().max(100).optional(), include_terminal: exports_external.boolean().optional() },
     annotations: { readOnlyHint: true }
   }, async (params, extra) => {
@@ -38916,7 +39577,7 @@ function registerSubagentRecoveryTools(server, service, taskStore, monitors, cod
       if (rows.length >= limit)
         break;
     }
-    return toolPayload(`${rows.length} Pro worker${rows.length === 1 ? "" : "s"}.`, { workers: rows });
+    return toolPayload(`${rows.length} GPT Worker${rows.length === 1 ? "" : "s"}.`, { workers: rows });
   });
 }
 
@@ -38959,7 +39620,7 @@ function scheduleTaskActivation(service, taskStore, monitors, timers, taskId, co
   const timer = setTimeout(() => {
     timers.delete(taskId);
     activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback).catch(async (error51) => {
-      await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker activation failed: ${errorMessage3(error51)}`, {
+      await taskStore.storeTaskResult(taskId, "failed", toolPayload(`GPT Worker activation failed: ${errorMessage3(error51)}`, {
         taskId,
         status: "failed",
         reason: errorMessage3(error51)
@@ -38995,7 +39656,7 @@ async function activateTaskIfPending(service, taskStore, monitors, taskId, codex
     await service.cancelRun(runId);
     return;
   }
-  await taskStore.updateTaskStatus(taskId, "working", `Pro worker ${runId} is running in an owned browser conversation.`);
+  await taskStore.updateTaskStatus(taskId, "working", `GPT Worker ${runId} is running in an owned browser conversation.`);
   startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
 }
 function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgress, codexCallback) {
@@ -39003,7 +39664,7 @@ function startTaskMonitor(service, taskStore, monitors, taskId, runId, emitProgr
   if (existing)
     return existing;
   const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress, codexCallback).catch(async (error51) => {
-    await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker monitor failed: ${errorMessage3(error51)}`, {
+    await taskStore.storeTaskResult(taskId, "failed", toolPayload(`GPT Worker monitor failed: ${errorMessage3(error51)}`, {
       taskId,
       runId,
       status: "failed",
@@ -39024,7 +39685,7 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress, code
   await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
   let run = await service.waitForRun(runId, (initial.timeoutMs ?? 600000) + 120000);
   if (run.status === "queued" || run.status === "running") {
-    run = await service.markNeedsUser(runId, "The Pro worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
+    run = await service.markNeedsUser(runId, "The GPT Worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
   }
   const task = await taskStore.getTask(taskId);
   if (task?.status === "cancelled")
@@ -39036,8 +39697,8 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress, code
     return;
   }
   if (run.status === "needs_user") {
-    await taskStore.updateTaskStatus(taskId, "input_required", run.error ?? "The Pro worker requires operator input.");
-    await emitProgress?.(0.95, "Pro worker needs operator input; delivering one terminal blocker result.");
+    await taskStore.updateTaskStatus(taskId, "input_required", run.error ?? "The GPT Worker requires operator input.");
+    await emitProgress?.(0.95, "GPT Worker needs operator input; delivering one terminal blocker result.");
     await delay(INPUT_REQUIRED_DELIVERY_GRACE_MS);
     const current = await taskStore.getTask(taskId);
     if (current?.status === "cancelled")
@@ -39047,7 +39708,7 @@ async function monitorTask(service, taskStore, taskId, runId, emitProgress, code
     return;
   }
   if (run.status === "cancelled") {
-    await taskStore.updateTaskStatus(taskId, "cancelled", run.error ?? "Pro worker was cancelled.");
+    await taskStore.updateTaskStatus(taskId, "cancelled", run.error ?? "GPT Worker was cancelled.");
     return;
   }
   await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run));
@@ -39089,7 +39750,7 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map, co
       continue;
     const runId = binding.runId;
     if (!runId) {
-      await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("Pro worker task has no durable run binding; no prompt was resubmitted.", {
+      await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("GPT Worker task has no durable run binding; no prompt was resubmitted.", {
         taskId: binding.task.taskId,
         status: "failed",
         reason: "missing durable run binding"
@@ -39106,7 +39767,8 @@ function subagentRequest(params, wait) {
     prompt: params.prompt,
     files: params.files,
     transport: "browser",
-    chatgptModel: "pro",
+    chatgptModel: params.chatgpt_model ?? "pro",
+    chatgptEffort: params.chatgpt_effort,
     idempotencyKey: params.idempotency_key,
     connectors: params.connectors,
     connectorMode: params.connector_mode,
@@ -39122,6 +39784,8 @@ function toRequest(params, kind, prompt) {
     conversationId: params.conversation_id,
     transport: params.transport,
     chatgptModel: params.chatgpt_model,
+    chatgptEffort: params.chatgpt_effort,
+    pinChat: params.pin_chat,
     idempotencyKey: params.idempotency_key,
     wait: params.wait !== false,
     timeoutMs: params.timeout_ms
@@ -39194,7 +39858,7 @@ function publicTask(task) {
 }
 function runText(run) {
   if (run.status === "completed")
-    return run.resultText ?? "Pro worker completed without text.";
+    return run.resultText ?? "GPT Worker completed without text.";
   if (run.status === "failed" || run.status === "cancelled" || run.status === "needs_user")
     return run.error ?? run.status;
   return `Run ${run.id} is ${run.status}.`;

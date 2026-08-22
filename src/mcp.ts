@@ -14,7 +14,8 @@ import type { Exec } from "./types";
 import { findOnPath } from "./transport";
 
 const TransportSchema = z.literal("browser");
-const ChatGptModelSchema = z.literal("pro");
+const ChatGptModelSchema = z.string().min(1).max(128);
+const ChatGptEffortSchema = z.string().min(1).max(64);
 const IdempotencyKeySchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const ConnectorNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/);
 const ConnectorModeSchema = z.enum(["prefer", "require"]);
@@ -23,6 +24,8 @@ const CommonSchema = {
 	files: z.array(z.string()).max(32).optional(),
 	transport: TransportSchema.optional(),
 	chatgpt_model: ChatGptModelSchema.optional(),
+	chatgpt_effort: ChatGptEffortSchema.optional(),
+	pin_chat: z.boolean().optional(),
 	idempotency_key: IdempotencyKeySchema.optional(),
 	wait: z.boolean().optional(),
 	timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
@@ -35,6 +38,8 @@ const SubagentSchema = {
 	prompt: z.string().min(1),
 	files: z.array(z.string()).max(32).optional(),
 	idempotency_key: IdempotencyKeySchema,
+	chatgpt_model: ChatGptModelSchema.optional(),
+	chatgpt_effort: ChatGptEffortSchema.optional(),
 	connectors: z.array(ConnectorNameSchema).max(8).optional(),
 	connector_mode: ConnectorModeSchema.optional(),
 	timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
@@ -44,6 +49,8 @@ interface SubagentParams {
 	prompt: string;
 	files?: string[];
 	idempotency_key: string;
+	chatgpt_model?: string;
+	chatgpt_effort?: string;
 	connectors?: string[];
 	connector_mode?: "prefer" | "require";
 	timeout_ms?: number;
@@ -141,8 +148,8 @@ class CodexCallbackCoordinator {
 		const identities = receipts.map((receipt) =>
 			`${receipt.taskId}${receipt.runId ? ` (${receipt.runId})` : ""}: ${receipt.status}`,
 		).join(", ");
-		const message = `${receipts.length === 1 ? "A" : receipts.length} ChatGPT Pro ${noun} finished. `
-			+ `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_subagent_get and update the user. ${identities}`;
+		const message = `${receipts.length === 1 ? "A" : receipts.length} GPT ${noun} finished. `
+			+ `Collect the durable ${receipts.length === 1 ? "result" : "results"} with gpt_worker_get and update the user. ${identities}`;
 		let result;
 		try {
 			result = await this.options.exec(this.options.command, [
@@ -197,12 +204,23 @@ export function createMcpServer(serviceOrOptions: GptControlService | GptMcpOpti
 	void recoveryReady.catch(() => undefined);
 
 	registerCoreTools(server, service, taskStore);
-	registerSubagentRecoveryTools(server, service, taskStore, monitors, codexCallback);
-	registerSubagentRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
+	registerWorkerRecoveryTools(server, service, taskStore, monitors, codexCallback);
+	registerWorkerRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
 	return server;
 }
 
 function registerCoreTools(server: McpServer, service: GptControlService, taskStore: DurableTaskStore): void {
+	server.registerTool("gpt_models", {
+		description: "Read the currently available ChatGPT model and effort choices from the live picker. No prompt is sent and the temporary owned tab is closed.",
+		inputSchema: {},
+		annotations: { readOnlyHint: true },
+	}, async () => toolPayload("Live ChatGPT model catalog.", await service.listModels()));
+	server.registerTool("gpt_projects", {
+		description: "Read the currently available ChatGPT project names from the live sidebar. No prompt is sent and the temporary owned tab is closed.",
+		inputSchema: {},
+		annotations: { readOnlyHint: true },
+	}, async () => toolPayload("Live ChatGPT project catalog.", await service.listProjects()));
+
 	server.registerTool("gpt_consult", {
 		description: "Request a bounded independent review. Attachment and provider authority come only from trusted operator policy.",
 		inputSchema: { question: z.string().min(1), ...CommonSchema },
@@ -226,6 +244,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 			conversation_id: z.string().optional(),
 			files: z.array(z.string()).max(32).optional(),
 			chatgpt_model: ChatGptModelSchema.optional(),
+			chatgpt_effort: ChatGptEffortSchema.optional(),
 			idempotency_key: IdempotencyKeySchema.optional(),
 			timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
 		},
@@ -238,6 +257,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 			conversationId: params.conversation_id,
 			transport: "browser",
 			chatgptModel: params.chatgpt_model,
+			chatgptEffort: params.chatgpt_effort,
 			idempotencyKey: params.idempotency_key,
 			timeoutMs: params.timeout_ms,
 		}, { mcpSessionId: extra.sessionId }));
@@ -323,6 +343,29 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		});
 	});
 
+	server.registerTool("gpt_conversation_manage", {
+		description: "Pin, unpin, rename, move, or archive one exact GPT-Control-owned ChatGPT conversation with live read-back. Archive also closes the local owned tab.",
+		inputSchema: {
+			conversation_id: z.string(),
+			action: z.enum(["pin", "unpin", "rename", "move", "archive"]),
+			title: z.string().min(1).max(128).optional(),
+			project: z.string().min(1).max(128).optional(),
+		},
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params, extra) => {
+		const operation = params.action === "rename"
+			? { action: "rename" as const, title: params.title ?? "" }
+			: params.action === "move"
+				? { action: "move" as const, project: params.project ?? "" }
+				: { action: params.action } as const;
+		const result = await service.manageConversation(params.conversation_id, operation, extra.sessionId);
+		return toolPayload(`ChatGPT conversation ${params.conversation_id} ${params.action} verified.`, {
+			conversationId: params.conversation_id,
+			action: params.action,
+			...result,
+		});
+	});
+
 	server.registerTool("gpt_diagnose", {
 		description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
 		inputSchema: {},
@@ -336,7 +379,7 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 	}, async () => toolPayload("GPT-Control active smoke test.", await service.activeSmokeTest()));
 }
 
-function registerSubagentRun(
+function registerWorkerRun(
 	server: McpServer,
 	service: GptControlService,
 	taskStore: DurableTaskStore,
@@ -347,14 +390,14 @@ function registerSubagentRun(
 	codexCallback?: CodexCallbackCoordinator,
 ): void {
 	const config = {
-		title: "Run ChatGPT Pro worker",
-		description: "Start one bounded ChatGPT Pro worker in its own owned browser conversation. Codex remains the orchestrator. Do not poll while the task result is pending.",
+		title: "Run GPT Worker",
+		description: "Start one bounded GPT Worker in its own owned browser conversation. The live model and effort can be selected for each worker. Do not poll while the task result is pending.",
 		inputSchema: SubagentSchema,
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
 		execution: { taskSupport: "optional" as const },
 	};
 	if (!taskSupport || typeof server.experimental.tasks.registerToolTask !== "function") {
-		server.registerTool("gpt_subagent_run", {
+		server.registerTool("gpt_worker_run", {
 			...config,
 			description: `${config.description} This runtime lacks MCP task registration, so the call returns exactly once when terminal.`,
 		}, async (params, extra) => {
@@ -364,7 +407,7 @@ function registerSubagentRun(
 		return;
 	}
 
-	server.experimental.tasks.registerToolTask("gpt_subagent_run", config, {
+	server.experimental.tasks.registerToolTask("gpt_worker_run", config, {
 		async createTask(params: SubagentParams, extra: CreateTaskRequestHandlerExtra) {
 			await recoveryReady;
 			const task = await extra.taskStore.createTask({ ttl: extra.taskRequestedTtl, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS });
@@ -385,15 +428,15 @@ function registerSubagentRun(
 				taskStore.removeStatusListener(task.taskId);
 				return { task };
 			}
-			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned Pro worker.");
+			await sendProgress(extra.sendNotification, progressToken, 0.05, "Creating owned GPT Worker.");
 			try {
 				const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: extra.sessionId });
 				preparedRunId = started.run.id;
 				if (started.run.mcpTaskId && started.run.mcpTaskId !== task.taskId) {
-					throw new Error("This idempotent Pro worker is already owned by another durable MCP task.");
+					throw new Error("This idempotent GPT Worker is already owned by another durable MCP task.");
 				}
 				if (started.run.executionReady && !started.run.mcpTaskId) {
-					throw new Error("This idempotent Pro worker was created outside MCP task ownership and cannot be adopted.");
+					throw new Error("This idempotent GPT Worker was created outside MCP task ownership and cannot be adopted.");
 				}
 				await taskStore.bindRun(task.taskId, started.run.id);
 				const currentTask = await taskStore.getTask(task.taskId, extra.sessionId);
@@ -403,7 +446,7 @@ function registerSubagentRun(
 					// Bind and return taskCreated before provider work is eligible. A short
 					// activation grace lets an immediate protocol cancellation durably seal
 					// the run before any browser submission; no status polling is required.
-					await taskStore.updateTaskStatus(task.taskId, "working", `Pro worker ${started.run.id} is prepared for activation after the cancellation grace.`);
+					await taskStore.updateTaskStatus(task.taskId, "working", `GPT Worker ${started.run.id} is prepared for activation after the cancellation grace.`);
 					await sendProgress(extra.sendNotification, progressToken, 0.1, "Owned worker prepared; browser execution begins after taskCreated and the bounded cancellation grace.");
 					scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId, codexCallback);
 				}
@@ -414,7 +457,7 @@ function registerSubagentRun(
 					taskStore.removeStatusListener(task.taskId);
 					return { task };
 				}
-				await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`Pro worker could not start: ${errorMessage(error)}`, {
+				await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`GPT Worker could not start: ${errorMessage(error)}`, {
 					taskId: task.taskId,
 					status: "failed",
 					reason: errorMessage(error),
@@ -435,58 +478,58 @@ function registerSubagentRun(
 	});
 }
 
-function registerSubagentRecoveryTools(
+function registerWorkerRecoveryTools(
 	server: McpServer,
 	service: GptControlService,
 	taskStore: DurableTaskStore,
 	monitors: Map<string, Promise<void>>,
 	codexCallback?: CodexCallbackCoordinator,
 ): void {
-	server.registerTool("gpt_subagent_get", {
-		description: "Durable read-only lookup for one Pro worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
+	server.registerTool("gpt_worker_get", {
+		description: "Durable read-only lookup for one GPT Worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
 		inputSchema: { run_id: z.string().optional(), task_id: z.string().optional() },
 		annotations: { readOnlyHint: true },
 	}, async (params, extra) => {
 		const identity = requireOneIdentity(params.run_id, params.task_id);
 		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!, extra.sessionId);
 		if (identity.runId && extra.sessionId !== undefined && !taskId) {
-			throw new Error("No Pro worker owned by this MCP session matched that run id.");
+			throw new Error("No GPT Worker owned by this MCP session matched that run id.");
 		}
 		const runId = identity.runId ?? (taskId ? await taskStore.getRunId(taskId, extra.sessionId) : undefined);
 		if (taskId) await activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback);
 		const task = taskId ? await taskStore.getTask(taskId, extra.sessionId) : null;
 		const run = runId ? await service.getRun(runId) : undefined;
-		if (!task && !run) throw new Error("No durable Pro worker matched that identity.");
+		if (!task && !run) throw new Error("No durable GPT Worker matched that identity.");
 		return toolPayload(run ? runText(run) : `Task ${taskId}: ${task?.status}.`, {
 			task: task ? publicTask(task) : undefined,
 			run: run ? publicRun(run) : undefined,
 		});
 	});
 
-	server.registerTool("gpt_subagent_cancel", {
-		description: "Cancel one Pro worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
+	server.registerTool("gpt_worker_cancel", {
+		description: "Cancel one GPT Worker independently by run id or MCP task id. Late completion cannot overwrite cancellation.",
 		inputSchema: { run_id: z.string().optional(), task_id: z.string().optional() },
 		annotations: { readOnlyHint: false, destructiveHint: true },
 	}, async (params, extra) => {
 		const identity = requireOneIdentity(params.run_id, params.task_id);
 		const taskId = identity.taskId ?? await taskStore.findTaskIdByRun(identity.runId!, extra.sessionId);
 		if (identity.runId && extra.sessionId !== undefined && !taskId) {
-			throw new Error("No Pro worker owned by this MCP session matched that run id.");
+			throw new Error("No GPT Worker owned by this MCP session matched that run id.");
 		}
 		if (taskId) {
 			const runId = identity.runId ?? await taskStore.getRunId(taskId, extra.sessionId);
-			await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_subagent_cancel.", extra.sessionId);
+			await taskStore.updateTaskStatus(taskId, "cancelled", "Cancelled through gpt_worker_cancel.", extra.sessionId);
 			// Keep the tool's provider-Stop guarantee explicit. The task-store listener
 			// also routes protocol tasks/cancel here; cancelRun is durable and idempotent.
 			const run = runId ? await service.cancelRun(runId) : undefined;
-			return toolPayload(`Pro worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
+			return toolPayload(`GPT Worker ${taskId} is cancelled.`, { taskId, run: run ? publicRun(run) : undefined });
 		}
 		if (!identity.runId) throw new Error("No run id was available to cancel.");
 		return runPayload(await service.cancelRun(identity.runId));
 	});
 
-	server.registerTool("gpt_subagent_list", {
-		description: "Bounded overview of active Pro workers. This is a recovery aid, not a polling requirement.",
+	server.registerTool("gpt_worker_list", {
+		description: "Bounded overview of active GPT Workers. This is a recovery aid, not a polling requirement.",
 		inputSchema: { limit: z.number().int().positive().max(100).optional(), include_terminal: z.boolean().optional() },
 		annotations: { readOnlyHint: true },
 	}, async (params, extra) => {
@@ -499,7 +542,7 @@ function registerSubagentRecoveryTools(
 			rows.push({ task: publicTask(binding.task), run: run ? publicRun(run) : undefined });
 			if (rows.length >= limit) break;
 		}
-		return toolPayload(`${rows.length} Pro worker${rows.length === 1 ? "" : "s"}.`, { workers: rows });
+		return toolPayload(`${rows.length} GPT Worker${rows.length === 1 ? "" : "s"}.`, { workers: rows });
 	});
 }
 
@@ -551,7 +594,7 @@ function scheduleTaskActivation(
 	const timer = setTimeout(() => {
 		timers.delete(taskId);
 		void activateTaskIfPending(service, taskStore, monitors, taskId, codexCallback).catch(async (error) => {
-			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker activation failed: ${errorMessage(error)}`, {
+			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`GPT Worker activation failed: ${errorMessage(error)}`, {
 				taskId, status: "failed", reason: errorMessage(error),
 			}, true)).catch(() => undefined);
 			await codexCallback?.queue(taskId, await taskStore.getRunId(taskId).catch(() => undefined), "failed");
@@ -585,7 +628,7 @@ async function activateTaskIfPending(
 		await service.cancelRun(runId);
 		return;
 	}
-	await taskStore.updateTaskStatus(taskId, "working", `Pro worker ${runId} is running in an owned browser conversation.`);
+	await taskStore.updateTaskStatus(taskId, "working", `GPT Worker ${runId} is running in an owned browser conversation.`);
 	startTaskMonitor(service, taskStore, monitors, taskId, runId, undefined, codexCallback);
 }
 
@@ -602,7 +645,7 @@ function startTaskMonitor(
 	if (existing) return existing;
 	const monitor = monitorTask(service, taskStore, taskId, runId, emitProgress, codexCallback)
 		.catch(async (error) => {
-			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`Pro worker monitor failed: ${errorMessage(error)}`, {
+			await taskStore.storeTaskResult(taskId, "failed", toolPayload(`GPT Worker monitor failed: ${errorMessage(error)}`, {
 				taskId,
 				runId,
 				status: "failed",
@@ -630,7 +673,7 @@ async function monitorTask(
 	await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
 	let run = await service.waitForRun(runId, (initial.timeoutMs ?? 600_000) + 120_000);
 	if (run.status === "queued" || run.status === "running") {
-		run = await service.markNeedsUser(runId, "The Pro worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
+		run = await service.markNeedsUser(runId, "The GPT Worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
 	}
 	const task = await taskStore.getTask(taskId);
 	if (task?.status === "cancelled") return;
@@ -641,8 +684,8 @@ async function monitorTask(
 		return;
 	}
 	if (run.status === "needs_user") {
-		await taskStore.updateTaskStatus(taskId, "input_required", run.error ?? "The Pro worker requires operator input.");
-		await emitProgress?.(0.95, "Pro worker needs operator input; delivering one terminal blocker result.");
+		await taskStore.updateTaskStatus(taskId, "input_required", run.error ?? "The GPT Worker requires operator input.");
+		await emitProgress?.(0.95, "GPT Worker needs operator input; delivering one terminal blocker result.");
 		// MCP input_required is intentionally non-terminal. Keep it observable for
 		// several declared poll intervals, then seal the task with one blocker result.
 		await delay(INPUT_REQUIRED_DELIVERY_GRACE_MS);
@@ -653,7 +696,7 @@ async function monitorTask(
 		return;
 	}
 	if (run.status === "cancelled") {
-		await taskStore.updateTaskStatus(taskId, "cancelled", run.error ?? "Pro worker was cancelled.");
+		await taskStore.updateTaskStatus(taskId, "cancelled", run.error ?? "GPT Worker was cancelled.");
 		return;
 	}
 	await taskStore.storeTaskResult(taskId, "failed", subagentResult(taskId, run));
@@ -703,7 +746,7 @@ export async function resumeDurableSubagents(
 		if (["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
 		const runId = binding.runId;
 		if (!runId) {
-			await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("Pro worker task has no durable run binding; no prompt was resubmitted.", {
+			await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("GPT Worker task has no durable run binding; no prompt was resubmitted.", {
 				taskId: binding.task.taskId,
 				status: "failed",
 				reason: "missing durable run binding",
@@ -721,7 +764,8 @@ function subagentRequest(params: SubagentParams, wait: boolean): StartRequest {
 		prompt: params.prompt,
 		files: params.files,
 		transport: "browser",
-		chatgptModel: "pro",
+		chatgptModel: params.chatgpt_model ?? "pro",
+		chatgptEffort: params.chatgpt_effort,
 		idempotencyKey: params.idempotency_key,
 		connectors: params.connectors,
 		connectorMode: params.connector_mode,
@@ -738,6 +782,8 @@ function toRequest(params: Record<string, unknown>, kind: Exclude<RunKind, "suba
 		conversationId: params.conversation_id as string | undefined,
 		transport: params.transport as StartRequest["transport"],
 		chatgptModel: params.chatgpt_model as StartRequest["chatgptModel"],
+		chatgptEffort: params.chatgpt_effort as string | undefined,
+		pinChat: params.pin_chat as boolean | undefined,
 		idempotencyKey: params.idempotency_key as string | undefined,
 		wait: params.wait !== false,
 		timeoutMs: params.timeout_ms as number | undefined,
@@ -816,7 +862,7 @@ function publicTask(task: Task): Record<string, unknown> {
 }
 
 function runText(run: RunRecord): string {
-	if (run.status === "completed") return run.resultText ?? "Pro worker completed without text.";
+	if (run.status === "completed") return run.resultText ?? "GPT Worker completed without text.";
 	if (run.status === "failed" || run.status === "cancelled" || run.status === "needs_user") return run.error ?? run.status;
 	return `Run ${run.id} is ${run.status}.`;
 }

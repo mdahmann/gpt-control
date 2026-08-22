@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.3.2";
+export const PACKAGE_VERSION = "0.4.0";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -10,7 +10,9 @@ export type RunKind = "consult" | "chat" | "image" | "subagent";
 export type SubmissionState = "not_submitted" | "submitting" | "submitted" | "not_applicable";
 export type Verdict = "approve" | "request_changes" | "inconclusive";
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
-export type ChatGptModel = "pro";
+/** Exact live picker label. The legacy value `pro` means the Pro effort preset. */
+export type ChatGptModel = string;
+export type ChatGptEffort = string;
 export type ModelEvidenceKind = "composer_selector" | "provider_response" | "provider_sdk";
 export type BrowserPageId = string | number;
 
@@ -75,6 +77,7 @@ export interface RunDiagnostics {
 	localAssistantTurnCount?: number;
 	lastObservedUrl?: string;
 	lastObservedUiState?: string;
+	organizationWarnings?: string[];
 }
 
 export interface ReviewReceipt {
@@ -83,6 +86,8 @@ export interface ReviewReceipt {
 	model?: string;
 	requestedModel?: string;
 	observedModel?: string;
+	requestedEffort?: string;
+	observedEffort?: string;
 	modelVerified?: boolean;
 	modelEvidenceKind?: ModelEvidenceKind;
 	modelVerifiedAt?: string;
@@ -117,6 +122,10 @@ export interface ConversationRecord {
 	browserSessionName?: string;
 	browserPageId?: BrowserPageId;
 	browserAssistantTurnCount?: number;
+	providerPinned?: boolean;
+	providerTitle?: string;
+	providerProject?: string;
+	providerArchivedAt?: string;
 	workspaceRoot: string;
 	policyFingerprint?: string;
 	/** Durable owner for resources created through a multiplexed MCP session. */
@@ -147,6 +156,8 @@ export interface RunRecord {
 	baselineMessageCount?: number;
 	submissionState?: SubmissionState;
 	requestedChatGptModel?: ChatGptModel;
+	requestedChatGptEffort?: ChatGptEffort;
+	pinChatRequested?: boolean;
 	timeoutMs?: number;
 	deadlineAt?: string;
 	idempotencyKeyHash?: string;
