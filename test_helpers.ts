@@ -101,6 +101,15 @@ export class FakeChromeBridge {
 				await waitWithAbort(this.options.sendDelayMs!, options?.signal);
 			}
 			if (command === this.launcher.privateRpc?.command) {
+				const requestPath = args.at(-1);
+				if (!requestPath) throw new Error("private request path missing");
+				const request = JSON.parse(readFileSync(requestPath, "utf8")) as { action: string; payload: Record<string, unknown> };
+				this.privateRequests.push(request);
+				if ((this.options.sendDelayMs ?? 0) > 0) {
+					if (request.action === "click" && String(request.payload?.selector ?? "").includes("send-button")) {
+						await waitWithAbort(this.options.sendDelayMs!, options?.signal);
+					}
+				}
 				return this.handlePrivate(args);
 			}
 			return this.handleBridge(args);
@@ -175,7 +184,6 @@ export class FakeChromeBridge {
 		const requestPath = args.at(-1);
 		if (!requestPath) throw new Error("private request path missing");
 		const request = JSON.parse(readFileSync(requestPath, "utf8")) as { action: string; payload: Record<string, unknown> };
-		this.privateRequests.push(request);
 		const expected = request.payload.expectedTarget;
 		if (expected && typeof expected === "object" && !Array.isArray(expected)) {
 			const target = expected as { sessionId?: string; tabId?: number; name?: string; url?: string };

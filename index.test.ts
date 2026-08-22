@@ -35,10 +35,10 @@ const Type: TypeBuilder = {
 };
 
 describe("public extension contract", () => {
-	test("keeps three workers as default and permits an operator ceiling through ten", () => {
+	test("defaults to six workers and permits an operator ceiling through ten", () => {
 		const root = scratch();
 		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
-		expect(operatorPolicyFromEnv({}, common).maxConcurrentWorkers).toBe(3);
+		expect(operatorPolicyFromEnv({}, common).maxConcurrentWorkers).toBe(6);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "6" }, common).maxConcurrentWorkers).toBe(6);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "10" }, common).maxConcurrentWorkers).toBe(10);
 		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");

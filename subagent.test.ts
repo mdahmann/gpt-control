@@ -1130,8 +1130,8 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			}, CallToolResultSchema, { task: { ttl: 60_000 }, timeout: 5000 })[Symbol.asyncIterator]();
 			const created = await iterator.next();
 			const taskId = (created.value as { type: "taskCreated"; task: { taskId: string } }).task.taskId;
-			await waitUntil(() => harness.bridge.calls.some((call) =>
-				call.args[0] === "click" && String(call.args[2] ?? "").includes("send-button")));
+			await waitUntil(() => harness.bridge.privateRequests.some((request) =>
+				request.action === "click" && String(request.payload.selector ?? "").includes("send-button")));
 			expect(harness.bridge.submittedPrompts).toEqual([]);
 			expect((await harness.client.experimental.tasks.cancelTask(taskId)).status).toBe("cancelled");
 			const runId = await harness.taskStore.getRunId(taskId);

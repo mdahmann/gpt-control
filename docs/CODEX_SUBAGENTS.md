@@ -27,9 +27,8 @@ uses the durable task/run IDs, not conversational polling.
 
 ## Concurrency
 
-- The safe default is three workers. The operator can set
-  `GPT_CONTROL_MAX_PRO_WORKERS` from 1 through 10. Five or six is the initial
-  recommendation after local validation; ten is experimental.
+- The default worker ceiling is six. The operator can set
+  `GPT_CONTROL_MAX_PRO_WORKERS` from 1 through 10. Ten is the hard ceiling.
 - Each worker receives a new owned browser session and ChatGPT conversation.
 - A durable global ordering prevents separate broker processes from exceeding
   the configured ceiling.
