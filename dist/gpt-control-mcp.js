@@ -37155,7 +37155,9 @@ ${proofLine}`;
       }
       const preSendObservation = await driver.observe(ready.session, signal);
       await driver.send(ready.session, signal);
-      const identityDeadline = Math.min(Date.now() + 15000, Date.parse(run.deadlineAt ?? "") || Date.now() + 15000);
+      const identityStartedAt = Date.now();
+      const runDeadline = Date.parse(run.deadlineAt ?? "");
+      const identityDeadline = Math.min(identityStartedAt + 15000, Math.max(identityStartedAt + 1000, Number.isFinite(runDeadline) ? runDeadline : identityStartedAt + 15000));
       let submittedIdentity;
       let persisted;
       let firstNewProviderUserMessageId;

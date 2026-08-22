@@ -1001,9 +1001,18 @@ export class GptControlService {
 			}
 			const preSendObservation = await driver.observe(ready.session, signal);
 			await driver.send(ready.session, signal);
+			const identityStartedAt = Date.now();
+			const runDeadline = Date.parse(run.deadlineAt ?? "");
+			// After the irreversible send boundary, reserve a short bounded grace
+			// period to bind the provider-issued user-turn identity. Without this,
+			// a tight caller deadline can leave an active turn that the broker cannot
+			// safely stop or recover because it has no durable provider identity.
 			const identityDeadline = Math.min(
-				Date.now() + 15_000,
-				Date.parse(run.deadlineAt ?? "") || Date.now() + 15_000,
+				identityStartedAt + 15_000,
+				Math.max(
+					identityStartedAt + 1_000,
+					Number.isFinite(runDeadline) ? runDeadline : identityStartedAt + 15_000,
+				),
 			);
 			let submittedIdentity: { id: string; url: string } | undefined;
 			let persisted: { conversation: ConversationRecord; run: RunRecord } | undefined;
