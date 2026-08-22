@@ -5,8 +5,8 @@ GPT-Control keeps Codex as the orchestrator. The three public concepts are:
 - **GPT Chat:** one direct `gpt_chat` turn or a follow-up in an exact owned
   conversation.
 - **GPT Worker:** one durable background ChatGPT assignment started by
-  `gpt_worker_run`. The Worker can use any live model and effort listed by
-  `gpt_models`.
+  `gpt_worker_start`, or a batch started by `gpt_worker_start_many`. The Worker
+  can use any live model and effort listed by `gpt_models`.
 - **GPT Sub-agent:** a native Codex child agent that owns one GPT-Control
   conversation and uses `gpt_chat` for as many turns as its goal requires.
 
@@ -26,6 +26,20 @@ replace this path with an unmanaged shell loop.
 
 ## Client paths
 
+### Detached Codex parent
+
+Use `gpt_worker_start` or `gpt_worker_start_many`. These are ordinary,
+immediate-return tools rather than MCP task calls. Before launch, the parent
+reads the current runtime-provided `CODEX_THREAD_ID` from its shell environment
+and supplies that UUID as `callback_thread_id`. The response includes every
+durable task/run handle and `callbackBound` state. The parent yields immediately
+only after the required callback bindings are true.
+
+Completion queues one fixed receipt to the parent through `codex queue`. If the
+parent is busy, Codex keeps the message queued until a safe turn boundary. The
+parent calls `gpt_worker_get` once after the callback; it does not poll while
+the Worker is active.
+
 ### MCP task-capable client
 
 `gpt_worker_run` advertises optional task execution. The server creates and
@@ -42,11 +56,12 @@ completion or blocker and returns once. This is the compatibility path for a
 client that cannot negotiate MCP tasks.
 
 A task notification is a protocol event and is not itself treated as a
-model-visible callback. In Codex 0.149 or newer, the plugin can also bind a task
-to the trusted `CODEX_THREAD_ID` supplied by the runtime. When that task becomes
-terminal, GPT-Control stages a compact receipt and invokes `codex queue` for the
-bound parent. The parent then reads the authoritative result with
-`gpt_worker_get`; no repeated polling is required.
+model-visible callback. In Codex 0.149 or newer, a detached start can bind its
+durable task to an explicit current-task UUID obtained from Codex's
+runtime-provided shell environment. When that task becomes terminal,
+GPT-Control stages a compact receipt and invokes `codex queue` for the bound
+parent. The parent then reads the authoritative result with `gpt_worker_get`;
+no repeated polling is required.
 
 Nearby terminal receipts for one parent are coalesced into one queued message.
 The receipt contains only task/run IDs and statuses, never the worker prompt or
@@ -55,11 +70,12 @@ the external command. This gives restart-safe at-most-once automatic delivery:
 an ambiguous crash can lose a wake-up, but it cannot automatically send a
 duplicate. Durable task/run lookup remains the recovery path.
 
-The parent target is never accepted from a model-facing tool argument. If
-`CODEX_THREAD_ID` is missing or invalid, or the trusted Codex executable cannot
-be found, only the callback is disabled; the worker and its durable result still
-operate normally. This release uses the local `codex queue` route and does not
-configure a remote app-server callback.
+The callback target routes only a fixed, bounded GPT-Control receipt. It cannot
+supply arbitrary callback text or grant repository, connector, browser, or
+provider authority. If the current task ID is missing or invalid, or the trusted
+Codex executable cannot be found, a requested callback start fails before
+claiming that automatic wake-up is available. This release uses the local
+`codex queue` route and does not configure a remote app-server callback.
 
 ## GPT Worker concurrency
 

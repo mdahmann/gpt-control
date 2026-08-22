@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.2] - 2026-08-22
+
+- Added immediate-return `gpt_worker_start` and `gpt_worker_start_many` tools so
+  Codex can launch one through ten durable Workers without holding the parent
+  turn open.
+- Added explicit per-launch Codex callback routing and visible callback binding
+  receipts. Shared MCP-server startup state is no longer assumed to contain the
+  current Codex task identity.
+- Kept `gpt_worker_run` as the backward-compatible MCP Tasks route.
+- Added multi-parent callback recovery and coalesced per-parent `codex queue`
+  delivery.
+
 ## [0.4.1] - 2026-08-22
 
 ### Added

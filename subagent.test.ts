@@ -595,7 +595,7 @@ async function connectMcp(options: {
 	bridge?: FakeChromeBridge;
 	root?: string;
 	recover?: boolean;
-	codexCallback?: false | { threadId: string; command: string; exec: Exec; delayMs?: number };
+	codexCallback?: false | { threadId?: string; command: string; exec: Exec; delayMs?: number };
 } = {}): Promise<McpHarness> {
 	const root = options.root ?? scratch();
 	const workspace = join(root, "workspace");
@@ -649,6 +649,101 @@ function taskIdFrom(events: Array<Record<string, unknown>>): string {
 }
 
 describe("MCP task delivery", () => {
+	test("detached worker start returns before completion and binds the explicit Codex callback", async () => {
+		const bridge = new FakeChromeBridge();
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const threadId = "019c8f58-41ac-72b0-a9f6-43653b3ea80c";
+		const harness = await connectMcp({
+			bridge,
+			codexCallback: { command: "/trusted/bin/codex", exec, delayMs: 1 },
+		});
+		try {
+			const started = await harness.client.callTool({
+				name: "gpt_worker_start",
+				arguments: {
+					prompt: "[slow] detached worker",
+					idempotency_key: "detached-worker",
+					callback_thread_id: threadId,
+					timeout_ms: 1500,
+				},
+			});
+			expect(started.isError).not.toBe(true);
+			expect(started.structuredContent).toMatchObject({
+				callbackBound: true,
+				task: { status: "working" },
+				callback: { targetThreadId: threadId, state: "waiting" },
+				run: { status: "queued" },
+			});
+			expect(calls).toEqual([]);
+			const taskId = (started.structuredContent as { task: { taskId: string } }).task.taskId;
+			await waitUntil(() => bridge.submittedPrompts.length === 1);
+			bridge.release();
+			await waitUntil(() => calls.length === 1);
+			expect(calls[0].args.slice(0, 4)).toEqual(["queue", "--thread", threadId, "--message"]);
+			const recovered = await harness.client.callTool({
+				name: "gpt_worker_get",
+				arguments: { task_id: taskId },
+			});
+			expect(recovered.structuredContent).toMatchObject({
+				task: { status: "completed" },
+				run: { status: "completed" },
+				callback: { targetThreadId: threadId, state: "delivered" },
+			});
+		} finally {
+			await harness.close();
+		}
+	});
+
+	test("detached batch starts every worker before any terminal result", async () => {
+		const bridge = new FakeChromeBridge();
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const exec: Exec = async (command, args) => {
+			calls.push({ command, args: [...args] });
+			return { stdout: "queued\n", stderr: "", code: 0, killed: false };
+		};
+		const threadId = "019c8f58-41ac-72b0-a9f6-43653b3ea80c";
+		const harness = await connectMcp({
+			bridge,
+			codexCallback: { command: "/trusted/bin/codex", exec, delayMs: 50 },
+		});
+		try {
+			const started = await harness.client.callTool({
+				name: "gpt_worker_start_many",
+				arguments: {
+					callback_thread_id: threadId,
+					workers: [1, 2, 3].map((index) => ({
+						prompt: `[slow] detached batch ${index}`,
+						idempotency_key: `detached-batch-${index}`,
+						timeout_ms: 1500,
+					})),
+				},
+			});
+			expect(started.isError).not.toBe(true);
+			const content = started.structuredContent as {
+				callbackBound: boolean;
+				workers: Array<{ callbackBound: boolean; task: { taskId: string; status: string }; run: { status: string } }>;
+			};
+			expect(content.callbackBound).toBe(true);
+			expect(content.workers).toHaveLength(3);
+			expect(content.workers.every((worker) => worker.callbackBound && worker.task.status === "working" && worker.run.status === "queued")).toBe(true);
+			expect(calls).toEqual([]);
+			await waitUntil(() => bridge.submittedPrompts.length === 3);
+			bridge.release();
+			bridge.release();
+			bridge.release();
+			await waitUntil(() => calls.length === 1);
+			expect(calls[0].args[4]).toContain("3 GPT workers finished");
+			await waitUntil(async () => (await Promise.all(content.workers.map(async (worker) =>
+				(await harness.taskStore.getCodexParent(worker.task.taskId))?.state === "delivered"))).every(Boolean));
+		} finally {
+			await harness.close();
+		}
+	});
+
 	test("passes an exact live model and effort into a GPT Worker", async () => {
 		const bridge = new FakeChromeBridge({
 			currentEffortPicker: true,

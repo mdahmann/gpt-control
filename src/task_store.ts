@@ -266,6 +266,25 @@ export class DurableTaskStore implements TaskStore {
 		});
 	}
 
+	async getCodexParent(taskId: string, sessionId?: string): Promise<CodexParentCallback | undefined> {
+		const record = await this.readRecord(taskId);
+		return this.withSessionAccess(record, sessionId, async () =>
+			record.parentCallback ? { ...record.parentCallback } : undefined);
+	}
+
+	async listCodexParentThreadIds(): Promise<string[]> {
+		await this.init();
+		const names = (await readdir(this.root))
+			.filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name))
+			.sort();
+		const threadIds = new Set<string>();
+		for (const name of names) {
+			const record = await this.readRecord(name.slice(0, -5));
+			if (record.parentCallback) threadIds.add(record.parentCallback.threadId);
+		}
+		return [...threadIds].sort();
+	}
+
 	async stageCodexCallback(
 		taskId: string,
 		runId: string | undefined,

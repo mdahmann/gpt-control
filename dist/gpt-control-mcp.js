@@ -6633,6 +6633,7 @@ var require_dist = __commonJS(function(exports, module) {
 });
 
 // src/mcp.ts
+import { randomUUID as randomUUID6 } from "crypto";
 import { join as join7, resolve as resolve9 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
 
@@ -29319,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.4.1";
+var PACKAGE_VERSION = "0.4.2";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33761,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.4.1";
+var PACKAGE_VERSION2 = "0.4.2";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -39089,6 +39090,21 @@ class DurableTaskStore {
       return record3;
     });
   }
+  async getCodexParent(taskId, sessionId) {
+    const record3 = await this.readRecord(taskId);
+    return this.withSessionAccess(record3, sessionId, async () => record3.parentCallback ? { ...record3.parentCallback } : undefined);
+  }
+  async listCodexParentThreadIds() {
+    await this.init();
+    const names = (await readdir2(this.root)).filter((name) => /^task_[a-f0-9]{32}\.json$/.test(name)).sort();
+    const threadIds = new Set;
+    for (const name of names) {
+      const record3 = await this.readRecord(name.slice(0, -5));
+      if (record3.parentCallback)
+        threadIds.add(record3.parentCallback.threadId);
+    }
+    return [...threadIds].sort();
+  }
   async stageCodexCallback(taskId, runId, status) {
     let pending = false;
     await this.mutate(taskId, (record3) => {
@@ -39456,6 +39472,7 @@ var ChatGptEffortSchema = exports_external.string().min(1).max(64);
 var IdempotencyKeySchema = exports_external.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 var ConnectorNameSchema = exports_external.string().regex(/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/);
 var ConnectorModeSchema = exports_external.enum(["prefer", "require"]);
+var CodexThreadIdSchema = exports_external.string().regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i);
 var CommonSchema = {
   conversation_id: exports_external.string().optional(),
   files: exports_external.array(exports_external.string()).max(32).optional(),
@@ -39483,12 +39500,10 @@ var SubagentSchema = {
   timeout_ms: exports_external.number().int().positive().max(60 * 60000).optional()
 };
 function codexCallbackOptionsFromEnv(env = process.env, exec = fallbackExec) {
-  const threadId = env.CODEX_THREAD_ID?.trim();
-  if (!threadId)
-    return false;
-  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
-    console.error("GPT-Control parent callbacks are disabled because CODEX_THREAD_ID is not a UUID.");
-    return false;
+  const requestedThreadId = env.CODEX_THREAD_ID?.trim();
+  const threadId = requestedThreadId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(requestedThreadId) ? requestedThreadId : undefined;
+  if (requestedThreadId && !threadId) {
+    console.error("GPT-Control ignored an invalid default CODEX_THREAD_ID; explicit per-launch callback routing remains available.");
   }
   const requestedCommand = env.GPT_CONTROL_CODEX_CLI?.trim() || "codex";
   const command = findOnPath2(requestedCommand, env);
@@ -39496,46 +39511,61 @@ function codexCallbackOptionsFromEnv(env = process.env, exec = fallbackExec) {
     console.error(`GPT-Control parent callbacks are disabled because the trusted Codex CLI was not found: ${requestedCommand}`);
     return false;
   }
-  return { threadId, command, exec };
+  return { threadId: threadId || undefined, command, exec };
 }
 
 class CodexCallbackCoordinator {
   options;
   taskStore;
   timer;
+  pendingThreadIds = new Set;
   constructor(options, taskStore) {
     this.options = options;
     this.taskStore = taskStore;
-    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.threadId)) {
+    if (options.threadId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.threadId)) {
       throw new Error("Trusted CODEX_THREAD_ID must be a UUID before parent callbacks can be enabled.");
     }
     if (options.command.trim() === "")
       throw new Error("Trusted Codex callback command is empty.");
   }
-  async register(taskId) {
+  async register(taskId, requestedThreadId) {
+    const threadId = requestedThreadId ?? this.options.threadId;
+    if (!threadId)
+      return false;
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId)) {
+      throw new Error("Codex callback thread id must be a UUID.");
+    }
     try {
-      await this.taskStore.bindCodexParent(taskId, this.options.threadId);
+      await this.taskStore.bindCodexParent(taskId, threadId);
+      return true;
     } catch (error51) {
       console.error(`GPT-Control could not bind parent callback for ${taskId}: ${callbackErrorDetail(errorMessage3(error51))}`);
+      throw error51;
     }
   }
   async recover() {
     try {
-      if (await this.taskStore.reconcileCodexCallbacks(this.options.threadId) > 0)
-        this.schedule();
+      for (const threadId of await this.taskStore.listCodexParentThreadIds()) {
+        if (await this.taskStore.reconcileCodexCallbacks(threadId) > 0)
+          this.schedule(threadId);
+      }
     } catch (error51) {
       console.error(`GPT-Control could not recover parent callbacks: ${callbackErrorDetail(errorMessage3(error51))}`);
     }
   }
   async queue(taskId, runId, status) {
     try {
-      if (await this.taskStore.stageCodexCallback(taskId, runId, status))
-        this.schedule();
+      if (!await this.taskStore.stageCodexCallback(taskId, runId, status))
+        return;
+      const callback = await this.taskStore.getCodexParent(taskId);
+      if (callback)
+        this.schedule(callback.threadId);
     } catch (error51) {
       console.error(`GPT-Control could not stage parent callback for ${taskId}: ${callbackErrorDetail(errorMessage3(error51))}`);
     }
   }
-  schedule() {
+  schedule(threadId) {
+    this.pendingThreadIds.add(threadId);
     if (this.timer)
       return;
     this.timer = setTimeout(() => {
@@ -39547,7 +39577,15 @@ class CodexCallbackCoordinator {
     this.timer.unref?.();
   }
   async flush() {
-    const receipts = await this.taskStore.claimPendingCodexCallbacks(this.options.threadId);
+    const threadIds = [...this.pendingThreadIds];
+    this.pendingThreadIds.clear();
+    for (const threadId of threadIds)
+      await this.flushThread(threadId);
+    if (this.pendingThreadIds.size > 0)
+      this.schedule(this.pendingThreadIds.values().next().value);
+  }
+  async flushThread(threadId) {
+    const receipts = await this.taskStore.claimPendingCodexCallbacks(threadId);
     if (receipts.length === 0)
       return;
     const noun = receipts.length === 1 ? "worker" : "workers";
@@ -39558,7 +39596,7 @@ class CodexCallbackCoordinator {
       result = await this.options.exec(this.options.command, [
         "queue",
         "--thread",
-        this.options.threadId,
+        threadId,
         "--message",
         message
       ], { timeout: 30000 });
@@ -39609,6 +39647,7 @@ function createMcpServer(serviceOrOptions = {}) {
   registerCoreTools(server, service, taskStore);
   registerWorkerRecoveryTools(server, service, taskStore, monitors, codexCallback);
   registerWorkerRun(server, service, taskStore, monitors, activationTimers, tasksEnabled, recoveryReady, codexCallback);
+  registerBackgroundWorkerTools(server, service, taskStore, monitors, activationTimers, recoveryReady, codexCallback);
   return server;
 }
 function registerCoreTools(server, service, taskStore) {
@@ -39830,6 +39869,113 @@ function registerWorkerRun(server, service, taskStore, monitors, activationTimer
     }
   });
 }
+function registerBackgroundWorkerTools(server, service, taskStore, monitors, activationTimers, recoveryReady, codexCallback) {
+  const workerSchema = {
+    ...SubagentSchema,
+    callback_thread_id: CodexThreadIdSchema.optional()
+  };
+  server.registerTool("gpt_worker_start", {
+    title: "Start GPT Worker",
+    description: "Start one durable GPT Worker and return its task and run handles immediately. This ordinary tool does not wait for the ChatGPT result. Pass callback_thread_id from the current Codex shell's CODEX_THREAD_ID when the parent should receive one fixed completion receipt.",
+    inputSchema: workerSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true }
+  }, async (params, extra) => {
+    await recoveryReady;
+    const started = await prepareBackgroundWorker(service, taskStore, monitors, activationTimers, params, extra.sessionId, codexCallback, "gpt_worker_start");
+    return backgroundStartPayload(started);
+  });
+  server.registerTool("gpt_worker_start_many", {
+    title: "Start GPT Workers",
+    description: "Prepare and start one through ten independent durable GPT Workers, then return every task and run handle immediately. The jobs share one optional Codex completion callback target and continue without keeping the parent turn open.",
+    inputSchema: {
+      workers: exports_external.array(exports_external.object(SubagentSchema)).min(1).max(10),
+      callback_thread_id: CodexThreadIdSchema.optional()
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true }
+  }, async (params, extra) => {
+    await recoveryReady;
+    const starts = [];
+    for (const worker of params.workers) {
+      starts.push(await prepareBackgroundWorker(service, taskStore, monitors, activationTimers, { ...worker, callback_thread_id: params.callback_thread_id }, extra.sessionId, codexCallback, "gpt_worker_start_many"));
+    }
+    return toolPayload(`Started ${starts.length} durable GPT Worker${starts.length === 1 ? "" : "s"}; the parent may yield immediately.`, { workers: starts.map(publicBackgroundStart), callbackBound: starts.every((start) => start.callbackBound) }, starts.some((start) => start.error !== undefined));
+  });
+}
+async function prepareBackgroundWorker(service, taskStore, monitors, activationTimers, params, sessionId, codexCallback, toolName) {
+  if (params.callback_thread_id && !codexCallback) {
+    throw new Error("Codex completion callback was requested, but the trusted Codex queue command is unavailable.");
+  }
+  let task;
+  let run;
+  let callbackBound = false;
+  try {
+    const started = await service.start(subagentRequest(params, false), { deferExecution: true, mcpSessionId: sessionId });
+    run = started.run;
+    if (run.mcpTaskId) {
+      const existingTask = await taskStore.getTask(run.mcpTaskId, sessionId);
+      if (!existingTask)
+        throw new Error("This idempotent GPT Worker is already owned by another MCP session.");
+      const callback = await taskStore.getCodexParent(existingTask.taskId, sessionId);
+      return { task: existingTask, run, callbackBound: callback !== undefined, callback };
+    }
+    const request = {
+      method: "tools/call",
+      params: { name: toolName, arguments: params }
+    };
+    task = await taskStore.createTask({ ttl: null, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS }, randomUUID6(), request, sessionId);
+    await taskStore.bindRun(task.taskId, run.id);
+    callbackBound = await codexCallback?.register(task.taskId, params.callback_thread_id) ?? false;
+    await taskStore.updateTaskStatus(task.taskId, "working", `GPT Worker ${run.id} is prepared for background activation.`);
+    scheduleTaskActivation(service, taskStore, monitors, activationTimers, task.taskId, codexCallback);
+    return {
+      task: await taskStore.getTask(task.taskId, sessionId) ?? task,
+      run: await service.getRun(run.id),
+      callbackBound,
+      callback: await taskStore.getCodexParent(task.taskId, sessionId)
+    };
+  } catch (error51) {
+    const reason = errorMessage3(error51);
+    if (task) {
+      await taskStore.storeTaskResult(task.taskId, "failed", toolPayload(`GPT Worker could not start: ${reason}`, {
+        taskId: task.taskId,
+        runId: run?.id,
+        status: "failed",
+        reason
+      }, true), sessionId).catch(() => {
+        return;
+      });
+      await codexCallback?.queue(task.taskId, run?.id, "failed");
+    }
+    if (run) {
+      if (task)
+        await service.cancelPreparedRunUnlessOwnedByAnotherTask(run.id, task.taskId).catch(() => {
+          return;
+        });
+      else
+        await service.cancelRun(run.id).catch(() => {
+          return;
+        });
+    }
+    return { task, run, callbackBound, error: reason };
+  }
+}
+function backgroundStartPayload(start) {
+  return toolPayload(start.error ? `GPT Worker${start.task ? ` ${start.task.taskId}` : ""} could not start: ${start.error}` : `GPT Worker ${start.task.taskId} started in the background; the parent may yield immediately.`, publicBackgroundStart(start), start.error !== undefined);
+}
+function publicBackgroundStart(start) {
+  return {
+    task: start.task ? publicTask(start.task) : undefined,
+    run: start.run ? publicRun(start.run) : undefined,
+    callbackBound: start.callbackBound,
+    callback: start.callback ? {
+      targetThreadId: start.callback.threadId,
+      state: start.callback.state,
+      terminalStatus: start.callback.terminalStatus,
+      error: start.callback.error
+    } : undefined,
+    error: start.error
+  };
+}
 function registerWorkerRecoveryTools(server, service, taskStore, monitors, codexCallback) {
   server.registerTool("gpt_worker_get", {
     description: "Durable read-only lookup for one GPT Worker by run id or MCP task id. Use after reconnect, not as a polling loop.",
@@ -39848,9 +39994,16 @@ function registerWorkerRecoveryTools(server, service, taskStore, monitors, codex
     const run = runId ? await service.getRun(runId) : undefined;
     if (!task && !run)
       throw new Error("No durable GPT Worker matched that identity.");
+    const callback = taskId ? await taskStore.getCodexParent(taskId, extra.sessionId) : undefined;
     return toolPayload(run ? runText(run) : `Task ${taskId}: ${task?.status}.`, {
       task: task ? publicTask(task) : undefined,
-      run: run ? publicRun(run) : undefined
+      run: run ? publicRun(run) : undefined,
+      callback: callback ? {
+        targetThreadId: callback.threadId,
+        state: callback.state,
+        terminalStatus: callback.terminalStatus,
+        error: callback.error
+      } : undefined
     });
   });
   server.registerTool("gpt_worker_cancel", {
@@ -39892,7 +40045,17 @@ function registerWorkerRecoveryTools(server, service, taskStore, monitors, codex
       const run = binding.runId ? await service.getRun(binding.runId).catch(() => {
         return;
       }) : undefined;
-      rows.push({ task: publicTask(binding.task), run: run ? publicRun(run) : undefined });
+      const callback = await taskStore.getCodexParent(binding.task.taskId, extra.sessionId);
+      rows.push({
+        task: publicTask(binding.task),
+        run: run ? publicRun(run) : undefined,
+        callback: callback ? {
+          targetThreadId: callback.threadId,
+          state: callback.state,
+          terminalStatus: callback.terminalStatus,
+          error: callback.error
+        } : undefined
+      });
       if (rows.length >= limit)
         break;
     }

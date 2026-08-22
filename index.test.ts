@@ -125,6 +125,9 @@ describe("MCP plugin contract", () => {
 			threadId: "019c8f58-41ac-72b0-a9f6-43653b3ea80c",
 			command: codex,
 		});
+		const sharedMcpCallback = codexCallbackOptionsFromEnv({ PATH: root }, exec);
+		expect(sharedMcpCallback).toMatchObject({ command: codex });
+		expect(sharedMcpCallback && sharedMcpCallback.threadId).toBeUndefined();
 	});
 
 	test("advertises optional task execution and omits authority-expanding schemas", async () => {
@@ -160,6 +163,13 @@ describe("MCP plugin contract", () => {
 				expect(properties).not.toHaveProperty(field);
 			}
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_image");
+			const detached = listed.tools.find((tool) => tool.name === "gpt_worker_start");
+			expect(detached?.execution?.taskSupport ?? "forbidden").toBe("forbidden");
+			expect(detached?.inputSchema.properties).toHaveProperty("callback_thread_id");
+			const detachedBatch = listed.tools.find((tool) => tool.name === "gpt_worker_start_many");
+			expect(detachedBatch?.execution?.taskSupport ?? "forbidden").toBe("forbidden");
+			expect(detachedBatch?.inputSchema.properties).toHaveProperty("workers");
+			expect(detachedBatch?.inputSchema.properties).toHaveProperty("callback_thread_id");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_models");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_projects");
 			expect(listed.tools.map((tool) => tool.name)).toContain("gpt_conversation_manage");

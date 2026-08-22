@@ -2,7 +2,8 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.1 adds verified project-aware Worker titles, durable caller detachment, and
+0.4.2 adds immediate-return single and batch Worker starts with verified Codex
+callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
 same-conversation required-connector preflight. Version 0.4.0 added live model
 and effort discovery, exact-conversation organization,
 crash-safe durable runs, and three clear orchestration routes: GPT Chat, GPT
@@ -63,7 +64,9 @@ never passed through child-process argv.
 | `gpt_run_claim` | Operator-authenticated claim or transfer of a run's authoritative conversation owner, including all bound tasks |
 | `gpt_conversation_close` | Close an owned local browser session; provider history remains |
 | `gpt_conversation_manage` | Pin, unpin, rename, move, or archive an owned conversation with live read-back |
-| `gpt_worker_run` | Start one independent bounded GPT Worker with a selected model and effort |
+| `gpt_worker_start` | Start one detached durable GPT Worker and return its handles immediately |
+| `gpt_worker_start_many` | Start one through ten detached Workers and return all handles immediately |
+| `gpt_worker_run` | Standard MCP Tasks route for a Worker when the originating call should own the lifecycle |
 | `gpt_worker_get` | One reconnect/recovery lookup for a worker |
 | `gpt_worker_cancel` | Durably cancel a worker |
 | `gpt_worker_list` | Bounded recovery overview, not a polling loop |
@@ -74,7 +77,8 @@ never passed through child-process argv.
 
 - **GPT Chat** uses `gpt_chat` for a literal message or an ongoing exact
   conversation.
-- **GPT Worker** uses `gpt_worker_run` for one durable background ChatGPT job.
+- **GPT Worker** uses `gpt_worker_start` or `gpt_worker_start_many` for detached
+  durable ChatGPT jobs. `gpt_worker_run` remains the standard MCP Tasks route.
 - **GPT Sub-agent** is a native Codex child that owns one GPT-Control
   conversation and uses `gpt_chat` repeatedly until its assigned goal is done.
 
@@ -83,7 +87,7 @@ for the actual Codex-child workflow.
 
 ## GPT Workers
 
-`gpt_worker_run` requires an idempotency key and creates a fresh owned
+Every Worker requires an idempotency key and creates a fresh owned
 conversation. Trusted policy defaults to six simultaneous workers and permits
 an operator-configured limit from one through ten, even across broker processes
 sharing the same state root. Additional workers queue fairly. Use `gpt_models`
@@ -122,9 +126,11 @@ execution; normal completion requires no status polling. Clients without task
 support receive one long-running terminal tool response. Protocol task
 notifications alone are not treated as a model-visible callback.
 
-When Codex starts the plugin with a valid `CODEX_THREAD_ID`, GPT-Control records
-that trusted parent identity with each task. A terminal worker stages one compact
-receipt and uses `codex queue` to wake the parent thread. Nearby completions are
+For detached Codex work, the caller reads its runtime-provided
+`CODEX_THREAD_ID` from the current shell environment and passes it as
+`callback_thread_id`. GPT-Control confirms `callbackBound` before the caller
+yields. A terminal worker stages one compact receipt and uses `codex queue` to
+wake the parent task. Nearby completions are
 combined, prompt and result text are excluded from the queued message, and the
 parent collects authoritative results with `gpt_worker_get`. The automatic
 delivery attempt is durable and at most once across restarts. If it is unavailable
