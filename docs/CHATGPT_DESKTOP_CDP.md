@@ -119,41 +119,57 @@ the user's current window.
 
 ## Explicit live acceptance
 
-The live harness sends one ordinary web-development question from a small
-rotating set, requires one stable reply, and then releases its local session
-ownership. It does not add test tokens or machine-looking verification text to
-the conversation. After read-back, it archives the disposable chat through the
-same desktop session. It does not run unless this separate mutation gate is present:
+Deterministic verification does not open ChatGPT or send a message. Live
+acceptance is a separate operator action. It defaults to one ordinary
+web-development question, uses the installed MCP product path, archives the
+disposable chat, proves that the pool is empty, and records only bounded
+identity receipts. It also writes an attempt receipt before startup and refuses
+another live run for 24 hours by default.
+
+Set an explicit installed package root and the exact mutation acknowledgement:
 
 ```sh
-GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
-node scripts/desktop-cdp-live-smoke.mjs --live
+export GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT="$HOME/plugins/gpt-control"
+export GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE=I_UNDERSTAND_THIS_CREATES_CHATGPT_CONVERSATIONS
+
+node scripts/chatgpt-desktop-acceptance.mjs \
+  --confirm --send --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT"
 ```
 
-Additional renderers are disabled by default. To test more than one distinct
-session, explicitly enable target creation. The driver uses the signed app's
-loopback CDP endpoint to create one exact independently owned background
-window and records the returned renderer ID:
+Do not use a stress run as an ordinary smoke test. Multiple sessions require a
+second acknowledgement and `--stress`. The product-path runner starts all
+requested MCP calls concurrently, requires a distinct pool-lane receipt for
+each result, and treats any archive, close, listener, profile-process, or state
+cleanup failure as a failed acceptance:
 
 ```sh
-export GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1
+export GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_STRESS=I_UNDERSTAND_THIS_STARTS_MULTIPLE_CHATGPT_SESSIONS
 
-GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
-node scripts/desktop-cdp-live-smoke.mjs --live --concurrency 2
+node scripts/chatgpt-desktop-acceptance.mjs \
+  --confirm --send --stress --count 2 \
+  --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT"
 ```
 
-Repeat with concurrency `3` and `6`. A clean capacity blocker is acceptable.
-Two workers silently sharing one renderer is a failure.
+The local cooldown can be configured from 1 through 168 hours with
+`GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_COOLDOWN_HOURS`. Bypassing it requires the
+separate operator-only `GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_OVERRIDE=1` gate and
+must not be part of an automated test suite.
+
+`desktop-cdp-live-smoke.mjs` remains a low-level exploratory driver harness. It
+is not canonical acceptance evidence. It refuses raw attachment tests because
+only `gpt_chat` exercises the production immutable-snapshot boundary, and it
+now fails if any archive or close operation fails.
 
 The single-process driver uses the user's normal app process and requires that
 process to start with the loopback CDP flags. The pool driver does not restart
 that process. It launches separate processes with persistent pool profiles and
 uses only those processes for worker sessions.
 
-The current macOS acceptance has proved one hidden/background pool lane and two
-independent concurrent native processes. Both conversations completed and were
-archived; both exact worker processes stopped; and focus returned to the
-original app. Higher staircase concurrency remains an alpha release gate.
+Earlier experimental heads observed several independent native processes and
+replies, but those raw-driver runs did not prove the normal GPT-Control client
+or fail-closed cleanup. Version 0.5.0-alpha.4 therefore makes no current
+installed-product live claim until the canonical runner passes at the exact
+installed commit after the account cool-down.
 
 Native-shell clicks use trusted CDP mouse input. A capture-phase guard checks
 the exact provider conversation and clicked element inside the page when the
@@ -167,32 +183,32 @@ the same page evaluation. Keyboard cleanup uses a capture-phase guard for
 file input, checks the conversation before and after the CDP file assignment,
 and refuses a missing or changed input.
 
-The live harness can exercise these paths in one disposable conversation. Put
-titles, project names, upload paths, and cleanup URLs in a private mode-0600
-request file so they do not appear in process arguments:
+The canonical runner accepts questions, production attachment paths, model,
+effort, and workspace root through a private mode-0600 request file so these
+values do not appear in process arguments:
 
 ```json
 {
-  "renameTitle": "Web Development Notes",
-  "project": "Projects",
-  "uploadPath": "/absolute/path/to/a/non-sensitive-file.md"
+  "questions": ["What is one practical use for a container query?"],
+  "files": ["docs/non-sensitive-web-note.md"],
+  "model": "GPT-5.6 Sol",
+  "effort": "High",
+  "workspaceRoot": "/absolute/trusted/workspace"
 }
 ```
 
 ```sh
 chmod 600 ./desktop-live-request.json
 
-GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
-node scripts/desktop-cdp-live-smoke.mjs --live \
-  --discover-models --discover-projects \
-  --model "GPT-5.6 Sol" --effort High \
-  --reload --pin --request-file ./desktop-live-request.json
+node scripts/chatgpt-desktop-acceptance.mjs \
+  --confirm --send --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT" \
+  --request-file ./desktop-live-request.json
 ```
 
-Run cancellation separately with `--cancel`. The harness attempts to archive
-every conversation during cleanup, including a run that fails after submission.
-Assistant text is represented by a character count and SHA-256 hash unless the
-operator explicitly adds `--include-sensitive-output`.
+The runner does not print prompt or assistant text. It records the exact local
+run/session/lane identities, requested-versus-observed model receipts, provider
+URL hash, attachment-manifest hash, installed launcher and pool-driver hashes,
+and complete offline cleanup proof.
 
 ## Alpha release gates
 
@@ -206,10 +222,9 @@ Do not make this the default driver until the signed-in app proves:
 - background operation without focus stealing;
 - distinct renderer ownership at concurrency 1, 2, 3, and 6.
 
-As of the current experiment, live model and project discovery, model switching,
-upload, exact reload continuation, cancellation, pin, rename, project move,
-archive, and three concurrent renderer identities have passed. Project move and
-upload passed in separate disposable workflows; ChatGPT refused one combined
-uploaded-chat project move, and the driver surfaced that refusal. Six concurrent
-renderers remain a release gate because one renderer became ineligible and the
-driver failed closed.
+Historical raw-driver exercises covered model and project discovery, model
+switching, upload, reload continuation, cancellation, organization controls,
+and multiple renderers. Those observations are not acceptance evidence for
+0.5.0-alpha.4. The exact installed package must pass the canonical 1, 2, 3, and
+6 staircase after low-volume account access is restored; the PR remains draft
+until then.

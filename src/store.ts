@@ -70,6 +70,7 @@ const ReceiptSchema = z.object({
 	providerConversationUrl: z.string().optional(),
 	providerRunId: z.string().optional(),
 	localBrowserSessionId: z.string().optional(),
+	desktopPoolLane: z.number().int().min(1).max(10).optional(),
 	localAssistantTurnCount: z.number().int().nonnegative().optional(),
 	recoveryAttempts: z.array(RecoverySchema).optional(),
 });
@@ -83,6 +84,7 @@ const ConversationSchema = z.object({
 	browserSessionId: z.string().optional(),
 	browserSessionName: z.string().optional(),
 	browserPageId: z.union([z.string(), z.number()]).optional(),
+	desktopPoolLane: z.number().int().min(1).max(10).optional(),
 	browserAssistantTurnCount: z.number().int().nonnegative().optional(),
 	providerPinned: z.boolean().optional(),
 	providerTitle: z.string().optional(),

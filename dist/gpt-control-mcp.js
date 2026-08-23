@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.3";
+var PACKAGE_VERSION = "0.5.0-alpha.4";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.3";
+var PACKAGE_VERSION2 = "0.5.0-alpha.4";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35822,11 +35822,15 @@ function exactActionTarget(session) {
 }
 var DriverIdSchema = exports_external.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
 var SessionSchema = exports_external.object({
-  sessionId: exports_external.string().min(1),
+  sessionId: exports_external.string().min(1).max(512),
   pageId: exports_external.union([exports_external.string(), exports_external.number()]),
   name: exports_external.string(),
-  url: exports_external.string()
+  url: exports_external.string(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional()
 }).strict();
+var ProvisionalSessionSchema = exports_external.object({
+  sessionId: exports_external.string().min(1).max(512)
+}).passthrough();
 var SnapshotSchema = exports_external.object({
   count: exports_external.number().int().nonnegative(),
   text: exports_external.string(),
@@ -35957,7 +35961,19 @@ class ExternalCommandBrowserDriver {
     return result;
   }
   async create(name, url2, signal) {
-    return SessionSchema.parse(await this.call("create", { name, url: url2 }, signal));
+    const raw = await this.call("create", { name, url: url2 }, signal);
+    const parsed = SessionSchema.safeParse(raw);
+    if (parsed.success)
+      return parsed.data;
+    const provisional = ProvisionalSessionSchema.safeParse(raw);
+    if (!provisional.success)
+      throw parsed.error;
+    try {
+      await this.close(provisional.data.sessionId);
+    } catch (cleanupError) {
+      throw new Error(`Browser driver create receipt failed validation and cleanup was not proved for session ${provisional.data.sessionId}: ${errorMessage(cleanupError)}`, { cause: parsed.error });
+    }
+    throw parsed.error;
   }
   async show(sessionId, signal) {
     return SessionSchema.parse(await this.call("show", { sessionId }, signal));
@@ -36289,6 +36305,7 @@ var ReceiptSchema = exports_external.object({
   providerConversationUrl: exports_external.string().optional(),
   providerRunId: exports_external.string().optional(),
   localBrowserSessionId: exports_external.string().optional(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
   localAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   recoveryAttempts: exports_external.array(RecoverySchema).optional()
 });
@@ -36302,6 +36319,7 @@ var ConversationSchema = exports_external.object({
   browserSessionId: exports_external.string().optional(),
   browserSessionName: exports_external.string().optional(),
   browserPageId: exports_external.union([exports_external.string(), exports_external.number()]).optional(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
   browserAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   providerPinned: exports_external.boolean().optional(),
   providerTitle: exports_external.string().optional(),
@@ -37607,9 +37625,7 @@ class GptControlService {
         await this.store.putCatalogCache("models", record3);
         return modelCatalogResult(record3, "refreshed");
       } finally {
-        await route.driver.close(session.sessionId).catch(() => {
-          return;
-        });
+        await route.driver.close(session.sessionId);
       }
     }));
   }
@@ -37640,9 +37656,7 @@ class GptControlService {
         await this.store.putCatalogCache("projects", record3);
         return projectCatalogResult(record3, "refreshed");
       } finally {
-        await route.driver.close(session.sessionId).catch(() => {
-          return;
-        });
+        await route.driver.close(session.sessionId);
       }
     }));
   }
@@ -37760,10 +37774,12 @@ class GptControlService {
         state,
         stateSummary: observation.stateSummary,
         assistantTurnCount: observation.snapshot.count,
-        requestedModel: latestRun?.receipt.requestedModel,
-        observedModel: latestRun?.receipt.observedModel,
-        requestedEffort: latestRun?.receipt.requestedEffort,
-        observedEffort: latestRun?.receipt.observedEffort,
+        ...latestRun?.receipt.modelVerified === true && latestRun.receipt.modelEvidenceKind === "composer_selector" && latestRun.receipt.observedModel ? {
+          requestedModel: latestRun.receipt.requestedModel,
+          observedModel: latestRun.receipt.observedModel,
+          requestedEffort: latestRun.receipt.requestedEffort,
+          observedEffort: latestRun.receipt.observedEffort
+        } : {},
         latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
         visibleToolCards: observation.visibleToolCards,
         rateLimitMessage: observation.rateLimitMessage,
@@ -38026,6 +38042,7 @@ class GptControlService {
           browserSessionId: session.sessionId,
           browserSessionName: name,
           browserPageId: session.pageId,
+          desktopPoolLane: session.desktopPoolLane,
           workspaceRoot: this.policy.workspaceRoot,
           policyFingerprint: this.policy.fingerprint,
           mcpSessionId,
@@ -39111,14 +39128,16 @@ class GptControlService {
       await assertExactDriverSession(available.driver, expected, signal);
       conversation = await this.store.updateConversation(conversation.id, {
         browserSessionId: session.sessionId,
-        browserPageId: session.pageId
+        browserPageId: session.pageId,
+        desktopPoolLane: session.desktopPoolLane
       });
       persisted = true;
       run = await this.store.updateRun(run.id, {
         receipt: {
           ...run.receipt,
           browserDriverId: available.driver.id,
-          localBrowserSessionId: session.sessionId
+          localBrowserSessionId: session.sessionId,
+          desktopPoolLane: session.desktopPoolLane
         }
       });
       if (TERMINAL2.has(run.status)) {
@@ -39138,13 +39157,15 @@ class GptControlService {
         } catch (cleanupError) {
           conversation = await this.store.updateConversation(conversation.id, {
             browserSessionId: session.sessionId,
-            browserPageId: session.pageId
+            browserPageId: session.pageId,
+            desktopPoolLane: session.desktopPoolLane
           });
           await this.store.updateRun(run.id, {
             receipt: {
               ...run.receipt,
               browserDriverId: available.driver.id,
-              localBrowserSessionId: session.sessionId
+              localBrowserSessionId: session.sessionId,
+              desktopPoolLane: session.desktopPoolLane
             }
           });
           throw new Error(`${errorMessage2(error51)} Browser cleanup was not proved; durable ownership was retained: ${errorMessage2(cleanupError)}`);

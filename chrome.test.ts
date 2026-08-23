@@ -622,6 +622,19 @@ describe("ChatGPT organization controls", () => {
 			observedEffort: "High",
 		});
 		expect(bridge.submittedPrompts).toEqual(["status target"]);
+		await service.start({
+			kind: "chat",
+			prompt: "queued status target",
+			conversationId: started.conversation.id,
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "High",
+			wait: false,
+		}, { deferExecution: true });
+		const unverified = await service.conversationStatus(started.conversation.id);
+		expect(unverified.requestedModel).toBeUndefined();
+		expect(unverified.observedModel).toBeUndefined();
+		expect(unverified.requestedEffort).toBeUndefined();
+		expect(unverified.observedEffort).toBeUndefined();
 	});
 });
 

@@ -75,6 +75,8 @@ export interface DriverSession {
 	pageId: DriverPageId;
 	name: string;
 	url: string;
+	/** Non-sensitive native desktop-pool ownership receipt. */
+	desktopPoolLane?: number;
 }
 
 export interface ChatGptConversationCatalogEntry {
@@ -764,11 +766,15 @@ function exactActionTarget(session: DriverSession): ExactBrowserActionTarget {
 
 const DriverIdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
 const SessionSchema = z.object({
-	sessionId: z.string().min(1),
+	sessionId: z.string().min(1).max(512),
 	pageId: z.union([z.string(), z.number()]),
 	name: z.string(),
 	url: z.string(),
+	desktopPoolLane: z.number().int().min(1).max(10).optional(),
 }).strict();
+const ProvisionalSessionSchema = z.object({
+	sessionId: z.string().min(1).max(512),
+}).passthrough();
 const SnapshotSchema = z.object({
 	count: z.number().int().nonnegative(),
 	text: z.string(),
@@ -903,7 +909,23 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 	}
 
 	async create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession> {
-		return SessionSchema.parse(await this.call("create", { name, url }, signal));
+		const raw = await this.call("create", { name, url }, signal);
+		const parsed = SessionSchema.safeParse(raw);
+		if (parsed.success) return parsed.data;
+		const provisional = ProvisionalSessionSchema.safeParse(raw);
+		if (!provisional.success) throw parsed.error;
+		try {
+			// A create response can fail local validation after the external driver has
+			// already created durable state. Cleanup is independent of a cancelled
+			// caller so a malformed receipt cannot silently consume a pool lane.
+			await this.close(provisional.data.sessionId);
+		} catch (cleanupError) {
+			throw new Error(
+				`Browser driver create receipt failed validation and cleanup was not proved for session ${provisional.data.sessionId}: ${errorMessage(cleanupError)}`,
+				{ cause: parsed.error },
+			);
+		}
+		throw parsed.error;
 	}
 
 	async show(sessionId: string, signal?: AbortSignal): Promise<DriverSession> {

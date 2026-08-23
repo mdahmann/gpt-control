@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 umask 077
 
-LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.3-verification}
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.4-verification}
 LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
@@ -54,7 +54,6 @@ run_gate desktop-bundle-build "$BUN" build src/desktop-driver-cli.ts --target=no
 run_gate desktop-bundle-current cmp dist/gpt-control-desktop-driver.js "$LOG_DIR/gpt-control-desktop-driver.js"
 run_gate desktop-bundle-node-syntax node --check dist/gpt-control-desktop-driver.js
 run_gate desktop-pool-bundle-build "$BUN" build src/desktop-pool-driver-cli.ts --target=node --minify-whitespace --outfile="$LOG_DIR/gpt-control-desktop-pool-driver.js"
-run_gate desktop-pool-bundle-normalize node scripts/normalize-generated-js.mjs "$LOG_DIR/gpt-control-desktop-pool-driver.js"
 run_gate desktop-pool-bundle-current cmp dist/gpt-control-desktop-pool-driver.js "$LOG_DIR/gpt-control-desktop-pool-driver.js"
 run_gate desktop-pool-bundle-node-syntax node --check dist/gpt-control-desktop-pool-driver.js
 mkdir -p "$LOG_DIR/mcp-home" "$LOG_DIR/mcp-state"
@@ -104,7 +103,7 @@ printf 'EXIT=0\n' >> "$LOG_DIR/secret-scan.log"
   printf 'bun=%s\n' "$("$BUN" --version)"
   printf 'node=%s\n' "$(node --version)"
   printf 'codex=%s\n' "$(codex --version 2>/dev/null | tail -1 || true)"
-  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax desktop-bundle-build desktop-bundle-current desktop-bundle-node-syntax desktop-pool-bundle-build desktop-pool-bundle-normalize desktop-pool-bundle-current desktop-pool-bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests desktop-driver-tests full-tests production-audit shell-syntax javascript-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
+  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax desktop-bundle-build desktop-bundle-current desktop-bundle-node-syntax desktop-pool-bundle-build desktop-pool-bundle-current desktop-pool-bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests desktop-driver-tests full-tests production-audit shell-syntax javascript-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
     printf '%s_exit=%s\n' "$gate" "$(sed -n 's/^EXIT=//p' "$LOG_DIR/$gate.log" | tail -1)"
   done
 } > "$LOG_DIR/summary.txt"

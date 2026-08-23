@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.5.0-alpha.3",
+  "version": "0.5.0-alpha.4",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents",
   "type": "module",
   "license": "MIT",
@@ -55,7 +55,7 @@
     "build": "bun run build:mcp && bun run build:desktop-driver && bun run build:desktop-pool-driver",
     "build:mcp": "bun build src/mcp.ts --target=node --outfile=dist/gpt-control-mcp.js",
     "build:desktop-driver": "bun build src/desktop-driver-cli.ts --target=node --minify-whitespace --outfile=dist/gpt-control-desktop-driver.js",
-    "build:desktop-pool-driver": "bun build src/desktop-pool-driver-cli.ts --target=node --minify-whitespace --outfile=dist/gpt-control-desktop-pool-driver.js && node scripts/normalize-generated-js.mjs dist/gpt-control-desktop-pool-driver.js"
+    "build:desktop-pool-driver": "bun build src/desktop-pool-driver-cli.ts --target=node --minify-whitespace --outfile=dist/gpt-control-desktop-pool-driver.js"
   },
   "omp": {
     "extensions": [

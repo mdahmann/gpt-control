@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0-alpha.4] - 2026-08-23
+
+- Accept and durably record exact native desktop-pool lane receipts.
+- Fence allocation and per-lane lifecycle locks against replacement and ownerless recovery.
+- Reserve lanes before slow startup, use durable round-robin selection, and prove a profile is offline before launch.
+- Restrict shutdown signals to stable descendants of the verified signed worker process.
+- Verify minimized-window and restored-focus postconditions after desktop actions.
+- Hide unverified model and effort fields from passive conversation status.
+- Remove lossy generated-JavaScript whitespace normalization.
+- Keep live acceptance explicit, low-volume, and separate from deterministic verification.
+
 ## [0.5.0-alpha.3] - 2026-08-23
 
 - Added an opt-in native ChatGPT/Codex worker pool with one separately signed

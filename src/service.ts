@@ -298,7 +298,7 @@ export class GptControlService {
 				await this.store.putCatalogCache("models", record);
 				return modelCatalogResult(record, "refreshed");
 			} finally {
-				await route.driver.close(session.sessionId).catch(() => undefined);
+				await route.driver.close(session.sessionId);
 			}
 		}));
 	}
@@ -328,7 +328,7 @@ export class GptControlService {
 				await this.store.putCatalogCache("projects", record);
 				return projectCatalogResult(record, "refreshed");
 			} finally {
-				await route.driver.close(session.sessionId).catch(() => undefined);
+				await route.driver.close(session.sessionId);
 			}
 		}));
 	}
@@ -464,10 +464,15 @@ export class GptControlService {
 				state,
 				stateSummary: observation.stateSummary,
 				assistantTurnCount: observation.snapshot.count,
-				requestedModel: latestRun?.receipt.requestedModel,
-				observedModel: latestRun?.receipt.observedModel,
-				requestedEffort: latestRun?.receipt.requestedEffort,
-				observedEffort: latestRun?.receipt.observedEffort,
+				...(latestRun?.receipt.modelVerified === true
+					&& latestRun.receipt.modelEvidenceKind === "composer_selector"
+					&& latestRun.receipt.observedModel
+					? {
+						requestedModel: latestRun.receipt.requestedModel,
+						observedModel: latestRun.receipt.observedModel,
+						requestedEffort: latestRun.receipt.requestedEffort,
+						observedEffort: latestRun.receipt.observedEffort,
+					} : {}),
 				latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
 				visibleToolCards: observation.visibleToolCards,
 				rateLimitMessage: observation.rateLimitMessage,
@@ -734,6 +739,7 @@ export class GptControlService {
 					browserSessionId: session.sessionId,
 					browserSessionName: name,
 					browserPageId: session.pageId,
+					desktopPoolLane: session.desktopPoolLane,
 					workspaceRoot: this.policy.workspaceRoot,
 					policyFingerprint: this.policy.fingerprint,
 					mcpSessionId,
@@ -1937,6 +1943,7 @@ export class GptControlService {
 			conversation = await this.store.updateConversation(conversation.id, {
 				browserSessionId: session.sessionId,
 				browserPageId: session.pageId,
+				desktopPoolLane: session.desktopPoolLane,
 			});
 			persisted = true;
 			run = await this.store.updateRun(run.id, {
@@ -1944,6 +1951,7 @@ export class GptControlService {
 					...run.receipt,
 					browserDriverId: available.driver.id,
 					localBrowserSessionId: session.sessionId,
+					desktopPoolLane: session.desktopPoolLane,
 				},
 			});
 			if (TERMINAL.has(run.status)) {
@@ -1963,12 +1971,14 @@ export class GptControlService {
 					conversation = await this.store.updateConversation(conversation.id, {
 						browserSessionId: session.sessionId,
 						browserPageId: session.pageId,
+						desktopPoolLane: session.desktopPoolLane,
 					});
 					await this.store.updateRun(run.id, {
 						receipt: {
 							...run.receipt,
 							browserDriverId: available.driver.id,
 							localBrowserSessionId: session.sessionId,
+							desktopPoolLane: session.desktopPoolLane,
 						},
 					});
 					throw new Error(

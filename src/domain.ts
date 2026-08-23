@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.5.0-alpha.3";
+export const PACKAGE_VERSION = "0.5.0-alpha.4";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -130,6 +130,7 @@ export interface ReviewReceipt {
 	providerConversationUrl?: string;
 	providerRunId?: string;
 	localBrowserSessionId?: string;
+	desktopPoolLane?: number;
 	localAssistantTurnCount?: number;
 	recoveryAttempts?: RecoveryAttempt[];
 }
@@ -145,6 +146,7 @@ export interface ConversationRecord {
 	browserSessionId?: string;
 	browserSessionName?: string;
 	browserPageId?: BrowserPageId;
+	desktopPoolLane?: number;
 	browserAssistantTurnCount?: number;
 	providerPinned?: boolean;
 	providerTitle?: string;

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +25,9 @@ import {
 } from "./src/desktop-cdp-macos";
 import {
 	assertLaneCanLaunch,
+	assertMinimizedWindowReceipt,
+	assertRestoredFrontmostPid,
+	assertShutdownProcessMembership,
 	addPoolLaneReceipt,
 	descendantProcessIds,
 	laneHasExactlyOneReadyShell,
@@ -34,7 +37,9 @@ import {
 	profileAssociatedProcessPids,
 	requestRequiresPoolAllocationLock,
 	requestSessionId,
+	roundRobinLaneOrder,
 	withPoolAllocationLock,
+	withReservedFreePoolLane,
 } from "./src/desktop-pool-driver-cli";
 
 const roots: string[] = [];
@@ -233,7 +238,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.3",
+				driverVersion: "0.5.0-alpha.4",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -1023,7 +1028,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.3");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.4");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
@@ -1173,11 +1178,35 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		expect(addPoolLaneReceipt({ version: 2, ok: false, error: "blocked" }, 4)).toEqual({ version: 2, ok: false, error: "blocked" });
 	});
 
-	test("holds the allocation lock across create, discovery, and final-session close", () => {
-		expect(requestRequiresPoolAllocationLock("create")).toBe(true);
+	test("keeps slow create work outside the global lock while serializing discovery and close", () => {
+		expect(requestRequiresPoolAllocationLock("create")).toBe(false);
 		expect(requestRequiresPoolAllocationLock("find_conversations")).toBe(true);
 		expect(requestRequiresPoolAllocationLock("close")).toBe(true);
 		expect(requestRequiresPoolAllocationLock("show")).toBe(false);
+	});
+
+	test("orders free-lane checks from a durable round-robin cursor", () => {
+		const lanes = [{ index: 1 }, { index: 2 }, { index: 3 }];
+		expect(roundRobinLaneOrder(lanes, 2).map(({ index }) => index)).toEqual([2, 3, 1]);
+		expect(roundRobinLaneOrder(lanes, 3).map(({ index }) => index)).toEqual([3, 1, 2]);
+		expect(() => roundRobinLaneOrder(lanes, 4)).toThrow("cursor");
+	});
+
+	test("reserves six cold lanes concurrently without holding the global lock during slow work", async () => {
+		const root = realpathSync(scratch());
+		const config = loadPoolConfig({
+			HOME: root,
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"),
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "6",
+		});
+		const lanes = poolLanes(config);
+		const assigned = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+			withReservedFreePoolLane(config, lanes, async (lane) => {
+				if (index === 0) await new Promise((resolve) => setTimeout(resolve, 100));
+				return lane.index;
+			})));
+		expect(new Set(assigned).size).toBe(6);
+		expect(assigned.sort((left, right) => left - right)).toEqual([1, 2, 3, 4, 5, 6]);
 	});
 
 	test("waits for one exact ready shell and refuses replacement under durable work", () => {
@@ -1215,6 +1244,28 @@ describe("ChatGPT Desktop endpoint policy", () => {
 			startedAt: "2001-01-01T00:00:00.000Z",
 		})}\n`, { mode: 0o600 });
 		expect(await withPoolAllocationLock(root, async () => "recovered")).toBe("recovered");
+	});
+
+	test("refuses an ownerless pool allocation lock", async () => {
+		const root = scratch();
+		mkdirSync(join(root, "allocation.lock"), { mode: 0o700 });
+		await expect(withPoolAllocationLock(root, async () => "unsafe")).rejects.toThrow("ownerless or invalid");
+	});
+
+	test("fences a replaced pool lock before work and preserves the foreign lock", async () => {
+		const root = scratch();
+		let entered = false;
+		await expect(withPoolAllocationLock(root, async () => {
+			entered = true;
+		}, {
+			afterPublish: async (lockRoot) => {
+				rmSync(lockRoot, { recursive: true, force: true });
+				mkdirSync(lockRoot, { mode: 0o700 });
+				writeFileSync(join(lockRoot, "foreign-marker"), "foreign\n", { mode: 0o600 });
+			},
+		})).rejects.toThrow("identity changed");
+		expect(entered).toBe(false);
+		expect(readFileSync(join(root, "allocation.lock", "foreign-marker"), "utf8")).toBe("foreign\n");
 	});
 
 	test("downgrades only the exact known no-window CDP error", () => {
@@ -1579,6 +1630,20 @@ describe("ChatGPT Desktop endpoint policy", () => {
 			" 201 200",
 		].join("\n");
 		expect(descendantProcessIds(processList, 100)).toEqual([100, 101, 102]);
+	});
+
+	test("refuses shutdown authority for foreign profile and listener processes", () => {
+		expect(() => assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100, 200]), new Set([101]))).toThrow("unproved");
+		expect(() => assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100]), new Set([101, 201]))).toThrow("unproved");
+		expect(assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100]), new Set([101]))).toBeUndefined();
+	});
+
+	test("requires minimized-window and restored-focus read-back", () => {
+		expect(assertMinimizedWindowReceipt(100, "2,0\n")).toBeUndefined();
+		expect(() => assertMinimizedWindowReceipt(100, "2,1\n")).toThrow("unminimized");
+		expect(() => assertMinimizedWindowReceipt(100, "unknown\n")).toThrow("invalid native-window receipt");
+		expect(assertRestoredFrontmostPid(200, 200)).toBeUndefined();
+		expect(() => assertRestoredFrontmostPid(200, 201)).toThrow("restore frontmost");
 	});
 
 	test("derives a stable reserved window identity for one dedicated profile lane", () => {

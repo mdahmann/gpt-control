@@ -2,7 +2,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -62,6 +62,25 @@ interface PoolLockOwner {
 	startedAt: string;
 }
 
+interface FileIdentity {
+	dev: number;
+	ino: number;
+}
+
+interface PoolLockLease {
+	root: string;
+	owner: PoolLockOwner;
+	identity: FileIdentity;
+}
+
+export interface PoolLockTestHooks {
+	afterPublish?: (lockRoot: string) => Promise<void>;
+}
+
+class PoolLockBusyError extends Error {}
+
+class LanePreflightError extends Error {}
+
 export function loadPoolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
 	const root = resolve(env.GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT
 		?? resolve(homedir(), ".gpt-control", "desktop-worker-pool"));
@@ -103,7 +122,7 @@ export function requestSessionId(request: DesktopDriverRequest): string | undefi
 }
 
 export function requestRequiresPoolAllocationLock(action: string): boolean {
-	return action === "create" || action === "find_conversations" || action === "close";
+	return action === "find_conversations" || action === "close";
 }
 
 export function addPoolLaneReceipt(response: DesktopDriverEnvelope, laneIndex: number): DesktopDriverEnvelope {
@@ -123,25 +142,10 @@ export async function handleDesktopPoolRequest(
 		await secureDirectory(config.root);
 		if (request.action === "probe") return success(await passivePoolProbe(config));
 		const lanes = poolLanes(config);
+		if (request.action === "create") {
+			return await createInReservedLane(request, config, lanes, env);
+		}
 		const dispatch = async (): Promise<DesktopDriverEnvelope> => {
-			if (request.action === "create") {
-				const lane = await firstFreeLane(lanes);
-				if (!lane) throw new Error(`ChatGPT Desktop worker pool is at capacity (${config.size} lanes).`);
-				await ensureLaneReady(lane, config, env);
-				const response = await invokeLane(lane, config, request, env);
-				if (!response.ok) {
-					const retainedSessionIds = await laneSessionIds(lane);
-					try {
-						await stopLane(lane, config, env);
-						for (const retainedSessionId of retainedSessionIds) {
-							await closeDesktopDriverSessionOffline(lane.stateRoot, retainedSessionId);
-						}
-					} catch (cleanupError) {
-						return failure(`${response.error ?? "ChatGPT Desktop create failed."} Cleanup failed: ${errorMessage(cleanupError)}${retainedSessionIds.length > 0 ? ` Retained session IDs: ${retainedSessionIds.join(", ")}.` : ""}`);
-					}
-				}
-				return addPoolLaneReceipt(response, lane.index);
-			}
 			if (request.action === "find_conversations") {
 				const lane = await firstRunningLane(lanes, config, env) ?? lanes[0];
 				const discoveryOnly = (await laneSessionIds(lane)).length === 0;
@@ -183,6 +187,71 @@ export async function handleDesktopPoolRequest(
 	}
 }
 
+async function createInReservedLane(
+	request: DesktopDriverRequest,
+	config: PoolConfig,
+	lanes: PoolLane[],
+	env: NodeJS.ProcessEnv,
+): Promise<DesktopDriverEnvelope> {
+	const excluded = new Set<number>();
+	const blockers: string[] = [];
+	while (excluded.size < lanes.length) {
+		const reservation = await reserveFreeLane(config, lanes, excluded);
+		if (!reservation) break;
+		const { lane, lease } = reservation;
+		try {
+			try {
+				await assertLanePrelaunchSafe(lane, config, env);
+			} catch (error) {
+				excluded.add(lane.index);
+				blockers.push(`lane ${lane.index}: ${errorMessage(error)}`);
+				continue;
+			}
+			await ensureLaneReady(lane, config, env);
+			const response = await invokeLane(lane, config, request, env);
+			if (!response.ok) {
+				const retainedSessionIds = await laneSessionIds(lane);
+				try {
+					await stopLane(lane, config, env);
+					for (const retainedSessionId of retainedSessionIds) {
+						await closeDesktopDriverSessionOffline(lane.stateRoot, retainedSessionId);
+					}
+				} catch (cleanupError) {
+					return failure(`${response.error ?? "ChatGPT Desktop create failed."} Cleanup failed: ${errorMessage(cleanupError)}${retainedSessionIds.length > 0 ? ` Retained session IDs: ${retainedSessionIds.join(", ")}.` : ""}`);
+				}
+			}
+			return addPoolLaneReceipt(response, lane.index);
+		} finally {
+			await releasePoolLock(lease);
+		}
+	}
+	if (blockers.length > 0) {
+		throw new Error(`No safe ChatGPT Desktop worker lane was available (${blockers.join("; ")}).`);
+	}
+	throw new Error(`ChatGPT Desktop worker pool is at capacity (${config.size} lanes).`);
+}
+
+async function assertLanePrelaunchSafe(lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv): Promise<void> {
+	await secureDirectory(dirname(lane.profileRoot));
+	await secureDirectory(lane.profileRoot);
+	await secureDirectory(lane.stateRoot);
+	const sessions = await laneSessionIds(lane);
+	if (sessions.length > 0) throw new LanePreflightError(`durable sessions appeared before launch: ${sessions.join(", ")}`);
+	if (await endpointAlive(lane.endpoint)) {
+		try {
+			await laneEnvironment(lane, config, env).verifyHost();
+			return;
+		} catch (error) {
+			throw new LanePreflightError(`existing listener is not the exact signed lane: ${errorMessage(error)}`);
+		}
+	}
+	try {
+		await assertLaneIsOffline(lane);
+	} catch (error) {
+		throw new LanePreflightError(errorMessage(error));
+	}
+}
+
 async function passivePoolProbe(config: PoolConfig): Promise<Record<string, unknown>> {
 	await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", config.appPath], { timeout: 30_000 });
 	const signature = await execFileAsync("/usr/bin/codesign", ["-dv", "--verbose=4", config.appPath], { timeout: 10_000 });
@@ -203,9 +272,96 @@ async function passivePoolProbe(config: PoolConfig): Promise<Record<string, unkn
 	};
 }
 
-async function firstFreeLane(lanes: PoolLane[]): Promise<PoolLane | undefined> {
-	for (const lane of lanes) if ((await laneSessionIds(lane)).length === 0) return lane;
-	return undefined;
+async function reserveFreeLane(
+	config: PoolConfig,
+	lanes: PoolLane[],
+	excluded: ReadonlySet<number>,
+): Promise<{ lane: PoolLane; lease: PoolLockLease } | undefined> {
+	return withPoolAllocationLock(config.root, async () => {
+		const cursor = await readAllocationCursor(config.root, config.size);
+		const ordered = roundRobinLaneOrder(lanes, cursor);
+		for (const lane of ordered) {
+			if (excluded.has(lane.index) || (await laneSessionIds(lane)).length > 0) continue;
+			const lockRoot = join(dirname(lane.profileRoot), "lifecycle.lock");
+			let lease: PoolLockLease;
+			try {
+				lease = await acquirePoolLock(lockRoot, Date.now(), `ChatGPT Desktop lane ${lane.index} lifecycle`);
+			} catch (error) {
+				if (error instanceof PoolLockBusyError) continue;
+				throw error;
+			}
+			try {
+				await writeAllocationCursor(config.root, lane.index === config.size ? 1 : lane.index + 1);
+				return { lane, lease };
+			} catch (error) {
+				await releasePoolLock(lease);
+				throw error;
+			}
+		}
+		return undefined;
+	});
+}
+
+export async function withReservedFreePoolLane<T>(
+	config: PoolConfig,
+	lanes: PoolLane[],
+	work: (lane: PoolLane) => Promise<T>,
+): Promise<T> {
+	await secureDirectory(config.root);
+	const reservation = await reserveFreeLane(config, lanes, new Set());
+	if (!reservation) throw new Error(`ChatGPT Desktop worker pool is at capacity (${config.size} lanes).`);
+	try {
+		return await work(reservation.lane);
+	} finally {
+		await releasePoolLock(reservation.lease);
+	}
+}
+
+export function roundRobinLaneOrder<T extends { index: number }>(lanes: readonly T[], cursor: number): T[] {
+	if (!Number.isSafeInteger(cursor) || cursor < 1 || cursor > lanes.length) {
+		throw new Error("Invalid ChatGPT Desktop worker-pool round-robin cursor.");
+	}
+	const start = lanes.findIndex((lane) => lane.index === cursor);
+	if (start < 0) throw new Error("ChatGPT Desktop worker-pool cursor does not identify a lane.");
+	return [...lanes.slice(start), ...lanes.slice(0, start)];
+}
+
+async function readAllocationCursor(root: string, size: number): Promise<number> {
+	const path = join(root, "allocation-cursor.json");
+	try {
+		const info = await lstat(path);
+		if (info.isSymbolicLink() || !info.isFile()) throw new Error("Unsafe ChatGPT Desktop worker-pool allocation cursor.");
+		const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+		let raw: string;
+		try {
+			raw = await handle.readFile("utf8");
+		} finally {
+			await handle.close();
+		}
+		const value = JSON.parse(raw) as unknown;
+		if (!isRecord(value) || value.version !== 1 || !Number.isSafeInteger(value.nextLane)
+			|| Number(value.nextLane) < 1 || Number(value.nextLane) > size) {
+			throw new Error("Invalid ChatGPT Desktop worker-pool allocation cursor.");
+		}
+		return Number(value.nextLane);
+	} catch (error) {
+		if (isMissing(error)) return 1;
+		throw error;
+	}
+}
+
+async function writeAllocationCursor(root: string, nextLane: number): Promise<void> {
+	const path = join(root, "allocation-cursor.json");
+	const temporary = `${path}.pending-${randomUUID()}`;
+	await writeFile(temporary, `${JSON.stringify({ version: 1, nextLane, updatedAt: new Date().toISOString() })}\n`, {
+		mode: 0o600,
+		flag: "wx",
+	});
+	try {
+		await rename(temporary, path);
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
 }
 
 async function firstRunningLane(lanes: PoolLane[], config: PoolConfig, env: NodeJS.ProcessEnv): Promise<PoolLane | undefined> {
@@ -245,6 +401,7 @@ async function ensureLaneReady(lane: PoolLane, config: PoolConfig, env: NodeJS.P
 		await stopLane(lane, config, env);
 	}
 	assertLaneCanLaunch(lane.index, sessionIds);
+	await assertLaneIsOffline(lane);
 	const interactiveBootstrap = !bootstrapped && config.allowInteractiveBootstrap;
 	const frontmostPid = await currentFrontmostPid();
 	await execFileAsync("/usr/bin/open", [
@@ -253,7 +410,9 @@ async function ensureLaneReady(lane: PoolLane, config: PoolConfig, env: NodeJS.P
 		"--remote-debugging-address=127.0.0.1",
 		`--remote-debugging-port=${lane.port}`,
 	], { timeout: 15_000 });
-	const deadline = Date.now() + (interactiveBootstrap ? 5 * 60_000 : 30_000);
+	// Keep the complete startup plus proved cleanup below every protocol caller's
+	// timeout. Interactive bootstrap remains an explicit operator opt-in.
+	const deadline = Date.now() + (interactiveBootstrap ? 60_000 : 30_000);
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		try {
@@ -286,7 +445,14 @@ async function laneBootstrapComplete(lane: PoolLane): Promise<boolean> {
 	try {
 		const info = await lstat(path);
 		if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Refused unsafe ChatGPT Desktop lane ${lane.index} bootstrap receipt.`);
-		const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+		const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+		let raw: string;
+		try {
+			raw = await handle.readFile("utf8");
+		} finally {
+			await handle.close();
+		}
+		const value = JSON.parse(raw) as unknown;
 		return isRecord(value) && value.version === 1 && value.profileSha256 === sha256(resolve(lane.profileRoot));
 	} catch (error) {
 		if (isMissing(error)) return false;
@@ -315,11 +481,27 @@ async function invokeLane(
 	request: DesktopDriverRequest,
 	env: NodeJS.ProcessEnv,
 ): Promise<DesktopDriverEnvelope> {
-	return handleDesktopDriverRequest(request, {
-		environment: laneEnvironment(lane, config, env),
-		stateRoot: lane.stateRoot,
-		allowCreateTarget: true,
-	});
+	const environment = laneEnvironment(lane, config, env);
+	const previousFrontmostPid = await currentFrontmostPid();
+	let response: DesktopDriverEnvelope;
+	try {
+		response = await handleDesktopDriverRequest(request, {
+			environment,
+			stateRoot: lane.stateRoot,
+			allowCreateTarget: true,
+		});
+	} catch (error) {
+		const host = await environment.verifyHost();
+		await quietWorkerWindows(host.listenerPid, previousFrontmostPid);
+		throw error;
+	}
+	try {
+		const host = await environment.verifyHost();
+		await quietWorkerWindows(host.listenerPid, previousFrontmostPid);
+	} catch (quietError) {
+		return failure(`${response.ok ? "Desktop driver action completed but native-window containment failed." : response.error ?? "Desktop driver action failed."} ${errorMessage(quietError)}`);
+	}
+	return response;
 }
 
 function laneEnvironment(lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) {
@@ -367,6 +549,7 @@ async function stopLane(lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessE
 interface ProcessIdentity {
 	pid: number;
 	processStartId: string;
+	commandSha256: string;
 }
 
 export function descendantProcessIds(processList: string, rootPid: number): number[] {
@@ -386,27 +569,58 @@ export function descendantProcessIds(processList: string, rootPid: number): numb
 }
 
 async function processTreeIdentities(rootPid: number, lane: PoolLane): Promise<ProcessIdentity[]> {
+	const first = await readProcessMembership(lane.port);
+	await sleep(25);
+	const second = await readProcessMembership(lane.port);
+	const firstDescendants = descendantProcessIds(first.treeList, rootPid);
+	const secondDescendants = new Set(descendantProcessIds(second.treeList, rootPid));
+	const stableDescendants = firstDescendants.filter((pid) => secondDescendants.has(pid));
+	if (!stableDescendants.includes(rootPid)) {
+		throw new Error(`ChatGPT Desktop worker root process ${rootPid} changed before shutdown authority was proved.`);
+	}
+	const authorized = new Set(stableDescendants);
+	const profilePids = new Set([
+		...profileAssociatedProcessPids(first.commandList, resolve(lane.profileRoot)),
+		...profileAssociatedProcessPids(second.commandList, resolve(lane.profileRoot)),
+	]);
+	const listenerPids = new Set([
+		...listenerProcessPids(first.listenerList),
+		...listenerProcessPids(second.listenerList),
+	]);
+	assertShutdownProcessMembership(lane.index, authorized, profilePids, listenerPids);
+	const identities = await Promise.all(stableDescendants.map((pid) => localProcessIdentity(pid)));
+	const verifiedAgain = await Promise.all(identities.map((identity) => exactProcessIsAlive(identity)));
+	if (verifiedAgain.some((alive) => !alive)) {
+		throw new Error(`ChatGPT Desktop lane ${lane.index} process identity changed before shutdown authority was sealed.`);
+	}
+	return identities;
+}
+
+export function assertShutdownProcessMembership(
+	laneIndex: number,
+	authorized: ReadonlySet<number>,
+	profilePids: ReadonlySet<number>,
+	listenerPids: ReadonlySet<number>,
+): void {
+	const foreign = [...new Set([...profilePids, ...listenerPids])].filter((pid) => !authorized.has(pid));
+	if (foreign.length > 0) {
+		throw new Error(`ChatGPT Desktop lane ${laneIndex} has unproved profile or listener process ${foreign.join(", ")}; shutdown was refused.`);
+	}
+}
+
+async function readProcessMembership(port: number): Promise<{ treeList: string; commandList: string; listenerList: string }> {
 	const [treeList, commandList, listenerList] = await Promise.all([
 		execFileAsync("/bin/ps", ["-axo", "pid=,ppid="], { timeout: 5_000, maxBuffer: 1024 * 1024, encoding: "utf8" }).then(({ stdout }) => stdout),
 		execFileAsync("/bin/ps", ["-axo", "pid=,command="], { timeout: 5_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" }).then(({ stdout }) => stdout),
-		execFileAsync("/usr/sbin/lsof", ["-nP", `-iTCP:${lane.port}`, "-sTCP:LISTEN", "-Fp"], { timeout: 5_000, maxBuffer: 1024 * 1024, encoding: "utf8" }).then(({ stdout }) => stdout),
+		execFileAsync("/usr/sbin/lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fp"], { timeout: 5_000, maxBuffer: 1024 * 1024, encoding: "utf8" }).then(({ stdout }) => stdout),
 	]);
-	const pids = new Set([
-		...descendantProcessIds(treeList, rootPid),
-		...profileAssociatedProcessPids(commandList, resolve(lane.profileRoot)),
-		...listenerProcessPids(listenerList),
-	]);
-	const identities = (await Promise.all([...pids].map(async (pid) => {
-		const processStartId = await localProcessStartId(pid).catch(() => undefined);
-		return processStartId ? { pid, processStartId } : undefined;
-	}))).filter((identity): identity is ProcessIdentity => Boolean(identity));
-	if (!identities.some(({ pid }) => pid === rootPid)) throw new Error(`ChatGPT Desktop worker root process ${rootPid} disappeared before shutdown identity was recorded.`);
-	return identities;
+	return { treeList, commandList, listenerList };
 }
 
 async function exactProcessIsAlive(identity: ProcessIdentity): Promise<boolean> {
 	if (!processIsAlive(identity.pid)) return false;
-	return await localProcessStartId(identity.pid).catch(() => undefined) === identity.processStartId;
+	const current = await localProcessIdentity(identity.pid).catch(() => undefined);
+	return current?.processStartId === identity.processStartId && current.commandSha256 === identity.commandSha256;
 }
 
 async function signalExactProcess(identity: ProcessIdentity, signal: NodeJS.Signals): Promise<void> {
@@ -437,9 +651,30 @@ async function laneSessionIds(lane: PoolLane): Promise<string[]> {
 	}
 }
 
-export async function withPoolAllocationLock<T>(root: string, work: () => Promise<T>): Promise<T> {
-	const lockRoot = join(root, "allocation.lock");
-	const ownerPath = join(lockRoot, "owner.json");
+export async function withPoolAllocationLock<T>(
+	root: string,
+	work: () => Promise<T>,
+	hooks: PoolLockTestHooks = {},
+): Promise<T> {
+	const lease = await acquirePoolLock(
+		join(root, "allocation.lock"),
+		Date.now() + 30_000,
+		"ChatGPT Desktop worker-pool allocation",
+		hooks,
+	);
+	try {
+		return await work();
+	} finally {
+		await releasePoolLock(lease);
+	}
+}
+
+async function acquirePoolLock(
+	lockRoot: string,
+	deadline: number,
+	label: string,
+	hooks: PoolLockTestHooks = {},
+): Promise<PoolLockLease> {
 	const owner: PoolLockOwner = {
 		version: 1,
 		token: randomUUID(),
@@ -448,36 +683,48 @@ export async function withPoolAllocationLock<T>(root: string, work: () => Promis
 		processStartId: await localProcessStartId(process.pid),
 		startedAt: new Date().toISOString(),
 	};
-	const deadline = Date.now() + 30_000;
 	while (true) {
-		let identity: { dev: number; ino: number } | undefined;
+		const pending = `${lockRoot}.pending-${owner.token}`;
 		try {
-			await mkdir(lockRoot, { mode: 0o700 });
-			const info = await lstat(lockRoot);
-			identity = { dev: info.dev, ino: info.ino };
-			try {
-				await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: "wx" });
-			} catch (error) {
-				const current = await lstat(lockRoot).catch(() => undefined);
-				if (current && current.dev === identity.dev && current.ino === identity.ino) {
-					await rm(lockRoot, { recursive: true, force: true }).catch(() => undefined);
-				}
-				throw error;
-			}
-			break;
+			await writeFile(pending, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: "wx" });
+			const prepared = await lstat(pending);
+			const identity = { dev: prepared.dev, ino: prepared.ino };
+			// link(2) is the no-clobber publication primitive. Unlike directory
+			// rename, it cannot replace an ownerless empty artifact.
+			await link(pending, lockRoot);
+			await rm(pending, { force: true });
+			await hooks.afterPublish?.(lockRoot);
+			await verifyPoolLockOwnership(lockRoot, owner, identity);
+			return { root: lockRoot, owner, identity };
 		} catch (error) {
-			if (!isAlreadyExists(error)) throw error;
-			if (await recoverPoolLock(lockRoot, ownerPath)) continue;
-			if (Date.now() >= deadline) throw new Error("Timed out waiting for the ChatGPT Desktop worker-pool allocation lock.");
+			await rm(pending, { recursive: true, force: true }).catch(() => undefined);
+			if (!isAlreadyExists(error) && !isDirectoryNotEmpty(error)) throw error;
+			if (await recoverPoolLock(lockRoot)) continue;
+			if (Date.now() >= deadline) throw new PoolLockBusyError(`Timed out waiting for the ${label} lock.`);
 			await sleep(50);
 		}
 	}
-	try {
-		return await work();
-	} finally {
-		const existing = await readPoolLockOwner(ownerPath).catch(() => undefined);
-		if (existing?.token === owner.token) await rm(lockRoot, { recursive: true, force: true });
+}
+
+async function verifyPoolLockOwnership(lockRoot: string, owner: PoolLockOwner, identity: FileIdentity): Promise<void> {
+	const info = await lstat(lockRoot);
+	if (info.isSymbolicLink() || !info.isFile() || info.dev !== identity.dev || info.ino !== identity.ino) {
+		throw new Error(`ChatGPT Desktop worker-pool lock identity changed before use: ${lockRoot}`);
 	}
+	const current = await readPoolLockOwner(lockRoot);
+	if (current.token !== owner.token) throw new Error(`ChatGPT Desktop worker-pool lock fencing token changed before use: ${lockRoot}`);
+}
+
+async function releasePoolLock(lease: PoolLockLease): Promise<void> {
+	await verifyPoolLockOwnership(lease.root, lease.owner, lease.identity);
+	const released = `${lease.root}.released-${lease.owner.token}`;
+	await rename(lease.root, released);
+	const info = await lstat(released);
+	const owner = await readPoolLockOwner(released);
+	if (info.dev !== lease.identity.dev || info.ino !== lease.identity.ino || owner.token !== lease.owner.token) {
+		throw new Error(`ChatGPT Desktop worker-pool lock changed during release: ${lease.root}`);
+	}
+	await rm(released, { recursive: true, force: true });
 }
 
 async function readPoolLockOwner(path: string): Promise<PoolLockOwner> {
@@ -500,25 +747,35 @@ async function readPoolLockOwner(path: string): Promise<PoolLockOwner> {
 	return value as unknown as PoolLockOwner;
 }
 
-async function recoverPoolLock(lockRoot: string, ownerPath: string): Promise<boolean> {
+async function recoverPoolLock(lockRoot: string): Promise<boolean> {
 	const info = await lstat(lockRoot).catch((error) => {
 		if (isMissing(error)) return undefined;
 		throw error;
 	});
 	if (!info) return true;
-	if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Refused unsafe worker-pool lock: ${lockRoot}`);
-	const first = await readPoolLockOwner(ownerPath).catch(() => undefined);
-	if (!first) {
-		if (Date.now() - info.mtimeMs <= 2_000) return false;
-	} else if (await poolLockOwnerIsAlive(first)) {
-		return false;
+	if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error(`Refused unsafe worker-pool lock: ${lockRoot}`);
+	// Version 0.5.0-alpha.3 used a directory plus owner.json. Read it only for
+	// dead-owner migration; new locks are one fully initialized atomic file.
+	const ownerPath = info.isDirectory() ? join(lockRoot, "owner.json") : lockRoot;
+	let first: PoolLockOwner;
+	try {
+		first = await readPoolLockOwner(ownerPath);
+	} catch (error) {
+		throw new Error(`Refused ownerless or invalid worker-pool lock: ${lockRoot}: ${errorMessage(error)}`);
 	}
-	const second = await readPoolLockOwner(ownerPath).catch(() => undefined);
-	if ((first?.token ?? "") !== (second?.token ?? "")) return false;
-	if (second && await poolLockOwnerIsAlive(second)) return false;
+	if (await poolLockOwnerIsAlive(first)) return false;
+	const secondInfo = await lstat(lockRoot);
+	const second = await readPoolLockOwner(ownerPath);
+	if (info.dev !== secondInfo.dev || info.ino !== secondInfo.ino || first.token !== second.token) return false;
+	if (await poolLockOwnerIsAlive(second)) return false;
 	const stale = `${lockRoot}.stale-${randomUUID()}`;
 	try {
 		await rename(lockRoot, stale);
+		const staleInfo = await lstat(stale);
+		const staleOwner = await readPoolLockOwner(staleInfo.isDirectory() ? join(stale, "owner.json") : stale);
+		if (staleInfo.dev !== info.dev || staleInfo.ino !== info.ino || staleOwner.token !== first.token) {
+			throw new Error(`Worker-pool lock changed during dead-owner recovery: ${lockRoot}`);
+		}
 		await rm(stale, { recursive: true, force: true });
 		return true;
 	} catch (error) {
@@ -542,6 +799,19 @@ async function localProcessStartId(pid: number): Promise<string> {
 	const value = result.stdout.trim();
 	if (!value) throw new Error(`Process ${pid} is unavailable.`);
 	return value;
+}
+
+async function localProcessIdentity(pid: number): Promise<ProcessIdentity> {
+	const [processStartId, command] = await Promise.all([
+		localProcessStartId(pid),
+		execFileAsync("/bin/ps", ["-p", String(pid), "-o", "command="], {
+			timeout: 5_000,
+			maxBuffer: 1024 * 1024,
+			encoding: "utf8",
+		}).then(({ stdout }) => stdout.trim()),
+	]);
+	if (!command) throw new Error(`Process ${pid} command identity is unavailable.`);
+	return { pid, processStartId, commandSha256: sha256(command) };
 }
 
 async function secureDirectory(path: string): Promise<void> {
@@ -624,14 +894,33 @@ async function currentFrontmostPid(): Promise<number | undefined> {
 }
 
 async function minimizeWorkerWindows(pid: number): Promise<void> {
-	const script = `tell application \"System Events\" to tell first application process whose unix id is ${pid} to if (count of windows) > 0 then set value of attribute \"AXMinimized\" of every window to true`;
-	await execFileAsync("/usr/bin/osascript", ["-e", script], { timeout: 5_000 });
 	const { stdout } = await execFileAsync("/usr/bin/osascript", [
-		"-e", `tell application \"System Events\" to tell first application process whose unix id is ${pid} to return count of windows`,
+		"-e", `tell application \"System Events\"
+set workerProcess to first application process whose unix id is ${pid}
+set unminimizedCount to 0
+repeat with workerWindow in windows of workerProcess
+	try
+		set value of attribute \"AXMinimized\" of workerWindow to true
+	end try
+	try
+		if value of attribute \"AXMinimized\" of workerWindow is not true then set unminimizedCount to unminimizedCount + 1
+	on error
+		set unminimizedCount to unminimizedCount + 1
+	end try
+end repeat
+return (count of windows of workerProcess as text) & \",\" & (unminimizedCount as text)
+end tell`,
 	], { timeout: 5_000 });
-	const count = Number(stdout.trim());
-	if (!Number.isSafeInteger(count) || count < 0) {
-		throw new Error(`ChatGPT Desktop worker process ${pid} returned an invalid native-window count.`);
+	assertMinimizedWindowReceipt(pid, stdout);
+}
+
+export function assertMinimizedWindowReceipt(pid: number, raw: string): void {
+	const match = /^(\d+),(\d+)$/.exec(raw.trim());
+	if (!match) throw new Error(`ChatGPT Desktop worker process ${pid} returned an invalid native-window receipt.`);
+	const windowCount = Number(match[1]);
+	const unminimizedCount = Number(match[2]);
+	if (!Number.isSafeInteger(windowCount) || !Number.isSafeInteger(unminimizedCount) || unminimizedCount !== 0) {
+		throw new Error(`ChatGPT Desktop worker process ${pid} retained ${unminimizedCount} of ${windowCount} unminimized windows.`);
 	}
 }
 
@@ -641,13 +930,23 @@ async function quietWorkerWindows(pid: number, previousFrontmostPid: number | un
 	if (previousFrontmostPid && previousFrontmostPid !== pid && currentPid === pid) {
 		await restoreFrontmostPid(previousFrontmostPid);
 	}
+	const finalPid = await currentFrontmostPid();
+	if (!finalPid) throw new Error("Could not verify the frontmost macOS application after desktop-worker containment.");
+	if (finalPid === pid) throw new Error(`ChatGPT Desktop worker process ${pid} remained frontmost.`);
+	await minimizeWorkerWindows(pid);
 }
 
 async function restoreFrontmostPid(pid: number): Promise<void> {
 	if (!processIsAlive(pid)) return;
 	await execFileAsync("/usr/bin/osascript", [
 		"-e", `tell application \"System Events\" to tell first application process whose unix id is ${pid} to set frontmost to true`,
-	], { timeout: 5_000 }).catch(() => undefined);
+	], { timeout: 5_000 });
+	const observed = await currentFrontmostPid();
+	assertRestoredFrontmostPid(pid, observed);
+}
+
+export function assertRestoredFrontmostPid(expectedPid: number, observedPid: number | undefined): void {
+	if (observedPid !== expectedPid) throw new Error(`Could not restore frontmost macOS application process ${expectedPid}.`);
 }
 
 function processIsAlive(pid: number): boolean {
@@ -675,6 +974,10 @@ function isMissing(error: unknown): boolean {
 
 function isAlreadyExists(error: unknown): boolean {
 	return isRecord(error) && error.code === "EEXIST";
+}
+
+function isDirectoryNotEmpty(error: unknown): boolean {
+	return isRecord(error) && error.code === "ENOTEMPTY";
 }
 
 function errorMessage(error: unknown): string {

@@ -26,6 +26,7 @@ const exerciseReload = process.argv.includes("--reload");
 const exerciseCancellation = process.argv.includes("--cancel");
 const pin = process.argv.includes("--pin");
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6) throw new Error("--concurrency must be an integer from 1 through 6.");
+if (uploadPath) throw new Error("Raw-driver upload acceptance is refused because it bypasses GPT-Control's immutable snapshot boundary. Use the canonical MCP acceptance runner.");
 const advancedExercise = Boolean(model || effort || renameTitle || project || uploadPath || discoverModels || discoverProjects || exerciseReload || exerciseCancellation || pin);
 if (concurrency > 1 && advancedExercise) throw new Error("Model, organization, upload, reload, and cancellation acceptance must use one exact session.");
 if (exerciseReload && exerciseCancellation) throw new Error("Run --reload and --cancel as separate exact-session acceptance tests.");
@@ -75,7 +76,9 @@ if (concurrency > 1 && process.env.GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGE
 
 const sessions = [];
 const archivedSessionIds = new Set();
-const cleanupUrls = new Map();
+const cleanupErrors = [];
+let primaryError;
+let finalRecord;
 const questions = [
 	"When would you use CSS Grid instead of Flexbox?",
 	"What makes a website feel fast to a visitor?",
@@ -138,7 +141,6 @@ try {
 			}
 		}
 		let currentSession = await call("show", { sessionId: session.sessionId });
-		cleanupUrls.set(session.sessionId, currentSession.url);
 		if (concurrency > 1) {
 			return { sessionId: session.sessionId, desktopPoolLane: session.desktopPoolLane, pageId: session.pageId, ...receipts, archived: false };
 		}
@@ -181,7 +183,9 @@ try {
 			archivedSessionIds.add(result.sessionId);
 		}
 	}
-	console.log(JSON.stringify({ mode: "live", concurrency, distinctLaneRendererIdentities: rendererIdentities.size, results }, null, 2));
+	finalRecord = { mode: "live", harness: "raw-driver-exploratory", concurrency, distinctLaneRendererIdentities: rendererIdentities.size, results };
+} catch (error) {
+	primaryError = error;
 } finally {
 	await Promise.all(sessions.filter((session) => !archivedSessionIds.has(session.sessionId)).map(async (session) => {
 		try {
@@ -194,23 +198,29 @@ try {
 					current = await waitRecovered(session.sessionId, current.url);
 					await call("manage_conversation", { session: current, operation: { action: "archive" } });
 				}
+				archivedSessionIds.add(session.sessionId);
 			}
-		} catch {}
-	}));
-	await Promise.all(sessions.map((session) => call("close", { sessionId: session.sessionId }).catch(() => undefined)));
-	for (const session of sessions.filter((candidate) => !archivedSessionIds.has(candidate.sessionId))) {
-		const url = cleanupUrls.get(session.sessionId);
-		if (!url || !/^https:\/\/chatgpt\.com\/c\//.test(url)) continue;
-		let cleanup;
-		try {
-			cleanup = await call("create", { name: `gpt-control:desktop-cleanup:${randomUUID()}`, url });
-			await call("manage_conversation", { session: cleanup, operation: { action: "archive" } });
-			archivedSessionIds.add(session.sessionId);
-		} catch {} finally {
-			if (cleanup) await call("close", { sessionId: cleanup.sessionId }).catch(() => undefined);
+		} catch (error) {
+			cleanupErrors.push(`archive ${session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
 		}
-	}
+	}));
+	await Promise.all(sessions.map(async (session) => {
+		try {
+			await call("close", { sessionId: session.sessionId });
+		} catch (error) {
+			cleanupErrors.push(`close ${session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}));
 }
+
+if (primaryError || cleanupErrors.length > 0) {
+	throw new AggregateError(
+		[...(primaryError ? [primaryError] : []), ...cleanupErrors.map((message) => new Error(message))],
+		`Desktop smoke failed${cleanupErrors.length > 0 ? ` and ${cleanupErrors.length} cleanup operation${cleanupErrors.length === 1 ? "" : "s"} did not succeed` : ""}.`,
+	);
+}
+if (!finalRecord) throw new Error("Desktop smoke produced no terminal record.");
+console.log(JSON.stringify(finalRecord, null, 2));
 
 async function waitReady(session) {
 	const deadline = Date.now() + 60_000;
@@ -284,8 +294,9 @@ async function call(action, params) {
 		child.stdout.on("data", (chunk) => { stdout += chunk; });
 		child.stderr.on("data", (chunk) => { stderr += chunk; });
 		child.on("error", rejectCall);
-		child.on("exit", () => {
+		child.on("exit", (code) => {
 			clearTimeout(timer);
+			if (code !== 0) { rejectCall(new Error(stderr.trim() || `Desktop driver ${action} exited ${code}.`)); return; }
 			let envelope;
 			try { envelope = JSON.parse(stdout.trim()); } catch { rejectCall(new Error(stderr.trim() || `Desktop driver returned invalid JSON (${Buffer.byteLength(stdout, "utf8")} bytes, sha256=${sha256(stdout)}).`)); return; }
 			if (!envelope.ok) { rejectCall(new Error(`Desktop driver ${action} failed: ${envelope.error || stderr.trim() || "unknown error"}`)); return; }
