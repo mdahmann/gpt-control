@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.1";
+var PACKAGE_VERSION = "0.5.0-alpha.2";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.1";
+var PACKAGE_VERSION2 = "0.5.0-alpha.2";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35696,6 +35696,16 @@ class ChromeBridgeBrowserDriver {
     }
     return current;
   }
+  async assertSessionOwnership(session, signal) {
+    const owned = await showSession(this.exec, this.launcher, session.sessionId, signal);
+    const pageId = tabIdFromSession(owned);
+    if (pageId === undefined || String(pageId) !== String(session.pageId)) {
+      throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; observation refused.`);
+    }
+    if (typeof owned.name !== "string" || owned.name !== session.name) {
+      throw new Error(`Refused observation on renamed or foreign browser session ${session.sessionId}.`);
+    }
+  }
   async probe(signal) {
     const result = await probeBridge(this.exec, this.launcher, signal);
     const secureInput = Boolean(this.launcher.privateRpc);
@@ -35773,6 +35783,7 @@ class ChromeBridgeBrowserDriver {
     await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
   }
   async observe(session, signal) {
+    await this.assertSessionOwnership(session, signal);
     return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
   async dismissRateLimitNotice(session, signal) {
@@ -35893,7 +35904,21 @@ var ProbeSchema = exports_external.object({
   driver: DriverIdSchema,
   secureInput: exports_external.boolean(),
   protocolVersion: exports_external.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
-  reason: exports_external.string().optional()
+  reason: exports_external.string().optional(),
+  driverVersion: exports_external.string().min(1).max(128).optional(),
+  stateWriterVersion: exports_external.number().int().positive().optional(),
+  host: exports_external.object({
+    appPath: exports_external.string().min(1),
+    bundleId: exports_external.string().min(1).max(256),
+    teamId: exports_external.string().min(1).max(64),
+    listenerPid: exports_external.number().int().positive(),
+    endpoint: exports_external.string().url(),
+    browserVersion: exports_external.string().min(1).max(512),
+    browserInstanceId: exports_external.string().min(8).max(256)
+  }).strict().optional(),
+  runtimeExecutable: exports_external.string().min(1).optional(),
+  runtimeBundlePath: exports_external.string().min(1).optional(),
+  runtimeBundleSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional()
 }).strict();
 var EnvelopeSchema = exports_external.object({
   version: exports_external.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
@@ -36045,13 +36070,14 @@ async function invokeJsonCommand(command, args, request, signal) {
         return reject(new Error("Browser driver response exceeded 16 MiB."));
       const output = Buffer.concat(stdout).toString("utf8").trim();
       if (code !== 0)
-        return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code}.`));
+        return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code} without a valid protocol envelope.`));
       if (output === "")
         return reject(new Error("Browser driver returned no JSON."));
       try {
         resolve3(JSON.parse(output));
       } catch {
-        reject(new Error(`Browser driver returned invalid JSON: ${output.slice(0, 400)}`));
+        const digest = createHash2("sha256").update(output, "utf8").digest("hex");
+        reject(new Error(`Browser driver returned invalid JSON (${Buffer.byteLength(output, "utf8")} bytes, sha256=${digest}).`));
       }
     }));
     child.stdin.end(`${request}
