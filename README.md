@@ -2,7 +2,7 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.5.0-alpha.1 adds an opt-in experimental protocol-v2 driver for the signed
+0.5.0-alpha.2 hardens the opt-in experimental protocol-v2 driver for the signed
 macOS ChatGPT desktop app. Chrome Bridge remains the default. Version 0.4.4
 added durable model and project catalogs so ordinary catalog reads do not
 open Chrome. Version 0.4.3 added shared rate-limit cooldown, ChatGPT

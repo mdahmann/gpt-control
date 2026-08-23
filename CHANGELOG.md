@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0-alpha.2] - 2026-08-23
+
+- Reserved every mutating desktop run a dedicated native window and persisted
+  its exact renderer receipt before waiting for readiness.
+- Added restart-safe provisional creation and close states, bounded local lock
+  recovery, exact target-absence proof, and multi-shell conversation search.
+- Added strict code-signature verification, one desktop environment namespace,
+  packaged runtime receipts, and valid protocol errors on exit status zero.
+- Kept user-owned ChatGPT windows passive and outside GPT-Control ownership.
+
 ## [0.5.0-alpha.1] - 2026-08-22
 
 - Added an opt-in protocol-v2 adapter for the signed macOS ChatGPT desktop app

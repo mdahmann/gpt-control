@@ -16,10 +16,12 @@ It verifies all of these conditions before an action:
 - the HTTP and WebSocket endpoints stay on the same loopback port;
 - the session still owns the exact renderer and ChatGPT URL.
 
-The durable state root is private. Prompt text is not stored there. The driver
+The private desktop ownership state stores no prompt or assistant text. It
 stores a SHA-256 prompt hash and marks Send as attempted before it clicks the
-button. If that boundary is ambiguous, it observes the existing conversation
-and refuses automatic replay.
+button. GPT-Control's separate broker state still stores the durable request,
+result, and recovery evidence required by GPT Chat and Worker workflows. If the
+Send boundary is ambiguous, the driver observes the existing conversation and
+refuses automatic replay.
 
 ## Read-only macOS diagnostic
 
@@ -39,6 +41,10 @@ node scripts/desktop-cdp-live-smoke.mjs
 
 The default diagnostic verifies the app, listener, endpoint, and target list.
 It does not create a conversation or send a message.
+
+The production doctor and launcher execute the bundled TypeScript protocol-v2
+driver. Earlier JavaScript prototype fixtures remain only for historical unit
+tests and are excluded from the published package.
 
 Read-only sidebar discovery is also available through
 `gpt_conversation_find`. It extracts each exact provider conversation ID from
@@ -102,20 +108,32 @@ the same page evaluation. Keyboard cleanup uses a capture-phase guard for
 file input, checks the conversation before and after the CDP file assignment,
 and refuses a missing or changed input.
 
-The live harness can exercise these paths in one disposable conversation:
+The live harness can exercise these paths in one disposable conversation. Put
+titles, project names, upload paths, and cleanup URLs in a private mode-0600
+request file so they do not appear in process arguments:
+
+```json
+{
+  "renameTitle": "Web Development Notes",
+  "project": "Projects",
+  "uploadPath": "/absolute/path/to/a/non-sensitive-file.md"
+}
+```
 
 ```sh
+chmod 600 ./desktop-live-request.json
+
 GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
 node scripts/desktop-cdp-live-smoke.mjs --live \
   --discover-models --discover-projects \
   --model "GPT-5.6 Sol" --effort High \
-  --upload ./path/to/a/non-sensitive-file.md \
-  --reload --pin --rename "Web Development Notes" \
-  --project "Projects"
+  --reload --pin --request-file ./desktop-live-request.json
 ```
 
 Run cancellation separately with `--cancel`. The harness attempts to archive
 every conversation during cleanup, including a run that fails after submission.
+Assistant text is represented by a character count and SHA-256 hash unless the
+operator explicitly adds `--include-sensitive-output`.
 
 ## Alpha release gates
 

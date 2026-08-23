@@ -81,7 +81,12 @@ process.stdin.on("end", () => {
   appendFileSync(process.env.GPT_CONTROL_DRIVER_LOG, JSON.stringify({ argv: process.argv.slice(2), action: request.action, params: request.params }) + "\\n");
   const base = { sessionId: "s1", pageId: "p1", name: "gpt-control:chat:x", url: "https://chatgpt.com/c/exact" };
   let result = {};
-  if (request.action === "probe") result = { ready: true, driver: "fixture/v2", secureInput: true, protocolVersion: 2 };
+  if (request.action === "probe") result = {
+    ready: true, driver: "fixture/v2", secureInput: true, protocolVersion: 2,
+    driverVersion: "0.5.0-alpha.2", stateWriterVersion: 2,
+    host: { appPath: "/Applications/ChatGPT.app", bundleId: "com.openai.codex", teamId: "2DC432GLL2", listenerPid: 123, endpoint: "http://127.0.0.1:9236", browserVersion: "Chrome/151", browserInstanceId: "/devtools/browser/12345678" },
+    runtimeExecutable: "/usr/bin/node", runtimeBundlePath: "/plugin/dist/driver.js", runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  };
   else if (request.action === "create") result = { ...base, name: request.params.name, url: request.params.url };
   else if (request.action === "show") result = base;
   else if (request.action === "navigate") result = { ...base, url: request.params.url };
@@ -96,7 +101,7 @@ process.stdin.on("end", () => {
 		process.env.GPT_CONTROL_DRIVER_LOG = log;
 		try {
 			const external = new ExternalCommandBrowserDriver(script);
-			expect(await external.probe()).toEqual({ ready: true, driver: "fixture/v2", secureInput: true, protocolVersion: 2 });
+			expect(await external.probe()).toMatchObject({ ready: true, driver: "fixture/v2", driverVersion: "0.5.0-alpha.2", stateWriterVersion: 2, runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
 			const created = await external.create("gpt-control:chat:x", "https://chatgpt.com");
 			await external.upload(created, ["/private/snapshot/a.ts"]);
 			await external.fill(created, "secret prompt carried only on stdin");

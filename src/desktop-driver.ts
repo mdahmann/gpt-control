@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import {
 	ChromeBridgeBrowserDriver,
 	type ChatGptConversationCatalog,
@@ -23,6 +25,8 @@ import type { Launcher } from "./transport";
 import type { Exec, ExecResult } from "./types";
 
 export const DESKTOP_DRIVER_ID = "chatgpt-desktop-cdp/v1";
+export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.2";
+export const DESKTOP_STATE_WRITER_VERSION = 2;
 
 export interface DesktopCdpTarget {
 	id: string;
@@ -32,6 +36,18 @@ export interface DesktopCdpTarget {
 	browserInstanceId?: string;
 	surface?: "web" | "desktop_shell";
 	runtimeUrl?: string;
+}
+
+export interface DesktopCdpTargetReceipt {
+	id: string;
+	browserInstanceId: string;
+}
+
+export class DesktopTargetCreationError extends Error {
+	constructor(message: string, readonly outcome: "not_created" | "unknown") {
+		super(message);
+		this.name = "DesktopTargetCreationError";
+	}
 }
 
 export type DesktopCdpAction =
@@ -55,9 +71,10 @@ export interface DesktopCdpEnvironment {
 	verifyHost(): Promise<DesktopHostReceipt>;
 	listTargets(): Promise<DesktopCdpTarget[]>;
 	findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog>;
-	createTarget(url: string): Promise<DesktopCdpTarget>;
+	createTarget(url: string): Promise<DesktopCdpTargetReceipt>;
+	waitForTarget(targetId: string, browserInstanceId: string): Promise<DesktopCdpTarget>;
 	navigateTarget(targetId: string, url: string): Promise<DesktopCdpTarget>;
-	windowId(targetId: string): Promise<number | undefined>;
+	windowId(targetId: string, browserInstanceId?: string): Promise<number | undefined>;
 	readHtml(targetId: string): Promise<string>;
 	elementExists(targetId: string, selector: string, expectedUrl?: string): Promise<boolean>;
 	act(targetId: string, action: DesktopCdpAction): Promise<unknown>;
@@ -93,10 +110,15 @@ interface DesktopSessionState {
 	browserInstanceId?: string;
 	surface?: "web" | "desktop_shell";
 	createdTarget?: boolean;
-	closeState?: "requested" | "target_closed";
+	creationPhase?: "intent_recorded" | "target_created" | "ready";
+	creationOperationId?: string;
+	creationStartedAt?: string;
+	creationBaselineTargetIds?: string[];
+	closeState?: "requested" | "close_dispatched" | "target_absent";
 	closeOwnerToken?: string;
 	closeOwnerPid?: number;
 	closeOwnerHostname?: string;
+	closeOwnerStartedAt?: string;
 	url: string;
 	state: "working" | "needs_user" | "completed";
 	sendState: "prepared" | "attempted" | "submitted";
@@ -106,10 +128,27 @@ interface DesktopSessionState {
 }
 
 interface DesktopDriverState {
-	version: 1;
+	version: 2;
+	writerVersion: 2;
+	driverVersion: string;
 	nextTabId: number;
 	sessions: Record<string, DesktopSessionState>;
 }
+
+interface CreationReceiptRecord {
+	version: 1;
+	operationId: string;
+	targetId: string;
+	browserInstanceId: string;
+	recordedAt: string;
+}
+
+const STATE_LOCK_LEASE_MS = 120_000;
+const STATE_LOCK_INITIALIZATION_GRACE_MS = 2_000;
+const CLOSE_OWNER_LEASE_MS = 300_000;
+const execFileAsync = promisify(execFile);
+
+class UnsafeStateLockError extends Error {}
 
 export async function handleDesktopDriverRequest(
 	request: DesktopDriverRequest,
@@ -120,8 +159,16 @@ export async function handleDesktopDriverRequest(
 	}
 	try {
 		if (request.action === "probe") {
-			await options.environment.verifyHost();
-			return success({ ready: true, driver: DESKTOP_DRIVER_ID, secureInput: true, protocolVersion: 2 });
+			const host = await options.environment.verifyHost();
+			return success({
+				ready: true,
+				driver: DESKTOP_DRIVER_ID,
+				driverVersion: DESKTOP_DRIVER_VERSION,
+				stateWriterVersion: DESKTOP_STATE_WRITER_VERSION,
+				secureInput: true,
+				protocolVersion: 2,
+				host,
+			});
 		}
 		const host = await options.environment.verifyHost();
 		const bridge = new DesktopCdpBridge(options, host);
@@ -357,18 +404,66 @@ class DesktopCdpBridge {
 		}
 		if (operation === "close") {
 			const sessionId = requiredString(rest[0], "sessionId");
+			let unresolved = requireSession(await readState(this.options.stateRoot), sessionId);
+			if (unresolved.creationPhase === "intent_recorded" && !unresolved.targetId) {
+				const receipt = unresolved.creationOperationId
+					? await readCreationReceipt(this.options.stateRoot, unresolved.creationOperationId)
+					: undefined;
+				if (receipt) {
+					const recoveredWindowId = await this.options.environment.windowId(receipt.targetId, receipt.browserInstanceId);
+					await withStateLock(this.options.stateRoot, async (state) => {
+						const durable = requireSession(state, sessionId);
+						if (durable.targetId || durable.creationOperationId !== receipt.operationId) {
+							throw new Error(`Desktop session ${sessionId} creation receipt no longer matches its durable intent.`);
+						}
+						durable.targetId = receipt.targetId;
+						durable.browserInstanceId = receipt.browserInstanceId;
+						durable.createdTarget = true;
+						durable.creationPhase = "target_created";
+						if (recoveredWindowId !== undefined) durable.windowId = recoveredWindowId;
+					});
+					unresolved = requireSession(await readState(this.options.stateRoot), sessionId);
+				}
+			}
+			if (unresolved.creationPhase === "intent_recorded" && !unresolved.targetId) {
+				if (!unresolved.browserInstanceId || !unresolved.creationBaselineTargetIds) {
+					throw new Error(`Desktop session ${sessionId} has an uncertain native-window creation outcome without recovery evidence; manual cleanup is required.`);
+				}
+				const currentHost = await this.options.environment.verifyHost();
+				const currentTargets = await this.options.environment.listTargets();
+				const state = await readState(this.options.stateRoot);
+				const claimed = new Set(Object.values(state.sessions)
+					.filter((entry) => entry.sessionId !== sessionId)
+					.map((entry) => entry.targetId)
+					.filter(Boolean));
+				const candidates = currentHost.browserInstanceId === unresolved.browserInstanceId
+					? currentTargets.filter((target) => !unresolved.creationBaselineTargetIds!.includes(target.id) && !claimed.has(target.id))
+					: [];
+				if (candidates.length > 0) {
+					throw new Error(`Desktop session ${sessionId} has an uncertain native-window creation outcome with ${candidates.length} unclaimed post-intent renderer candidate(s); the durable record was retained for manual cleanup.`);
+				}
+				await withStateLock(this.options.stateRoot, async (current) => {
+					const durable = requireSession(current, sessionId);
+					if (durable.creationPhase !== "intent_recorded" || durable.targetId) throw new Error(`Desktop session ${sessionId} creation recovery state changed.`);
+					delete current.sessions[sessionId];
+				});
+				return { success: true };
+			}
 			const closeToken = randomUUID();
 			const snapshot = await withStateLock(this.options.stateRoot, async (state) => {
 				const session = requireSession(state, sessionId);
 				session.closeState ??= "requested";
-				if (session.closeState === "target_closed") return { session: { ...session }, claimed: new Set<string>() };
+				if (session.closeState === "target_absent") return { session: { ...session }, claimed: new Set<string>() };
 				if (session.closeOwnerToken) {
-					if (session.closeOwnerHostname !== hostname()) throw new Error(`Desktop session ${sessionId} close is owned by another host.`);
-					if (session.closeOwnerPid && processIsAlive(session.closeOwnerPid)) throw new Error(`Desktop session ${sessionId} close is already in progress.`);
+					const ownerFresh = typeof session.closeOwnerStartedAt === "string"
+						&& Date.now() - Date.parse(session.closeOwnerStartedAt) < CLOSE_OWNER_LEASE_MS;
+					if (ownerFresh && session.closeOwnerHostname !== hostname()) throw new Error(`Desktop session ${sessionId} close is owned by another host.`);
+					if (ownerFresh && session.closeOwnerPid && processIsAlive(session.closeOwnerPid)) throw new Error(`Desktop session ${sessionId} close is already in progress.`);
 				}
 				session.closeOwnerToken = closeToken;
 				session.closeOwnerPid = process.pid;
 				session.closeOwnerHostname = hostname();
+				session.closeOwnerStartedAt = new Date().toISOString();
 				return {
 					session: { ...session },
 					claimed: new Set(Object.values(state.sessions)
@@ -377,7 +472,7 @@ class DesktopCdpBridge {
 						.filter(Boolean)),
 				};
 			});
-			if (snapshot.session.closeState === "target_closed") {
+			if (snapshot.session.closeState === "target_absent") {
 				await withStateLock(this.options.stateRoot, async (state) => { delete state.sessions[sessionId]; });
 				return { success: true };
 			}
@@ -387,6 +482,9 @@ class DesktopCdpBridge {
 				if (session.createdTarget === true && !session.browserInstanceId) {
 					throw new Error(`Desktop session ${sessionId} uses legacy ownership state and cannot safely close its renderer automatically; the durable record was retained for manual cleanup.`);
 				}
+				if (session.createdTarget === true && session.browserInstanceId !== this.host.browserInstanceId) {
+					throw new Error(`Desktop session ${sessionId} belongs to a different ChatGPT Desktop browser instance; target absence cannot be proved and the durable record was retained.`);
+				}
 				if (session.targetId && session.createdTarget === true
 					&& session.browserInstanceId === this.host.browserInstanceId) {
 					const targets = await this.options.environment.listTargets();
@@ -394,40 +492,65 @@ class DesktopCdpBridge {
 						? undefined
 						: targets.find((target) => target.id === session.targetId);
 					if (session.windowId !== undefined) {
-						if (owned && await this.options.environment.windowId(owned.id) !== session.windowId) owned = undefined;
+						if (owned && await this.options.environment.windowId(owned.id, session.browserInstanceId) !== session.windowId) {
+							throw new Error(`Desktop session ${sessionId} exact renderer is still live but its native window identity changed; the durable record was retained.`);
+						}
 						if (!owned) {
 							const replacements: DesktopCdpTarget[] = [];
 							for (const candidate of targets) {
 								if (snapshot.claimed.has(candidate.id)) continue;
-								if (await this.options.environment.windowId(candidate.id) === session.windowId) replacements.push(candidate);
+								if (await this.options.environment.windowId(candidate.id, session.browserInstanceId) === session.windowId) replacements.push(candidate);
 							}
 							if (replacements.length > 1) throw new Error(`Desktop session ${sessionId} has ambiguous replacement renderers in its owned window.`);
 							owned = replacements[0];
 						}
-					} else if (!owned) {
-						throw new Error(`Desktop session ${sessionId} lost its exact renderer and has no native window identity; the durable record was retained for manual cleanup.`);
-					}
+						} else if (!owned) {
+							throw new Error(`Desktop session ${sessionId} lost its exact renderer and has no native window identity; the durable record was retained for manual cleanup.`);
+						}
 					ownedTargetId = owned?.id;
 					if (ownedTargetId) {
-						ownedTargetId = await withStateLock(this.options.stateRoot, async (state) => {
-							const durable = requireSession(state, sessionId);
-							if (durable.closeOwnerToken !== closeToken) throw new Error(`Desktop session ${sessionId} close ownership changed.`);
-							const duplicate = Object.values(state.sessions)
-								.find((entry) => entry.sessionId !== sessionId && entry.targetId === ownedTargetId);
-							if (duplicate) return undefined;
-							durable.targetId = ownedTargetId!;
-							return ownedTargetId;
-						});
-						if (ownedTargetId) await this.options.environment.closeTarget(ownedTargetId, session.browserInstanceId);
+						for (let attempt = 0; attempt < 4 && ownedTargetId; attempt += 1) {
+							const targetToClose = ownedTargetId;
+							ownedTargetId = await withStateLock(this.options.stateRoot, async (state) => {
+								const durable = requireSession(state, sessionId);
+								if (durable.closeOwnerToken !== closeToken) throw new Error(`Desktop session ${sessionId} close ownership changed.`);
+								const duplicate = Object.values(state.sessions)
+									.find((entry) => entry.sessionId !== sessionId && entry.targetId === targetToClose);
+								if (duplicate) return undefined;
+								durable.targetId = targetToClose;
+								durable.closeState = "close_dispatched";
+								return targetToClose;
+							});
+							if (!ownedTargetId) break;
+							await this.options.environment.closeTarget(ownedTargetId, session.browserInstanceId);
+							const afterClose = await this.options.environment.listTargets();
+							if (afterClose.some((target) => target.id === targetToClose)) {
+								throw new Error(`ChatGPT Desktop renderer ${targetToClose} is still present after close.`);
+							}
+							if (session.windowId === undefined) {
+								throw new Error(`Desktop session ${sessionId} closed its exact renderer, but has no native window identity; replacement-window absence cannot be proved and the durable record was retained.`);
+							}
+							const replacements: DesktopCdpTarget[] = [];
+							for (const candidate of afterClose) {
+								if (snapshot.claimed.has(candidate.id)) continue;
+								if (await this.options.environment.windowId(candidate.id, session.browserInstanceId) === session.windowId) replacements.push(candidate);
+							}
+							if (replacements.length > 1) throw new Error(`Desktop session ${sessionId} has ambiguous replacement renderers after close.`);
+							ownedTargetId = replacements[0]?.id;
+						}
+						if (ownedTargetId) throw new Error(`Desktop session ${sessionId} kept replacing its renderer during bounded close cleanup.`);
 					}
+				} else if (session.targetId && session.createdTarget !== true) {
+					throw new Error(`Desktop session ${sessionId} does not own a dedicated renderer; automatic close is refused.`);
 				}
 				await withStateLock(this.options.stateRoot, async (state) => {
 					const durable = requireSession(state, sessionId);
 					if (durable.closeOwnerToken !== closeToken) throw new Error(`Desktop session ${sessionId} close ownership changed.`);
-					durable.closeState = "target_closed";
+					durable.closeState = "target_absent";
 					delete durable.closeOwnerToken;
 					delete durable.closeOwnerPid;
 					delete durable.closeOwnerHostname;
+					delete durable.closeOwnerStartedAt;
 				});
 			} catch (error) {
 				await withStateLock(this.options.stateRoot, async (state) => {
@@ -436,12 +559,13 @@ class DesktopCdpBridge {
 					delete durable.closeOwnerToken;
 					delete durable.closeOwnerPid;
 					delete durable.closeOwnerHostname;
+					delete durable.closeOwnerStartedAt;
 				});
 				throw error;
 			}
 			await withStateLock(this.options.stateRoot, async (state) => {
 				const session = requireSession(state, sessionId);
-				if (session.closeState !== "target_closed") throw new Error(`Desktop session ${sessionId} has not completed target cleanup.`);
+				if (session.closeState !== "target_absent") throw new Error(`Desktop session ${sessionId} has not proved target cleanup.`);
 				delete state.sessions[sessionId];
 			});
 			return { success: true };
@@ -451,46 +575,84 @@ class DesktopCdpBridge {
 
 	private async navigateSession(sessionId: string, url: string): Promise<{ tabId: number }> {
 		let snapshot = await this.sessionById(sessionId);
-		if (!snapshot.targetId) {
-			let createdTarget: DesktopCdpTarget | undefined;
+		if (!snapshot.targetId && snapshot.creationPhase === "intent_recorded") {
+			const journaled = snapshot.creationOperationId
+				? await readCreationReceipt(this.options.stateRoot, snapshot.creationOperationId)
+				: undefined;
+			if (!journaled) {
+				throw new Error(`Desktop session ${sessionId} has an uncertain native-window creation outcome; no replacement window will be created automatically.`);
+			}
+			await withStateLock(this.options.stateRoot, async (state) => {
+				const session = requireSession(state, sessionId);
+				if (session.creationOperationId !== journaled.operationId || session.targetId) throw new Error("Desktop creation receipt no longer matches its durable intent.");
+				session.targetId = journaled.targetId;
+				session.browserInstanceId = journaled.browserInstanceId;
+				session.createdTarget = true;
+				session.creationPhase = "target_created";
+				session.url = CHATGPT_ORIGIN;
+			});
+			snapshot = await this.sessionById(sessionId);
+		}
+		if (!snapshot.targetId || snapshot.creationPhase === "target_created") {
+			let receipt: DesktopCdpTargetReceipt | undefined = snapshot.targetId && snapshot.browserInstanceId
+				? { id: snapshot.targetId, browserInstanceId: snapshot.browserInstanceId }
+				: undefined;
+			let receiptJournaled = Boolean(receipt);
+			let creationBaselineTargetIds = snapshot.creationBaselineTargetIds ?? [];
+			const operationId = snapshot.creationOperationId ?? randomUUID();
 			try {
-				const targets = await this.options.environment.listTargets();
-				const state = await readState(this.options.stateRoot);
-				const claimed = new Set(Object.values(state.sessions).map((session) => session.targetId).filter(Boolean));
-				const available = targets.filter((candidate) => eligibleTarget(candidate) && !claimed.has(candidate.id));
-				const exactProviderConversation = providerConversationIdentity(url);
-				let target: DesktopCdpTarget | undefined;
-				let navigated: DesktopCdpTarget | undefined;
-				if (exactProviderConversation) {
+				if (!receipt) {
 					if (!this.options.allowCreateTarget) {
-						throw new Error("Exact ChatGPT conversation attachment requires a new owned renderer, but dedicated target creation is disabled.");
+						throw new Error("ChatGPT Desktop mutations require a dedicated owned window, but target creation is disabled.");
 					}
-					createdTarget = await this.options.environment.createTarget(CHATGPT_ORIGIN);
-					target = createdTarget;
-				} else {
-					target = targets.find((candidate) => eligibleTarget(candidate)
-						&& !claimed.has(candidate.id)
-						&& sameExactUrl(candidate.url, url));
-					target ??= available[0];
-					if (!target) {
-						const activeClaims = claimed.size;
-						if (activeClaims > 0 && !this.options.allowCreateTarget) {
-							throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
+					const creationHost = await this.options.environment.verifyHost();
+					creationBaselineTargetIds = (await this.options.environment.listTargets()).map((target) => target.id);
+					const unresolved = await withStateLock(this.options.stateRoot, async (current) => {
+						const session = requireSession(current, sessionId);
+						if (session.targetId || session.creationPhase) throw new Error("Desktop session creation state changed before native window creation.");
+						const conflict = Object.values(current.sessions)
+							.find((entry) => entry.sessionId !== sessionId && entry.creationPhase === "intent_recorded" && !entry.targetId);
+						if (conflict) {
+							delete current.sessions[sessionId];
+							return { operationId: conflict.creationOperationId, sessionId: conflict.sessionId };
 						}
-						createdTarget = await this.options.environment.createTarget(url);
-						target = createdTarget;
+						session.browserInstanceId = creationHost.browserInstanceId;
+						session.creationPhase = "intent_recorded";
+						session.creationOperationId = operationId;
+						session.creationStartedAt = new Date().toISOString();
+						session.creationBaselineTargetIds = creationBaselineTargetIds;
+						return undefined;
+					});
+					if (unresolved) {
+						throw new Error(`Desktop window creation is blocked by unresolved intent ${unresolved.operationId} in session ${unresolved.sessionId}; no replacement window was created.`);
 					}
+					receipt = await this.options.environment.createTarget(CHATGPT_ORIGIN);
+					await writeCreationReceipt(this.options.stateRoot, operationId, receipt);
+					receiptJournaled = true;
+					await withStateLock(this.options.stateRoot, async (current) => {
+						const session = requireSession(current, sessionId);
+						if (session.targetId && session.targetId !== receipt!.id) throw new Error("Desktop session target changed during provisional claim.");
+						const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== sessionId && entry.targetId === receipt!.id);
+						if (duplicate) throw new Error("Desktop renderer is already owned by another GPT-Control session.");
+						session.targetId = receipt!.id;
+						session.browserInstanceId = receipt!.browserInstanceId;
+						session.createdTarget = true;
+						session.creationPhase = "target_created";
+						session.url = CHATGPT_ORIGIN;
+					});
 				}
-				navigated ??= await this.options.environment.navigateTarget(target.id, url);
+				const target = await this.options.environment.waitForTarget(receipt.id, receipt.browserInstanceId);
+				const navigated = await this.options.environment.navigateTarget(target.id, url);
 				const ownershipHost = await this.options.environment.verifyHost();
-				if (createdTarget?.browserInstanceId && createdTarget.browserInstanceId !== ownershipHost.browserInstanceId) {
+				if (receipt.browserInstanceId !== ownershipHost.browserInstanceId) {
 					throw new Error("ChatGPT Desktop browser instance changed during native renderer creation.");
 				}
 				const provedTarget = (await this.options.environment.listTargets())
 					.find((candidate) => candidate.id === navigated.id && sameExactUrl(candidate.url, navigated.url));
 				if (!provedTarget) throw new Error("ChatGPT Desktop renderer ownership changed before durable claim.");
 				this.host = ownershipHost;
-				const windowId = await this.options.environment.windowId(navigated.id);
+				const windowId = await this.options.environment.windowId(navigated.id, ownershipHost.browserInstanceId);
+				if (windowId === undefined) throw new Error("ChatGPT Desktop did not provide a native window identity for the created renderer.");
 				await withStateLock(this.options.stateRoot, async (current) => {
 					const session = requireSession(current, sessionId);
 					if (session.targetId && session.targetId !== navigated.id) throw new Error("Desktop session target changed during claim.");
@@ -500,15 +662,81 @@ class DesktopCdpBridge {
 					session.windowId = windowId;
 					session.browserInstanceId = ownershipHost.browserInstanceId;
 					session.surface = navigated.surface;
-					session.createdTarget = createdTarget?.id === navigated.id;
+					session.createdTarget = true;
+					session.creationPhase = "ready";
 					session.url = exactChatGptUrl(navigated.url);
 				});
+				await removeCreationReceipt(this.options.stateRoot, operationId);
 			} catch (error) {
-				await withStateLock(this.options.stateRoot, async (state) => {
-					const current = state.sessions[sessionId];
-					if (current && !current.targetId) delete state.sessions[sessionId];
-				});
-				if (createdTarget) await this.options.environment.closeTarget(createdTarget.id, this.host.browserInstanceId).catch(() => undefined);
+				if (!receipt) {
+					if (!(error instanceof DesktopTargetCreationError && error.outcome === "unknown")) {
+						await withStateLock(this.options.stateRoot, async (state) => {
+							const current = state.sessions[sessionId];
+							if (current && !current.targetId) delete state.sessions[sessionId];
+						});
+						throw error;
+					}
+					const durableBoundaryRecorded = await withStateLock(this.options.stateRoot, async (state) => {
+						const current = state.sessions[sessionId];
+						if (!current) return false;
+						if (!current.targetId && !current.creationPhase) {
+							delete state.sessions[sessionId];
+							return false;
+						}
+						return true;
+					});
+					if (!durableBoundaryRecorded) throw error;
+					throw new Error(`${errorMessage(error)} Native-window creation intent ${operationId} in session ${sessionId} remains durably recorded because no exact target receipt was received; call close with this session ID to recover only after no post-intent renderer remains.`);
+				}
+				if (!receiptJournaled) {
+					try {
+						await writeCreationReceipt(this.options.stateRoot, operationId, receipt);
+						receiptJournaled = true;
+					} catch (journalError) {
+						let stateRecordError: unknown;
+						try {
+							await withStateLock(this.options.stateRoot, async (state) => {
+								const current = requireSession(state, sessionId);
+								current.targetId = receipt!.id;
+								current.browserInstanceId = receipt!.browserInstanceId;
+								current.createdTarget = true;
+								current.creationPhase = "target_created";
+							});
+						} catch (caught) {
+							stateRecordError = caught;
+						}
+						let cleanupError: unknown;
+						try {
+							await this.cleanupProvisionalRenderer(sessionId, receipt, creationBaselineTargetIds, !stateRecordError);
+						} catch (caught) {
+							cleanupError = caught;
+						}
+						if (!cleanupError) {
+							if (!stateRecordError) {
+								await withStateLock(this.options.stateRoot, async (state) => { delete state.sessions[sessionId]; });
+							}
+							throw new Error(`${errorMessage(error)} Receipt persistence failed, but exact renderer ${receipt.id} cleanup was proved: ${errorMessage(journalError)}`);
+						}
+						if (!stateRecordError) {
+							throw new Error(`${errorMessage(error)} Exact renderer ${receipt.id} remains durably recorded because receipt persistence and cleanup failed: ${errorMessage(journalError)}; ${errorMessage(cleanupError)}`);
+						}
+						throw new Error(`${errorMessage(error)} Exact renderer ${receipt.id} could not be journaled, recorded in state, or proved cleaned: ${errorMessage(journalError)}; ${errorMessage(stateRecordError)}; ${errorMessage(cleanupError)}`);
+					}
+				}
+				try {
+					await this.cleanupProvisionalRenderer(sessionId, receipt, creationBaselineTargetIds, true);
+				} catch (closeError) {
+					throw new Error(`${errorMessage(error)} Exact created renderer ${receipt.id} remains durably journaled because cleanup could not be proved: ${errorMessage(closeError)}`);
+				}
+				try {
+					await withStateLock(this.options.stateRoot, async (state) => {
+						const current = state.sessions[sessionId];
+						if (current?.creationOperationId === operationId) delete state.sessions[sessionId];
+					});
+					await removeCreationReceipt(this.options.stateRoot, operationId);
+				} catch (stateCleanupError) {
+					throw new Error(`${errorMessage(error)} Renderer ${receipt.id} absence was proved, but durable state cleanup failed; receipt journal ${operationId} was retained: ${errorMessage(stateCleanupError)}`);
+				}
 				throw error;
 			}
 			snapshot = await this.sessionById(sessionId);
@@ -518,6 +746,63 @@ class DesktopCdpBridge {
 			await withStateLock(this.options.stateRoot, async (state) => { requireSession(state, sessionId).url = exactChatGptUrl(navigated.url); });
 		}
 		return { tabId: snapshot.tabId };
+	}
+
+	private async cleanupProvisionalRenderer(
+		sessionId: string,
+		receipt: DesktopCdpTargetReceipt,
+		baselineTargetIds: readonly string[],
+		persistState: boolean,
+	): Promise<void> {
+		const baseline = new Set(baselineTargetIds);
+		let targetId: string | undefined = receipt.id;
+		let windowId: number | undefined;
+		try {
+			windowId = await this.options.environment.windowId(receipt.id, receipt.browserInstanceId);
+		} catch {
+			// The exact-target and baseline checks below remain fail-closed when no
+			// native window identity is available.
+		}
+		for (let attempt = 0; attempt < 4 && targetId; attempt += 1) {
+			if (persistState) {
+				await withStateLock(this.options.stateRoot, async (state) => {
+					const current = requireSession(state, sessionId);
+					current.targetId = targetId!;
+					current.browserInstanceId = receipt.browserInstanceId;
+					current.createdTarget = true;
+					current.creationPhase = "target_created";
+					if (windowId !== undefined) current.windowId = windowId;
+				});
+			}
+			let closeError: unknown;
+			try {
+				await this.options.environment.closeTarget(targetId, receipt.browserInstanceId);
+			} catch (caught) {
+				closeError = caught;
+			}
+			const remaining = await this.options.environment.listTargets();
+			if (remaining.some((target) => target.id === targetId)) {
+				throw closeError ?? new Error(`ChatGPT Desktop provisional renderer ${targetId} is still present after close.`);
+			}
+			const state = await readState(this.options.stateRoot).catch(() => undefined);
+			const claimed = new Set(state ? Object.values(state.sessions)
+				.filter((entry) => entry.sessionId !== sessionId)
+				.map((entry) => entry.targetId)
+				.filter(Boolean) : []);
+			const postIntent = remaining.filter((candidate) => !baseline.has(candidate.id) && !claimed.has(candidate.id));
+			if (windowId === undefined) {
+				if (postIntent.length > 0) throw new Error(`${postIntent.length} post-intent renderer candidate(s) remain after exact-target cleanup.`);
+				return;
+			}
+			const replacements: DesktopCdpTarget[] = [];
+			for (const candidate of postIntent) {
+				if (await this.options.environment.windowId(candidate.id, receipt.browserInstanceId) === windowId) replacements.push(candidate);
+			}
+			if (replacements.length > 1) throw new Error("Multiple replacement renderers remain in the provisional native window.");
+			targetId = replacements[0]?.id;
+			if (!targetId) return;
+		}
+		if (targetId) throw new Error("The provisional native window kept replacing its renderer during bounded cleanup.");
 	}
 
 	private async currentTabs(): Promise<Array<{ id: number; url: string }>> {
@@ -533,6 +818,12 @@ class DesktopCdpBridge {
 
 	private async assertExactTarget(session: DesktopSessionState, expected?: ExactBrowserActionTarget): Promise<DesktopSessionState> {
 		assertSessionNotClosing(session);
+		if (session.createdTarget !== true) {
+			throw new Error(`Desktop session ${session.sessionId} does not own a dedicated renderer; browser actions are refused.`);
+		}
+		if (session.createdTarget === true && session.creationPhase !== "ready") {
+			throw new Error(`Desktop session ${session.sessionId} has a provisional renderer claim and is not ready for actions.`);
+		}
 		if (!session.browserInstanceId || session.browserInstanceId !== this.host.browserInstanceId) {
 			throw new Error("ChatGPT Desktop browser instance changed; durable renderer ownership is no longer valid.");
 		}
@@ -546,7 +837,7 @@ class DesktopCdpBridge {
 			let targets = await this.options.environment.listTargets();
 			let target = targets.find((candidate) => candidate.id === session.targetId);
 			if (target && session.windowId !== undefined
-				&& await this.options.environment.windowId(target.id) !== session.windowId) target = undefined;
+				&& await this.options.environment.windowId(target.id, session.browserInstanceId) !== session.windowId) target = undefined;
 			if (target
 				&& !eligibleTarget(target)
 				&& session.surface === "desktop_shell"
@@ -576,17 +867,18 @@ class DesktopCdpBridge {
 					const candidateIdentity = eligibleTarget(candidate) ? providerConversationIdentity(candidate.url) : undefined;
 					if (candidateIdentity?.id !== identity.id || claimed.has(candidate.id)) continue;
 					if (session.windowId !== undefined
-						&& await this.options.environment.windowId(candidate.id) !== session.windowId) continue;
+						&& await this.options.environment.windowId(candidate.id, session.browserInstanceId) !== session.windowId) continue;
 					matches.push(candidate);
 				}
 				if (matches.length === 1) {
 					target = matches[0];
+					const replacementWindowId = await this.options.environment.windowId(target.id, session.browserInstanceId);
 					await withStateLock(this.options.stateRoot, async (current) => {
 						const durable = requireSession(current, session.sessionId);
 						const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== session.sessionId && entry.targetId === target?.id);
 						if (duplicate) throw new Error("Replacement ChatGPT Desktop renderer became owned by another session.");
 						durable.targetId = target!.id;
-					durable.windowId = await this.options.environment.windowId(target!.id);
+						durable.windowId = replacementWindowId;
 						durable.surface = target!.surface;
 						durable.url = identity.url;
 					});
@@ -662,6 +954,87 @@ class DesktopCdpBridge {
 	}
 }
 
+async function writeCreationReceipt(root: string, operationId: string, receipt: DesktopCdpTargetReceipt): Promise<void> {
+	const directory = await secureDirectory(join(resolve(root), "creation-receipts"));
+	const destination = join(directory, `${safeOperationId(operationId)}.json`);
+	const record: CreationReceiptRecord = {
+		version: 1,
+		operationId,
+		targetId: receipt.id,
+		browserInstanceId: receipt.browserInstanceId,
+		recordedAt: new Date().toISOString(),
+	};
+	const existing = await readCreationReceipt(root, operationId);
+	if (existing) {
+		if (existing.targetId !== receipt.id || existing.browserInstanceId !== receipt.browserInstanceId) {
+			throw new Error(`Conflicting desktop creation receipt for operation ${operationId}.`);
+		}
+		return;
+	}
+	const scratch = join(directory, `.${operationId}-${randomUUID()}.tmp`);
+	const handle = await open(scratch, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+	try {
+		await handle.writeFile(`${JSON.stringify(record)}\n`);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	try {
+		await link(scratch, destination);
+	} catch (error) {
+		if (!isAlreadyExists(error)) throw error;
+		const winner = await readCreationReceipt(root, operationId);
+		if (!winner || winner.targetId !== receipt.id || winner.browserInstanceId !== receipt.browserInstanceId) {
+			throw new Error(`Conflicting desktop creation receipt for operation ${operationId}.`);
+		}
+	} finally {
+		await rm(scratch, { force: true });
+	}
+}
+
+async function readCreationReceipt(root: string, operationId: string): Promise<CreationReceiptRecord | undefined> {
+	const directory = await secureDirectory(join(resolve(root), "creation-receipts"));
+	const path = join(directory, `${safeOperationId(operationId)}.json`);
+	try {
+		const info = await lstat(path);
+		if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Refused unsafe desktop creation receipt: ${path}`);
+		const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+		if (!isRecord(value)
+			|| value.version !== 1
+			|| value.operationId !== operationId
+			|| typeof value.targetId !== "string"
+			|| !/^[A-Za-z0-9_-]{8,128}$/.test(value.targetId)
+			|| typeof value.browserInstanceId !== "string"
+			|| value.browserInstanceId.length < 8
+			|| value.browserInstanceId.length > 256
+			|| typeof value.recordedAt !== "string"
+			|| !Number.isFinite(Date.parse(value.recordedAt))) {
+			throw new Error(`Invalid desktop creation receipt: ${path}`);
+		}
+		return value as unknown as CreationReceiptRecord;
+	} catch (error) {
+		if (isMissing(error)) return undefined;
+		throw error;
+	}
+}
+
+async function removeCreationReceipt(root: string, operationId: string): Promise<void> {
+	const directory = await secureDirectory(join(resolve(root), "creation-receipts"));
+	const path = join(directory, `${safeOperationId(operationId)}.json`);
+	try {
+		const info = await lstat(path);
+		if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Refused unsafe desktop creation receipt: ${path}`);
+		await rm(path);
+	} catch (error) {
+		if (!isMissing(error)) throw error;
+	}
+}
+
+function safeOperationId(operationId: string): string {
+	if (!/^[a-f0-9]{8}-[a-f0-9-]{27,63}$/i.test(operationId)) throw new Error("Invalid desktop creation operation ID.");
+	return operationId;
+}
+
 async function readState(root: string): Promise<DesktopDriverState> {
 	await secureDirectory(root);
 	const path = join(resolve(root), "state.json");
@@ -669,9 +1042,16 @@ async function readState(root: string): Promise<DesktopDriverState> {
 		const info = await lstat(path);
 		if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Refused unsafe desktop driver state: ${path}`);
 		const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+		if (isRecord(parsed) && parsed.version === 1) return migrateLegacyState(parsed);
 		return parseState(parsed);
 	} catch (error) {
-		if (isMissing(error)) return { version: 1, nextTabId: 1, sessions: {} };
+		if (isMissing(error)) return {
+			version: 2,
+			writerVersion: DESKTOP_STATE_WRITER_VERSION,
+			driverVersion: DESKTOP_DRIVER_VERSION,
+			nextTabId: 1,
+			sessions: {},
+		};
 		throw error;
 	}
 }
@@ -681,9 +1061,13 @@ async function withStateLock<T>(root: string, work: (state: DesktopDriverState) 
 	const lock = join(resolve(root), "state.lock");
 	const deadline = Date.now() + 30_000;
 	const token = randomUUID();
+	const processStartId = await localProcessStartId(process.pid);
+	let lockIdentity: { dev: number; ino: number } | undefined;
 	for (;;) {
 		try {
 			await mkdir(lock, { mode: 0o700 });
+			const info = await lstat(lock);
+			lockIdentity = { dev: info.dev, ino: info.ino };
 		} catch (error) {
 			if (!isAlreadyExists(error) || Date.now() >= deadline) throw error;
 			if (await recoverDeadLocalLock(lock)) continue;
@@ -691,21 +1075,33 @@ async function withStateLock<T>(root: string, work: (state: DesktopDriverState) 
 			continue;
 		}
 		try {
-			await writeFile(join(lock, "owner.json"), `${JSON.stringify({
+			const ownerScratch = join(lock, `.owner-${token}.tmp`);
+			await writeFile(ownerScratch, `${JSON.stringify({
 				token,
 				pid: process.pid,
 				hostname: hostname(),
 				createdAt: new Date().toISOString(),
+				expiresAt: new Date(Date.now() + STATE_LOCK_LEASE_MS).toISOString(),
+				processStartId,
 			})}\n`, { mode: 0o600, flag: "wx" });
+			await rename(ownerScratch, join(lock, "owner.json"));
 			break;
 		} catch (error) {
-			await rm(lock, { recursive: true, force: true });
+			if (lockIdentity) {
+				const current = await lstat(lock).catch(() => undefined);
+				if (current?.dev === lockIdentity.dev && current.ino === lockIdentity.ino) {
+					await rm(lock, { recursive: true, force: true });
+				}
+			}
 			throw error;
 		}
 	}
 	try {
 		const state = await readState(root);
 		const result = await work(state);
+		state.version = 2;
+		state.writerVersion = DESKTOP_STATE_WRITER_VERSION;
+		state.driverVersion = DESKTOP_DRIVER_VERSION;
 		await writeState(root, state);
 		return result;
 	} finally {
@@ -718,18 +1114,74 @@ async function withStateLock<T>(root: string, work: (state: DesktopDriverState) 
 
 async function recoverDeadLocalLock(lock: string): Promise<boolean> {
 	try {
-		const owner = JSON.parse(await readFile(join(lock, "owner.json"), "utf8")) as unknown;
+		let owner: unknown;
+		try {
+			owner = JSON.parse(await readFile(join(lock, "owner.json"), "utf8")) as unknown;
+		} catch {
+			if (await lockIsWithinInitializationGrace(lock)) return false;
+			throw new UnsafeStateLockError(`Refused ownerless desktop state lock: ${lock}. Manual inspection is required.`);
+		}
 		if (!isRecord(owner)
-			|| owner.hostname !== hostname()
+			|| typeof owner.hostname !== "string"
 			|| typeof owner.pid !== "number"
 			|| !Number.isInteger(owner.pid)
 			|| owner.pid <= 0
-			|| typeof owner.token !== "string") return false;
-		if (processIsAlive(owner.pid)) return false;
+			|| typeof owner.token !== "string"
+			|| typeof owner.expiresAt !== "string"
+			|| !Number.isFinite(Date.parse(owner.expiresAt))
+			|| typeof owner.processStartId !== "string"
+			|| owner.processStartId === "") {
+			if (isRecord(owner)
+				&& owner.hostname === hostname()
+				&& typeof owner.pid === "number"
+				&& Number.isInteger(owner.pid)
+				&& owner.pid > 0
+				&& !processIsAlive(owner.pid)) {
+				await rm(lock, { recursive: true, force: true });
+				return true;
+			}
+			if (await lockIsWithinInitializationGrace(lock)) return false;
+			throw new UnsafeStateLockError(`Refused malformed desktop state lock: ${lock}. Manual inspection is required.`);
+		}
+		// A valid owner record is never stolen from a live local process or from
+		// another host. The fixed expiry is diagnostic only; without a fencing
+		// generation, removing that lock could let the old writer commit later.
+		if (owner.hostname !== hostname()) return false;
+		if (!processIsAlive(owner.pid)) {
+			await rm(lock, { recursive: true, force: true });
+			return true;
+		}
+		const currentStartId = await localProcessStartId(owner.pid);
+		if (currentStartId === owner.processStartId) return false;
 		await rm(lock, { recursive: true, force: true });
 		return true;
+	} catch (error) {
+		if (error instanceof UnsafeStateLockError) throw error;
+		return false;
+	}
+}
+
+async function lockIsWithinInitializationGrace(lock: string): Promise<boolean> {
+	try {
+		const info = await lstat(lock);
+		return info.isDirectory() && Date.now() - info.mtimeMs < STATE_LOCK_INITIALIZATION_GRACE_MS;
 	} catch {
 		return false;
+	}
+}
+
+async function localProcessStartId(pid: number): Promise<string> {
+	try {
+		const result = await execFileAsync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+			timeout: 5_000,
+			maxBuffer: 64 * 1024,
+			encoding: "utf8",
+		});
+		const value = result.stdout.trim();
+		if (!value) throw new Error(`Process ${pid} is unavailable.`);
+		return value;
+	} catch (error) {
+		throw new Error(`Could not verify process ${pid} start identity: ${errorMessage(error)}`);
 	}
 }
 
@@ -776,9 +1228,57 @@ async function secureDirectory(path: string): Promise<string> {
 }
 
 function parseState(value: unknown): DesktopDriverState {
-	if (!isRecord(value) || value.version !== 1 || !Number.isInteger(value.nextTabId) || !isRecord(value.sessions)) {
+	if (!isRecord(value)
+		|| value.version !== 2
+		|| value.writerVersion !== DESKTOP_STATE_WRITER_VERSION
+		|| typeof value.driverVersion !== "string"
+		|| value.driverVersion.length < 1
+		|| value.driverVersion.length > 64
+		|| !Number.isInteger(value.nextTabId)
+		|| !isRecord(value.sessions)) {
 		throw new Error("Invalid durable ChatGPT Desktop driver state.");
 	}
+	for (const [key, candidate] of Object.entries(value.sessions)) {
+		if (!isRecord(candidate)
+			|| candidate.sessionId !== key
+			|| typeof candidate.name !== "string"
+			|| !Number.isInteger(candidate.tabId)
+			|| typeof candidate.targetId !== "string"
+			|| (candidate.windowId !== undefined && (!Number.isSafeInteger(candidate.windowId) || (candidate.windowId as number) < 0))
+			|| (candidate.browserInstanceId !== undefined && (typeof candidate.browserInstanceId !== "string" || candidate.browserInstanceId.length < 8 || candidate.browserInstanceId.length > 256))
+			|| (candidate.surface !== undefined && candidate.surface !== "web" && candidate.surface !== "desktop_shell")
+			|| (candidate.createdTarget !== undefined && typeof candidate.createdTarget !== "boolean")
+			|| (candidate.creationPhase !== undefined && candidate.creationPhase !== "intent_recorded" && candidate.creationPhase !== "target_created" && candidate.creationPhase !== "ready")
+			|| (candidate.creationOperationId !== undefined && (typeof candidate.creationOperationId !== "string" || candidate.creationOperationId.length < 8))
+			|| (candidate.creationStartedAt !== undefined && (typeof candidate.creationStartedAt !== "string" || !Number.isFinite(Date.parse(candidate.creationStartedAt))))
+			|| (candidate.creationBaselineTargetIds !== undefined && (!Array.isArray(candidate.creationBaselineTargetIds)
+				|| candidate.creationBaselineTargetIds.length > 1_000
+				|| candidate.creationBaselineTargetIds.some((targetId) => typeof targetId !== "string" || targetId.length < 1 || targetId.length > 256)))
+			|| (candidate.closeState !== undefined && candidate.closeState !== "requested" && candidate.closeState !== "close_dispatched" && candidate.closeState !== "target_absent")
+			|| (candidate.closeOwnerToken !== undefined && (typeof candidate.closeOwnerToken !== "string" || candidate.closeOwnerToken.length < 8))
+			|| (candidate.closeOwnerPid !== undefined && (!Number.isSafeInteger(candidate.closeOwnerPid) || (candidate.closeOwnerPid as number) <= 0))
+			|| (candidate.closeOwnerHostname !== undefined && (typeof candidate.closeOwnerHostname !== "string" || candidate.closeOwnerHostname === ""))
+			|| (candidate.closeOwnerStartedAt !== undefined && (typeof candidate.closeOwnerStartedAt !== "string" || !Number.isFinite(Date.parse(candidate.closeOwnerStartedAt))))
+			|| ((candidate.closeOwnerToken === undefined) !== (candidate.closeOwnerPid === undefined))
+			|| ((candidate.closeOwnerToken === undefined) !== (candidate.closeOwnerHostname === undefined))
+			|| ((candidate.closeOwnerToken === undefined) !== (candidate.closeOwnerStartedAt === undefined))
+			|| typeof candidate.url !== "string"
+			|| !new Set(["working", "needs_user", "completed"]).has(String(candidate.state))
+			|| !new Set(["prepared", "attempted", "submitted"]).has(String(candidate.sendState))
+			|| typeof candidate.createdAt !== "string"
+			|| (candidate.assistantBaseline !== undefined && (!Number.isSafeInteger(candidate.assistantBaseline) || (candidate.assistantBaseline as number) < 0))
+			|| (candidate.promptSha256 !== undefined && !/^[a-f0-9]{64}$/.test(String(candidate.promptSha256)))) {
+			throw new Error("Invalid durable ChatGPT Desktop session record.");
+		}
+	}
+	return value as unknown as DesktopDriverState;
+}
+
+function migrateLegacyState(value: Record<string, unknown>): DesktopDriverState {
+	if (value.version !== 1 || !Number.isInteger(value.nextTabId) || !isRecord(value.sessions)) {
+		throw new Error("Invalid legacy ChatGPT Desktop driver state.");
+	}
+	const sessions: Record<string, DesktopSessionState> = {};
 	for (const [key, candidate] of Object.entries(value.sessions)) {
 		if (!isRecord(candidate)
 			|| candidate.sessionId !== key
@@ -801,10 +1301,39 @@ function parseState(value: unknown): DesktopDriverState {
 			|| typeof candidate.createdAt !== "string"
 			|| (candidate.assistantBaseline !== undefined && (!Number.isSafeInteger(candidate.assistantBaseline) || (candidate.assistantBaseline as number) < 0))
 			|| (candidate.promptSha256 !== undefined && !/^[a-f0-9]{64}$/.test(String(candidate.promptSha256)))) {
-			throw new Error("Invalid durable ChatGPT Desktop session record.");
+			throw new Error("Invalid legacy ChatGPT Desktop session record.");
 		}
+		if (candidate.closeOwnerToken !== undefined
+			&& (candidate.closeOwnerHostname !== hostname() || processIsAlive(candidate.closeOwnerPid as number))) {
+			throw new Error(`Legacy ChatGPT Desktop session ${key} has an active or unprovable close owner; migration is refused until that owner is gone.`);
+		}
+		sessions[key] = {
+			sessionId: key,
+			name: candidate.name,
+			tabId: candidate.tabId as number,
+			targetId: candidate.targetId,
+			...(candidate.windowId !== undefined ? { windowId: candidate.windowId as number } : {}),
+			...(typeof candidate.browserInstanceId === "string" ? { browserInstanceId: candidate.browserInstanceId } : {}),
+			...(candidate.surface === "web" || candidate.surface === "desktop_shell" ? { surface: candidate.surface } : {}),
+			...(typeof candidate.createdTarget === "boolean" ? { createdTarget: candidate.createdTarget } : {}),
+			...(candidate.targetId ? { creationPhase: "ready" as const } : {}),
+			...(candidate.closeState === "requested" ? { closeState: "requested" as const } : {}),
+			...(candidate.closeState === "target_closed" ? { closeState: "close_dispatched" as const } : {}),
+			url: candidate.url,
+			state: candidate.state as DesktopSessionState["state"],
+			sendState: candidate.sendState as DesktopSessionState["sendState"],
+			...(typeof candidate.assistantBaseline === "number" ? { assistantBaseline: candidate.assistantBaseline } : {}),
+			...(typeof candidate.promptSha256 === "string" ? { promptSha256: candidate.promptSha256 } : {}),
+			createdAt: candidate.createdAt,
+		};
 	}
-	return value as unknown as DesktopDriverState;
+	return parseState({
+		version: 2,
+		writerVersion: DESKTOP_STATE_WRITER_VERSION,
+		driverVersion: DESKTOP_DRIVER_VERSION,
+		nextTabId: value.nextTabId,
+		sessions,
+	});
 }
 
 function requireSession(state: DesktopDriverState, sessionId: string): DesktopSessionState {
@@ -957,7 +1486,8 @@ function isAlreadyExists(error: unknown): boolean {
 }
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	const message = error instanceof Error ? error.message : String(error);
+	return message || "Unknown ChatGPT Desktop driver failure.";
 }
 
 function sleep(ms: number): Promise<void> {

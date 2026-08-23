@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 umask 077
 
-LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.1-verification}
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.2-verification}
 LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
@@ -64,7 +64,7 @@ run_gate desktop-driver-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" te
 run_gate full-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test
 run_gate production-audit "$BUN" audit --production
 run_gate shell-syntax bash -n bin/gpt-control-mcp bin/gpt-control-desktop-driver scripts/verify-security.sh
-run_gate javascript-syntax node --check scripts/desktop-cdp-live-smoke.mjs
+run_gate javascript-syntax sh -c 'node --check scripts/desktop-cdp-live-smoke.mjs && node --check scripts/chatgpt-desktop-doctor.mjs && node --check scripts/chatgpt-desktop-launch.mjs && node --check scripts/chatgpt-desktop-acceptance.mjs'
 run_gate python-syntax python3 -c 'from pathlib import Path; [compile(path.read_text(), str(path), "exec") for path in (Path("scripts/mcp-stdio-smoke.py"), Path("scripts/package-smoke.py"))]'
 run_gate package-smoke python3 scripts/package-smoke.py
 run_gate json-parse python3 -m json.tool package.json
@@ -78,6 +78,7 @@ run_gate diff-check git diff --check HEAD -- . ':(exclude)dist/gpt-control-deskt
 secret_found=0
 : > "$LOG_DIR/secret-scan.log"
 while IFS= read -r -d '' verify_file; do
+	[[ -f "$verify_file" ]] || continue
   if grep -InE \
     '(^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
     "$verify_file" >> "$LOG_DIR/secret-scan.log"; then

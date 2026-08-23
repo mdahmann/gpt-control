@@ -54,6 +54,20 @@ export interface DriverProbe {
 	secureInput: boolean;
 	protocolVersion: typeof BROWSER_DRIVER_PROTOCOL_VERSION;
 	reason?: string;
+	driverVersion?: string;
+	stateWriterVersion?: number;
+	host?: {
+		appPath: string;
+		bundleId: string;
+		teamId: string;
+		listenerPid: number;
+		endpoint: string;
+		browserVersion: string;
+		browserInstanceId: string;
+	};
+	runtimeExecutable?: string;
+	runtimeBundlePath?: string;
+	runtimeBundleSha256?: string;
 }
 
 export interface DriverSession {
@@ -595,6 +609,17 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		return current;
 	}
 
+	private async assertSessionOwnership(session: DriverSession, signal?: AbortSignal): Promise<void> {
+		const owned = await showSession(this.exec, this.launcher, session.sessionId, signal);
+		const pageId = tabIdFromSession(owned);
+		if (pageId === undefined || String(pageId) !== String(session.pageId)) {
+			throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; observation refused.`);
+		}
+		if (typeof owned.name !== "string" || owned.name !== session.name) {
+			throw new Error(`Refused observation on renamed or foreign browser session ${session.sessionId}.`);
+		}
+	}
+
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
 		const result = await probeBridge(this.exec, this.launcher, signal);
 		const secureInput = Boolean(this.launcher.privateRpc);
@@ -688,6 +713,10 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation> {
+		// Observation is how bounded recovery detects URL drift. Prove the exact
+		// session/page/name ownership without requiring the old URL to remain
+		// current, then read only that proved page.
+		await this.assertSessionOwnership(session, signal);
 		return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
 	}
 
@@ -818,6 +847,20 @@ const ProbeSchema = z.object({
 	secureInput: z.boolean(),
 	protocolVersion: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
 	reason: z.string().optional(),
+	driverVersion: z.string().min(1).max(128).optional(),
+	stateWriterVersion: z.number().int().positive().optional(),
+	host: z.object({
+		appPath: z.string().min(1),
+		bundleId: z.string().min(1).max(256),
+		teamId: z.string().min(1).max(64),
+		listenerPid: z.number().int().positive(),
+		endpoint: z.string().url(),
+		browserVersion: z.string().min(1).max(512),
+		browserInstanceId: z.string().min(8).max(256),
+	}).strict().optional(),
+	runtimeExecutable: z.string().min(1).optional(),
+	runtimeBundlePath: z.string().min(1).optional(),
+	runtimeBundleSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 }).strict();
 const EnvelopeSchema = z.object({
 	version: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
@@ -988,12 +1031,13 @@ async function invokeJsonCommand(
 		child.on("close", (code) => finish(() => {
 			if (stdoutBytes > limit) return reject(new Error("Browser driver response exceeded 16 MiB."));
 			const output = Buffer.concat(stdout).toString("utf8").trim();
-			if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code}.`));
+			if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code} without a valid protocol envelope.`));
 			if (output === "") return reject(new Error("Browser driver returned no JSON."));
 			try {
 				resolve(JSON.parse(output));
 			} catch {
-				reject(new Error(`Browser driver returned invalid JSON: ${output.slice(0, 400)}`));
+				const digest = createHash("sha256").update(output, "utf8").digest("hex");
+				reject(new Error(`Browser driver returned invalid JSON (${Buffer.byteLength(output, "utf8")} bytes, sha256=${digest}).`));
 			}
 		}));
 		child.stdin!.end(`${request}\n`);

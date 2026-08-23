@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.5.0-alpha.1",
+  "version": "0.5.0-alpha.2",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents",
   "type": "module",
   "license": "MIT",
@@ -24,7 +24,8 @@
     "codex"
   ],
   "files": [
-    "src",
+    "src/*.ts",
+    "src/*.py",
     "bin",
     "dist",
     "skills",
@@ -41,7 +42,8 @@
     "LICENSE"
   ],
   "bin": {
-    "gpt-control-mcp": "./bin/gpt-control-mcp.js"
+    "gpt-control-mcp": "./bin/gpt-control-mcp.js",
+    "gpt-control-desktop-driver": "./bin/gpt-control-desktop-driver.js"
   },
   "scripts": {
     "check": "tsc --noEmit",

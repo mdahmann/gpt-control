@@ -1,16 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	handleDesktopDriverRequest,
+	DesktopTargetCreationError,
 	type DesktopCdpAction,
 	type DesktopCdpEnvironment,
 	type DesktopCdpTarget,
+	type DesktopCdpTargetReceipt,
 } from "./src/desktop-driver";
 import {
 	MacDesktopCdpEnvironment,
+	CdpProtocolError,
+	isMissingBrowserWindowError,
 	parseCdpTargetList,
 	parseLoopbackEndpoint,
 	resolveDesktopShellProviderUrl,
@@ -39,9 +43,13 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 	failNextSend = false;
 	nativeSendOnly = false;
 	failCreateTarget = false;
+	failCreateAfterTarget = false;
+	failWaitForTarget = false;
 	restartAfterCreateTarget = false;
 	failCloseTarget = false;
 	failCloseAfterDelete = false;
+	replaceAfterClose = false;
+	omitCreatedWindowId = false;
 	html: string | undefined;
 	createdSurface: DesktopCdpTarget["surface"];
 	conversationCatalog = [
@@ -73,17 +81,26 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 		return { conversations: this.conversationCatalog, discoveredAt: "2026-08-22T20:00:00.000Z" };
 	}
 
-	async createTarget(url: string): Promise<DesktopCdpTarget> {
-		if (this.failCreateTarget) throw new Error("signed desktop capacity exhausted");
+	async createTarget(url: string): Promise<DesktopCdpTargetReceipt> {
+		if (this.failCreateTarget) throw new DesktopTargetCreationError("signed desktop capacity exhausted", "unknown");
 		const id = `target-${this.nextTarget++}`;
 		const target = { id, type: "page" as const, title: "ChatGPT", url, browserInstanceId: this.browserInstanceId, ...(this.createdSurface ? { surface: this.createdSurface } : {}) };
 		this.targets.set(id, target);
-		this.windowIds.set(id, this.nextWindow++);
+		if (!this.omitCreatedWindowId) this.windowIds.set(id, this.nextWindow++);
+		if (this.failCreateAfterTarget) throw new DesktopTargetCreationError("renderer creation receipt transport failed", "unknown");
+		const receipt = { id, browserInstanceId: this.browserInstanceId };
 		if (this.restartAfterCreateTarget) this.browserInstanceId = "fake-browser-instance-after-create";
-		return { ...target };
+		return receipt;
 	}
 
-	async windowId(targetId: string): Promise<number | undefined> {
+	async waitForTarget(targetId: string, browserInstanceId: string): Promise<DesktopCdpTarget> {
+		if (this.failWaitForTarget) throw new Error("desktop renderer readiness failed");
+		if (browserInstanceId !== this.browserInstanceId) throw new Error("desktop browser instance changed before readiness");
+		return { ...this.requireTarget(targetId), browserInstanceId };
+	}
+
+	async windowId(targetId: string, browserInstanceId?: string): Promise<number | undefined> {
+		if (browserInstanceId && browserInstanceId !== this.browserInstanceId) throw new Error("desktop browser instance changed before native window lookup");
 		return this.windowIds.get(targetId);
 	}
 
@@ -130,9 +147,17 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 		if (browserInstanceId && browserInstanceId !== this.browserInstanceId) throw new Error("desktop browser instance changed");
 		if (this.failCloseTarget) throw new Error("desktop target close failed");
 		if (!this.targets.has(targetId)) throw new Error(`missing target ${targetId}`);
+		const windowId = this.windowIds.get(targetId);
+		const closed = this.targets.get(targetId);
 		this.targets.delete(targetId);
 		this.windowIds.delete(targetId);
 		if (this.failCloseAfterDelete) throw new Error("ambiguous desktop target close failure");
+		if (this.replaceAfterClose && windowId !== undefined && closed) {
+			this.replaceAfterClose = false;
+			const replacement = { ...closed, id: `target-${this.nextTarget++}` };
+			this.targets.set(replacement.id, replacement);
+			this.windowIds.set(replacement.id, windowId);
+		}
 	}
 
 	private requireTarget(targetId: string): DesktopCdpTarget {
@@ -192,8 +217,11 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
+				driverVersion: "0.5.0-alpha.2",
+				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
+				host: await environment.verifyHost(),
 			},
 		});
 	});
@@ -226,7 +254,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(environment.targets.size).toBe(1);
 	});
 
-	test("owns the signed desktop ChatGPT shell without navigating or closing the app renderer", async () => {
+	test("refuses to adopt the signed desktop shell used by the user", async () => {
 		const environment = new FakeDesktopCdp();
 		environment.targets.set("desktop-shell", {
 			id: "desktop-shell",
@@ -242,11 +270,11 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			name: "gpt-control:chat:desktop-shell",
 			url: "https://chatgpt.com/",
 		}), options);
-		expect(created.ok).toBe(true);
-		const session = created.result as { sessionId: string };
-		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		expect(created.ok).toBe(false);
+		expect(created.error).toContain("dedicated owned window");
 		expect(environment.closedTargets).toEqual([]);
 		expect(environment.targets.has("desktop-shell")).toBe(true);
+		expect(Object.keys(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions)).toHaveLength(0);
 	});
 
 	test("attaches an exact conversation only in a newly created renderer", async () => {
@@ -278,6 +306,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 
 	test("fails closed instead of attaching an exact conversation to an existing renderer", async () => {
 		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
 		environment.targets.set("user-webview", {
 			id: "user-webview",
 			type: "webview",
@@ -288,11 +317,12 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		const response = await handleDesktopDriverRequest(request("create", {
 			name: "gpt-control:attached:no-window-authority",
 			url: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
-		}), { environment, stateRoot: scratch(), allowCreateTarget: false });
+		}), { environment, stateRoot, allowCreateTarget: false });
 
 		expect(response.ok).toBe(false);
-		expect(response.error).toContain("dedicated target creation is disabled");
+		expect(response.error).toContain("target creation is disabled");
 		expect(environment.targets.get("user-webview")?.url).toBe("https://chatgpt.com/");
+		expect(Object.keys(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions)).toHaveLength(0);
 	});
 
 	test("refuses durable ownership when Desktop restarts during renderer creation", async () => {
@@ -306,10 +336,12 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 
 		expect(response.ok).toBe(false);
 		expect(response.error).toContain("browser instance changed");
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+		const retained = Object.values(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions) as Array<Record<string, unknown>>;
+		expect(retained).toHaveLength(1);
+		expect(retained[0]).toMatchObject({ targetId: "target-1", creationPhase: "target_created", createdTarget: true });
 	});
 
-	test("releases an adopted webview without closing the user-owned target", async () => {
+	test("refuses to adopt a user-owned webview", async () => {
 		const environment = new FakeDesktopCdp();
 		environment.targets.set("user-webview", {
 			id: "user-webview",
@@ -324,9 +356,8 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			name: "gpt-control:chat:adopted-webview",
 			url: "https://chatgpt.com/",
 		}), options);
-		const session = created.result as { sessionId: string };
-
-		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		expect(created.ok).toBe(false);
+		expect(created.error).toContain("target creation is disabled");
 		expect(environment.closedTargets).toEqual([]);
 		expect(environment.targets.has("user-webview")).toBe(true);
 	});
@@ -364,7 +395,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(durable.sessions[session.sessionId]).toMatchObject({
 			targetId: "target-1",
 			createdTarget: true,
-			closeState: "requested",
+			closeState: "close_dispatched",
 		});
 		expect(environment.targets.has("target-1")).toBe(true);
 
@@ -391,7 +422,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(first.error).toContain("ambiguous desktop target close failure");
 		expect(environment.targets.has("target-1")).toBe(false);
 		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions[session.sessionId])
-			.toMatchObject({ closeState: "requested", createdTarget: true });
+			.toMatchObject({ closeState: "close_dispatched", createdTarget: true });
 
 		const shown = await handleDesktopDriverRequest(request("show", { sessionId: session.sessionId }), options);
 		expect(shown.ok).toBe(false);
@@ -418,6 +449,22 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(environment.closedTargets).toEqual([replacement.id]);
 		expect(environment.targets.has(replacement.id)).toBe(false);
 		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions[session.sessionId]).toBeUndefined();
+	});
+
+	test("closes a renderer replacement created after the first close dispatch", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.createdSurface = "desktop_shell";
+		const stateRoot = scratch();
+		const options = { environment, stateRoot, allowCreateTarget: true };
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:post-close-replacement",
+			url: "https://chatgpt.com/",
+		}), options);
+		const session = created.result as { sessionId: string };
+		environment.replaceAfterClose = true;
+		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		expect(environment.closedTargets).toEqual(["target-1", "target-2"]);
+		expect(environment.targets.size).toBe(0);
 	});
 
 	test("does not close a user window showing the same chat after an ambiguous owned close", async () => {
@@ -448,7 +495,26 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(environment.closedTargets).not.toContain("user-window");
 	});
 
-	test("invalidates old ownership instead of closing a recycled window after a Desktop restart", async () => {
+	test("retains ownership when the exact renderer remains live under a different native window", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.createdSurface = "desktop_shell";
+		const stateRoot = scratch();
+		const options = { environment, stateRoot, allowCreateTarget: true };
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:window-drift",
+			url: "https://chatgpt.com/",
+		}), options);
+		const session = created.result as { sessionId: string };
+		environment.windowIds.set("target-1", 999);
+
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options);
+		expect(closed.ok).toBe(false);
+		expect(closed.error).toContain("native window identity changed");
+		expect(environment.targets.has("target-1")).toBe(true);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions[session.sessionId]).toBeDefined();
+	});
+
+	test("retains old ownership instead of certifying closure after a Desktop restart", async () => {
 		const environment = new FakeDesktopCdp();
 		environment.createdSurface = "desktop_shell";
 		const conversationUrl = "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc";
@@ -471,9 +537,12 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		});
 		environment.windowIds.set("target-1", 1);
 
-		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options);
+		expect(closed.ok).toBe(false);
+		expect(closed.error).toContain("different ChatGPT Desktop browser instance");
 		expect(environment.targets.has("target-1")).toBe(true);
 		expect(environment.closedTargets).toEqual([]);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions[session.sessionId]).toBeDefined();
 	});
 
 	test("retains a legacy created session when browser ownership cannot be proved", async () => {
@@ -499,7 +568,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(JSON.parse(readFileSync(statePath, "utf8")).sessions[session.sessionId]).toBeDefined();
 	});
 
-	test("closes the exact created renderer when native window identity is unavailable", async () => {
+	test("does not certify exact renderer close when native window identity is unavailable", async () => {
 		const environment = new FakeDesktopCdp();
 		environment.createdSurface = "desktop_shell";
 		const stateRoot = scratch();
@@ -514,9 +583,14 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		delete durable.sessions[session.sessionId].windowId;
 		writeFileSync(statePath, `${JSON.stringify(durable, null, 2)}\n`);
 
-		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options);
+		expect(closed.ok).toBe(false);
+		expect(closed.error).toContain("replacement-window absence cannot be proved");
 		expect(environment.closedTargets).toContain("target-1");
 		expect(environment.targets.has("target-1")).toBe(false);
+		expect(JSON.parse(readFileSync(statePath, "utf8")).sessions[session.sessionId]).toMatchObject({
+			closeState: "close_dispatched",
+		});
 	});
 
 	test("retains ownership when a renderer changes without native window identity", async () => {
@@ -540,6 +614,28 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(closed.ok).toBe(false);
 		expect(closed.error).toContain("no native window identity");
 		expect(JSON.parse(readFileSync(statePath, "utf8")).sessions[session.sessionId]).toBeDefined();
+	});
+
+	test("does not certify an ambiguous close retry without native window identity", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.createdSurface = "desktop_shell";
+		const stateRoot = scratch();
+		const options = { environment, stateRoot, allowCreateTarget: true };
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:ambiguous-no-window",
+			url: "https://chatgpt.com/",
+		}), options);
+		const session = created.result as { sessionId: string };
+		const durable = JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8"));
+		delete durable.sessions[session.sessionId].windowId;
+		durable.sessions[session.sessionId].closeState = "close_dispatched";
+		writeFileSync(join(stateRoot, "state.json"), JSON.stringify(durable), { mode: 0o600 });
+		environment.targets.delete("target-1");
+		environment.windowIds.delete("target-1");
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options);
+		expect(closed.ok).toBe(false);
+		expect(closed.error).toContain("no native window identity");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions[session.sessionId]).toBeDefined();
 	});
 
 	test("does not close a replacement renderer claimed by another durable session", async () => {
@@ -710,6 +806,20 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(response.ok).toBe(true);
 	});
 
+	test("refuses an ownerless state lock instead of stealing it", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		const lock = join(stateRoot, "state.lock");
+		mkdirSync(lock, { mode: 0o700 });
+		utimesSync(lock, new Date(0), new Date(0));
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:desktop-ownerless-lock",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("ownerless desktop state lock");
+	});
+
 	test("assigns distinct renderer identities and returns a clean capacity blocker", async () => {
 		const environment = new FakeDesktopCdp();
 		const stateRoot = scratch();
@@ -725,11 +835,11 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			allowCreateTarget: false,
 		});
 		expect(blocked.ok).toBe(false);
-		expect(blocked.error).toContain("capacity");
+		expect(blocked.error).toContain("target creation is disabled");
 		expect(environment.targets.size).toBe(2);
 	});
 
-	test("removes an unbound durable session when renderer acquisition fails", async () => {
+	test("retains pre-creation intent when no exact renderer receipt is returned", async () => {
 		const environment = new FakeDesktopCdp();
 		environment.failCreateTarget = true;
 		const stateRoot = scratch();
@@ -739,12 +849,312 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		}), { environment, stateRoot, allowCreateTarget: true });
 		expect(response.ok).toBe(false);
 		expect(response.error).toContain("capacity exhausted");
+		expect(response.error).toContain("call close with this session ID");
 		const durable = JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8"));
-		expect(durable.sessions).toEqual({});
+		const sessions = Object.values(durable.sessions) as Array<Record<string, unknown>>;
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]).toMatchObject({ targetId: "", creationPhase: "intent_recorded" });
+		const retried = await handleDesktopDriverRequest(request("navigate", {
+			session: { sessionId: sessions[0].sessionId, pageId: sessions[0].tabId, name: sessions[0].name, url: "https://chatgpt.com/" },
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(retried.ok).toBe(false);
+		expect(retried.error).toContain("no replacement window");
+		const recovered = await handleDesktopDriverRequest(request("close", { sessionId: sessions[0].sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(recovered.ok).toBe(true);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+		environment.failCreateTarget = false;
+		const replacement = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:replacement-after-recovery",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(replacement.ok).toBe(true);
+		expect(environment.targets.size).toBe(1);
+	});
+
+	test("retains an uncertain creation when a post-intent renderer remains", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.failCreateAfterTarget = true;
+		const stateRoot = scratch();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:unknown-created-window",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		const sessions = Object.values(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions) as Array<Record<string, unknown>>;
+		expect(sessions).toHaveLength(1);
+		const recovered = await handleDesktopDriverRequest(request("close", { sessionId: sessions[0].sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(recovered.ok).toBe(false);
+		expect(recovered.error).toContain("post-intent renderer candidate");
+		expect(environment.targets.size).toBe(1);
+	});
+
+	test("closes an exact journaled renderer after a crash before state promotion", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.failCreateAfterTarget = true;
+		const stateRoot = scratch();
+		await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:journal-crash-recovery",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		const durable = JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8"));
+		const session = Object.values(durable.sessions)[0] as Record<string, string>;
+		const receipts = join(stateRoot, "creation-receipts");
+		mkdirSync(receipts, { mode: 0o700 });
+		writeFileSync(join(receipts, `${session.creationOperationId}.json`), JSON.stringify({
+			version: 1,
+			operationId: session.creationOperationId,
+			targetId: "target-1",
+			browserInstanceId: environment.browserInstanceId,
+			recordedAt: "2026-08-23T09:00:00.000Z",
+		}), { mode: 0o600 });
+
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(closed.ok).toBe(true);
+		expect(environment.closedTargets).toEqual(["target-1"]);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+	});
+
+	test("cleans the exact renderer when receipt journaling is unavailable", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		writeFileSync(join(stateRoot, "creation-receipts"), "not-a-directory", { mode: 0o600 });
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:journal-unavailable",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("cleanup was proved");
+		expect(environment.closedTargets).toEqual(["target-1"]);
+		expect(environment.targets.size).toBe(0);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+	});
+
+	test("rejects and cleans a created renderer without native window identity", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.omitCreatedWindowId = true;
+		const stateRoot = scratch();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:no-window-identity",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("native window identity");
+		expect(environment.closedTargets).toEqual(["target-1"]);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+	});
+
+	test("migrates legacy version-one state and accepts an older version-two driver label", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		const legacySession = {
+			sessionId: "desktop-legacy-session",
+			name: "gpt-control:chat:legacy",
+			tabId: 1,
+			targetId: "target-legacy",
+			windowId: 1,
+			browserInstanceId: environment.browserInstanceId,
+			createdTarget: true,
+			closeState: "target_closed",
+			url: "https://chatgpt.com/",
+			state: "working",
+			sendState: "prepared",
+			createdAt: "2026-08-22T20:00:00.000Z",
+		};
+		writeFileSync(join(stateRoot, "state.json"), JSON.stringify({ version: 1, nextTabId: 2, sessions: { [legacySession.sessionId]: legacySession } }), { mode: 0o600 });
+		const closed = await handleDesktopDriverRequest(request("close", { sessionId: legacySession.sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(closed.ok).toBe(true);
+
+		writeFileSync(join(stateRoot, "state.json"), JSON.stringify({
+			version: 2,
+			writerVersion: 2,
+			driverVersion: "0.5.0-alpha.1",
+			nextTabId: 1,
+			sessions: {},
+		}), { mode: 0o600 });
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:upgraded-v2",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: false });
+		expect(created.ok).toBe(false);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.2");
+	});
+
+	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		environment.targets.set("user-target", {
+			id: "user-target",
+			type: "page",
+			title: "ChatGPT",
+			url: "https://chatgpt.com/",
+		});
+		environment.windowIds.set("user-target", 42);
+		const session = {
+			sessionId: "desktop-legacy-adopted",
+			name: "gpt-control:chat:legacy-adopted",
+			tabId: 1,
+			targetId: "user-target",
+			windowId: 42,
+			browserInstanceId: environment.browserInstanceId,
+			createdTarget: false,
+			url: "https://chatgpt.com/",
+			state: "working",
+			sendState: "prepared",
+			createdAt: "2026-08-22T20:00:00.000Z",
+		};
+		writeFileSync(join(stateRoot, "state.json"), JSON.stringify({ version: 1, nextTabId: 2, sessions: { [session.sessionId]: session } }), { mode: 0o600 });
+		const shown = await handleDesktopDriverRequest(request("show", { sessionId: session.sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(shown.ok).toBe(false);
+		expect(shown.error).toContain("does not own a dedicated renderer");
+		expect(environment.targets.has("user-target")).toBe(true);
+	});
+
+	test("refuses migration while a legacy close owner may still be active", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		const session = {
+			sessionId: "desktop-legacy-active-close",
+			name: "gpt-control:chat:legacy-active-close",
+			tabId: 1,
+			targetId: "target-legacy",
+			windowId: 1,
+			browserInstanceId: environment.browserInstanceId,
+			createdTarget: true,
+			closeState: "requested",
+			closeOwnerToken: "legacy-close-owner",
+			closeOwnerPid: process.pid,
+			closeOwnerHostname: hostname(),
+			url: "https://chatgpt.com/",
+			state: "working",
+			sendState: "prepared",
+			createdAt: "2026-08-22T20:00:00.000Z",
+		};
+		writeFileSync(join(stateRoot, "state.json"), JSON.stringify({ version: 1, nextTabId: 2, sessions: { [session.sessionId]: session } }), { mode: 0o600 });
+		const response = await handleDesktopDriverRequest(request("show", { sessionId: session.sessionId }), {
+			environment,
+			stateRoot,
+			allowCreateTarget: true,
+		});
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("migration is refused");
+	});
+
+	test("cleans a provisionally recorded target when readiness fails", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.failWaitForTarget = true;
+		const stateRoot = scratch();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:readiness-cleanup",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("readiness failed");
+		expect(environment.closedTargets).toEqual(["target-1"]);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+	});
+
+	test("cleans a replacement renderer during provisional readiness failure", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.failWaitForTarget = true;
+		environment.replaceAfterClose = true;
+		const stateRoot = scratch();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:readiness-replacement-cleanup",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(environment.closedTargets).toEqual(["target-1", "target-2"]);
+		expect(environment.targets.size).toBe(0);
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions).toEqual({});
+	});
+
+	test("retains the exact provisional receipt when readiness and cleanup both fail", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.failWaitForTarget = true;
+		environment.failCloseTarget = true;
+		const stateRoot = scratch();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:worker:readiness-retained",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("remains durably journaled");
+		const sessions = Object.values(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions) as Array<Record<string, unknown>>;
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]).toMatchObject({ targetId: "target-1", creationPhase: "target_created", createdTarget: true });
 	});
 });
 
 describe("ChatGPT Desktop endpoint policy", () => {
+	test("downgrades only the exact known no-window CDP error", () => {
+		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Browser window not found"))).toBe(true);
+		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Permission denied"))).toBe(false);
+		expect(isMissingBrowserWindowError(new Error("Browser window not found"))).toBe(false);
+	});
+
+	test("searches every eligible desktop shell and deduplicates exact matching evidence", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+		};
+		transport.targetDescriptors = async () => ["shell-one", "shell-two"].map((id) => ({
+			id, type: "page", title: "ChatGPT", url: id === "shell-one" ? "app://-/index.html" : "https://chatgpt.com/c/WEB:12345678-1234-1234-1234-123456789abc", webSocketDebuggerUrl: `ws://127.0.0.1:9236/devtools/page/${id}`,
+		}));
+		const record = {
+			providerConversationId: "12345678-1234-1234-1234-123456789abc",
+			providerConversationUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+			title: "Sequence review",
+			pinned: true,
+		};
+		transport.evaluate = async (targetId) => [{
+			...record,
+			pinned: targetId === "shell-two",
+			...(targetId === "shell-one" ? { current: true } : {}),
+		}];
+		const catalog = await environment.findConversations({ query: "Sequence", limit: 20 });
+		expect(catalog.conversations).toEqual([{ ...record, current: true }]);
+	});
+
+	test("fails closed when desktop shells disagree about one conversation identity", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+		};
+		transport.targetDescriptors = async () => ["shell-one", "shell-two"].map((id) => ({
+			id, type: "page", title: "ChatGPT", url: "app://-/index.html", webSocketDebuggerUrl: `ws://127.0.0.1:9236/devtools/page/${id}`,
+		}));
+		transport.evaluate = async (targetId) => [{
+			providerConversationId: "12345678-1234-1234-1234-123456789abc",
+			providerConversationUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+			title: targetId === "shell-one" ? "Sequence review" : "Conflicting title",
+			pinned: true,
+		}];
+		await expect(environment.findConversations({ limit: 20 })).rejects.toThrow("conflicting identity evidence");
+	});
+
 	test("double-clicks one exact native header title", async () => {
 		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
 		const cdpCalls: Array<{ method: string; params?: Record<string, unknown> }> = [];

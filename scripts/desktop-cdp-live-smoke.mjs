@@ -1,20 +1,25 @@
 #!/usr/bin/env node
-import { randomInt, randomUUID } from "node:crypto";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, lstat, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const driver = resolve(process.env.GPT_CONTROL_BROWSER_DRIVER ?? resolve(root, "bin/gpt-control-desktop-driver"));
 const live = process.argv.includes("--live");
-const archiveUrl = option("--archive-url");
+for (const legacySensitiveOption of ["--archive-url", "--rename", "--project", "--upload"]) {
+	if (process.argv.includes(legacySensitiveOption)) throw new Error(`${legacySensitiveOption} is refused in process arguments. Put it in a private --request-file instead.`);
+}
+const requestConfig = await loadRequestConfig(option("--request-file"));
+const archiveUrl = requestConfig.archiveUrl;
 const concurrency = Number(option("--concurrency") ?? 1);
 const model = option("--model");
 const effort = option("--effort");
-const renameTitle = option("--rename");
-const project = option("--project");
-const uploadPath = option("--upload");
+const renameTitle = requestConfig.renameTitle;
+const project = requestConfig.project;
+const uploadPath = requestConfig.uploadPath;
+const includeSensitiveOutput = process.argv.includes("--include-sensitive-output");
 const discoverModels = process.argv.includes("--discover-models");
 const discoverProjects = process.argv.includes("--discover-projects");
 const exerciseReload = process.argv.includes("--reload");
@@ -47,7 +52,7 @@ if (archiveUrl) {
 	try {
 		session = await call("create", { name: `gpt-control:desktop-cleanup:${randomUUID()}`, url: archiveUrl });
 		const result = await call("manage_conversation", { session, operation: { action: "archive" } });
-		console.log(JSON.stringify({ mode: "archive", url: archiveUrl, ...result }, null, 2));
+		console.log(JSON.stringify({ mode: "archive", ...(includeSensitiveOutput ? { url: archiveUrl } : { urlSha256: sha256(archiveUrl) }), ...result }, null, 2));
 	} finally {
 		if (session) await call("close", { sessionId: session.sessionId }).catch(() => undefined);
 	}
@@ -110,7 +115,7 @@ try {
 			receipts.cancelled = await waitStopped(current);
 		} else {
 			const completion = await waitCompletion(session, initial.snapshot?.count ?? 0);
-			receipts.response = completion.snapshot.text;
+			receipts.response = sensitiveTextReceipt(completion.snapshot.text, includeSensitiveOutput);
 			if (exerciseReload) {
 				const beforeReload = await call("show", { sessionId: session.sessionId });
 				await call("recover", { session: beforeReload, action: "reload" });
@@ -121,8 +126,8 @@ try {
 				if (selection) receipts.postReloadModel = await call("verify_model", { session: recovered, model: selection });
 				await call("send", { session: recovered });
 				const continued = await waitCompletion(recovered, beforeFollowUp.snapshot?.count ?? 0);
-				receipts.recoveredUrl = recovered.url;
-				receipts.continuation = continued.snapshot.text;
+				receipts.recoveredUrl = includeSensitiveOutput ? recovered.url : { sha256: sha256(recovered.url) };
+				receipts.continuation = sensitiveTextReceipt(continued.snapshot.text, includeSensitiveOutput);
 			}
 		}
 		let currentSession = await call("show", { sessionId: session.sessionId });
@@ -275,7 +280,7 @@ async function call(action, params) {
 		child.on("exit", () => {
 			clearTimeout(timer);
 			let envelope;
-			try { envelope = JSON.parse(stdout.trim()); } catch { rejectCall(new Error(stderr.trim() || `Desktop driver returned invalid JSON: ${stdout.slice(0, 400)}`)); return; }
+			try { envelope = JSON.parse(stdout.trim()); } catch { rejectCall(new Error(stderr.trim() || `Desktop driver returned invalid JSON (${Buffer.byteLength(stdout, "utf8")} bytes, sha256=${sha256(stdout)}).`)); return; }
 			if (!envelope.ok) { rejectCall(new Error(`Desktop driver ${action} failed: ${envelope.error || stderr.trim() || "unknown error"}`)); return; }
 			resolveCall(envelope.result);
 		});
@@ -293,4 +298,27 @@ function option(name) {
 	const value = process.argv[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value.`);
 	return value;
+}
+
+async function loadRequestConfig(path) {
+	if (!path) return {};
+	const absolute = resolve(path);
+	const info = await lstat(absolute);
+	if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o077) !== 0 || info.size > 64 * 1024) {
+		throw new Error("Desktop live request file must be a private regular file no larger than 64 KiB.");
+	}
+	const value = JSON.parse(await readFile(absolute, "utf8"));
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Desktop live request file must contain one JSON object.");
+	const allowed = new Set(["archiveUrl", "renameTitle", "project", "uploadPath"]);
+	for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`Unknown desktop live request key: ${key}`);
+	for (const key of allowed) if (value[key] !== undefined && (typeof value[key] !== "string" || value[key] === "")) throw new Error(`Desktop live request ${key} must be a non-empty string.`);
+	return value;
+}
+
+function sensitiveTextReceipt(value, include) {
+	return include ? value : { chars: value.length, sha256: sha256(value) };
+}
+
+function sha256(value) {
+	return createHash("sha256").update(value, "utf8").digest("hex");
 }

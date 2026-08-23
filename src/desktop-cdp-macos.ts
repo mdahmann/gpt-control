@@ -4,9 +4,11 @@ import { realpath } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { ChatGptConversationCatalog, ChatGptConversationFindRequest } from "./browser-driver";
 import {
+	DesktopTargetCreationError,
 	type DesktopCdpAction,
 	type DesktopCdpEnvironment,
 	type DesktopCdpTarget,
+	type DesktopCdpTargetReceipt,
 	type DesktopHostReceipt,
 } from "./desktop-driver";
 
@@ -21,7 +23,19 @@ interface CdpTargetDescriptor extends DesktopCdpTarget {
 }
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	const message = error instanceof Error ? error.message : String(error);
+	return message || "Unknown ChatGPT Desktop driver failure.";
+}
+
+export class CdpProtocolError extends Error {
+	constructor(readonly code: number, message: string) {
+		super(message);
+		this.name = "CdpProtocolError";
+	}
+}
+
+export function isMissingBrowserWindowError(error: unknown): boolean {
+	return error instanceof CdpProtocolError && error.code === -32000 && error.message === "Browser window not found";
 }
 
 export interface DesktopShellEvidence {
@@ -61,12 +75,19 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 	async verifyHost(): Promise<DesktopHostReceipt> {
 		if (process.platform !== "darwin") throw new Error("ChatGPT Desktop CDP requires macOS.");
 		const executable = await realpath(`${this.appPath}/Contents/MacOS/ChatGPT`);
+		await command("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", this.appPath], 30_000, true);
 		const signature = await command("/usr/bin/codesign", ["-dv", "--verbose=4", this.appPath], 10_000, true);
 		const identifier = /^Identifier=(.+)$/m.exec(signature)?.[1]?.trim();
 		const teamId = /^TeamIdentifier=(.+)$/m.exec(signature)?.[1]?.trim();
 		if (!identifier || !OFFICIAL_BUNDLE_IDS.has(identifier) || teamId !== OFFICIAL_TEAM_ID) {
 			throw new Error(`Refused unverified ChatGPT.app signature (bundle=${identifier ?? "unknown"}, team=${teamId ?? "unknown"}).`);
 		}
+		await command("/usr/bin/codesign", [
+			"--verify", "--deep", "--strict", "--verbose=2",
+			`-R=identifier "${identifier}" and anchor apple generic and certificate leaf[subject.OU] = "${OFFICIAL_TEAM_ID}"`,
+			this.appPath,
+		], 30_000, true);
+		await verifySignedExecutable(executable);
 		const listenerPid = await this.listenerReceipt(executable);
 		const processExecutable = (await command("/bin/ps", ["-p", String(listenerPid), "-o", "comm="], 5_000)).trim();
 		if (await realpath(processExecutable) !== executable) {
@@ -119,17 +140,15 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 	}
 
 	async findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog> {
-		const shells = (await this.targetDescriptors()).filter((target) => target.url === "app://-/index.html");
-		if (shells.length !== 1) {
-			throw new Error(`ChatGPT Desktop conversation discovery requires one main app shell; found ${shells.length}.`);
-		}
+		const shells = (await this.targetDescriptors()).filter((target) => isDesktopShellRuntimeUrl(target.url));
+		if (shells.length === 0) throw new Error("ChatGPT Desktop conversation discovery found no eligible app shell.");
 		const payload = JSON.stringify({
 			query: request.query?.toLocaleLowerCase() ?? "",
 			pinned: request.pinned,
 			projectId: request.projectId,
 			limit: request.limit ?? 20,
 		});
-		const raw = await this.evaluate(shells[0].id, `(() => {
+		const expression = `(() => {
 			const request = ${payload};
 			const idGrammar = /^[A-Za-z0-9_-]{8,128}$/;
 			const normalized = value => String(value || '').replace(/\\s+/g, ' ').trim();
@@ -189,9 +208,15 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 				deduped.set(record.providerConversationId, previous ? { ...previous, ...record, pinned: previous.pinned || record.pinned } : record);
 			}
 			return [...deduped.values()].slice(0, request.limit);
-		})()`);
+		})()`;
+		const raw: unknown[] = [];
+		for (const shell of shells) {
+			const shellRecords = await this.evaluate(shell.id, expression);
+			if (!Array.isArray(shellRecords)) throw new Error("ChatGPT Desktop returned an invalid conversation catalog.");
+			raw.push(...shellRecords);
+		}
 		if (!Array.isArray(raw)) throw new Error("ChatGPT Desktop returned an invalid conversation catalog.");
-		const conversations = raw.map((entry) => {
+		const mapped = raw.map((entry) => {
 			if (!isRecord(entry)
 				|| typeof entry.providerConversationId !== "string"
 				|| !/^[A-Za-z0-9_-]{8,128}$/.test(entry.providerConversationId)
@@ -213,10 +238,31 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 				...(typeof entry.updatedAt === "string" ? { updatedAt: entry.updatedAt } : {}),
 			};
 		});
-		return { conversations, discoveredAt: new Date().toISOString() };
+		const byId = new Map<string, (typeof mapped)[number]>();
+		for (const conversation of mapped) {
+			const previous = byId.get(conversation.providerConversationId);
+			if (previous) {
+				if (previous.providerConversationUrl !== conversation.providerConversationUrl
+					|| previous.title !== conversation.title
+					|| previous.projectId !== conversation.projectId) {
+					throw new Error(`ChatGPT Desktop returned conflicting identity evidence for conversation ${conversation.providerConversationId}.`);
+				}
+				byId.set(conversation.providerConversationId, {
+					...previous,
+					pinned: previous.pinned || conversation.pinned,
+					...(previous.current === true || conversation.current === true ? { current: true } : {}),
+					...(previous.updatedAt || conversation.updatedAt
+						? { updatedAt: [previous.updatedAt, conversation.updatedAt].filter((value): value is string => Boolean(value)).sort().at(-1)! }
+						: {}),
+				});
+				continue;
+			}
+			byId.set(conversation.providerConversationId, conversation);
+		}
+		return { conversations: [...byId.values()].slice(0, request.limit ?? 20), discoveredAt: new Date().toISOString() };
 	}
 
-	async createTarget(url: string): Promise<DesktopCdpTarget> {
+	async createTarget(url: string): Promise<DesktopCdpTargetReceipt> {
 		const requested = new URL(url);
 		if (requested.origin !== "https://chatgpt.com" || requested.pathname !== "/" || requested.search || requested.hash) {
 			throw new Error("ChatGPT Desktop can create only an owned new-chat window; exact-conversation creation is not supported.");
@@ -227,51 +273,49 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		const browserSocket = new URL(requiredString(version.webSocketDebuggerUrl, "CDP browser WebSocket URL"));
 		assertLoopbackWebSocket(browserSocket, this.endpoint.port);
 		if (browserSocket.pathname !== host.browserInstanceId) throw new Error("ChatGPT Desktop browser instance changed before renderer creation.");
-		let ownedTargetId: string | undefined;
+		let created: unknown;
 		try {
-			const created = await cdpRequest(browserSocket.toString(), "Target.createTarget", {
+			created = await cdpRequest(browserSocket.toString(), "Target.createTarget", {
 				url: "app://-/index.html",
 				newWindow: true,
 				background: true,
 			});
-			if (!isRecord(created)) throw new Error("ChatGPT Desktop returned an invalid renderer-creation receipt.");
-			ownedTargetId = requiredString(created.targetId, "created renderer target ID");
-			if (!/^[A-Za-z0-9_-]{8,128}$/.test(ownedTargetId)) throw new Error("ChatGPT Desktop returned an invalid created renderer target ID.");
-			const deadline = Date.now() + 30_000;
-			while (Date.now() < deadline) {
-				const candidate = (await this.targetDescriptors()).find((target) => target.id === ownedTargetId);
-				if (candidate && isDesktopShellRuntimeUrl(candidate.url)) {
-					const providerUrl = resolveDesktopShellProviderUrl(await this.desktopShellEvidence(candidate.id));
-					if (providerUrl) {
-						return {
-							id: candidate.id,
-							type: candidate.type,
-							title: candidate.title,
-							url: providerUrl,
-							browserInstanceId: host.browserInstanceId,
-							runtimeUrl: candidate.url,
-							surface: "desktop_shell",
-						};
-					}
-				}
-				await sleep(100);
-			}
-			throw new Error("ChatGPT Desktop owned window did not expose one ready signed-in native renderer.");
 		} catch (error) {
-			if (ownedTargetId !== undefined) {
-				await this.closeTarget(ownedTargetId, host.browserInstanceId).catch(() => undefined);
-				const cleanupDeadline = Date.now() + 5_000;
-				let remaining = await this.targetDescriptors().catch(() => []);
-				while (remaining.some((target) => target.id === ownedTargetId) && Date.now() < cleanupDeadline) {
-					await sleep(100);
-					remaining = await this.targetDescriptors().catch(() => []);
-				}
-				if (remaining.some((target) => target.id === ownedTargetId)) {
-					throw new Error(`${errorMessage(error)} Failed native window cleanup was retained because renderer ${ownedTargetId} is still live.`);
-				}
-			}
-			throw error;
+			const outcome = error instanceof CdpProtocolError ? "not_created" : "unknown";
+			throw new DesktopTargetCreationError(`ChatGPT Desktop renderer creation ${outcome === "not_created" ? "was rejected" : "has an unknown outcome"}: ${errorMessage(error)}`, outcome);
 		}
+		if (!isRecord(created)) throw new DesktopTargetCreationError("ChatGPT Desktop returned an invalid renderer-creation receipt.", "unknown");
+		let ownedTargetId: string;
+		try {
+			ownedTargetId = requiredString(created.targetId, "created renderer target ID");
+		} catch (error) {
+			throw new DesktopTargetCreationError(errorMessage(error), "unknown");
+		}
+		if (!/^[A-Za-z0-9_-]{8,128}$/.test(ownedTargetId)) throw new DesktopTargetCreationError("ChatGPT Desktop returned an invalid created renderer target ID.", "unknown");
+		return { id: ownedTargetId, browserInstanceId: host.browserInstanceId };
+	}
+
+	async waitForTarget(targetId: string, browserInstanceId: string): Promise<DesktopCdpTarget> {
+		const host = await this.verifyHost();
+		if (host.browserInstanceId !== browserInstanceId) throw new Error("ChatGPT Desktop browser instance changed before renderer readiness.");
+		const deadline = Date.now() + 30_000;
+		while (Date.now() < deadline) {
+			const candidate = (await this.targetDescriptors()).find((target) => target.id === targetId);
+			if (candidate && isDesktopShellRuntimeUrl(candidate.url)) {
+				const providerUrl = resolveDesktopShellProviderUrl(await this.desktopShellEvidence(candidate.id));
+				if (providerUrl) return {
+					id: candidate.id,
+					type: candidate.type,
+					title: candidate.title,
+					url: providerUrl,
+					browserInstanceId,
+					runtimeUrl: candidate.url,
+					surface: "desktop_shell",
+				};
+			}
+			await sleep(100);
+		}
+		throw new Error("ChatGPT Desktop owned window did not expose one ready signed-in native renderer.");
 	}
 
 	async navigateTarget(targetId: string, url: string): Promise<DesktopCdpTarget> {
@@ -912,12 +956,21 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		return requiredString(result.data, "CDP screenshot data");
 	}
 
-	async windowId(targetId: string): Promise<number | undefined> {
+	async windowId(targetId: string, browserInstanceId?: string): Promise<number | undefined> {
 		const version = await this.fetchJson("/json/version");
 		if (!isRecord(version)) throw new Error("ChatGPT Desktop returned an invalid CDP browser descriptor.");
 		const browserSocket = new URL(requiredString(version.webSocketDebuggerUrl, "CDP browser WebSocket URL"));
 		assertLoopbackWebSocket(browserSocket, this.endpoint.port);
-		const result = await cdpRequest(browserSocket.toString(), "Browser.getWindowForTarget", { targetId });
+		if (browserInstanceId && browserSocket.pathname !== browserInstanceId) {
+			throw new Error("ChatGPT Desktop browser instance changed before native window lookup.");
+		}
+		let result: unknown;
+		try {
+			result = await cdpRequest(browserSocket.toString(), "Browser.getWindowForTarget", { targetId });
+		} catch (error) {
+			if (isMissingBrowserWindowError(error)) return undefined;
+			throw error;
+		}
 		if (!isRecord(result) || !Number.isSafeInteger(result.windowId) || (result.windowId as number) < 0) return undefined;
 		return result.windowId as number;
 	}
@@ -930,12 +983,19 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		if (browserInstanceId && browserSocket.pathname !== browserInstanceId) {
 			throw new Error("ChatGPT Desktop browser instance changed before renderer cleanup.");
 		}
+		if (!(await this.targetDescriptors()).some((target) => target.id === targetId)) return;
 		const result = await cdpRequest(browserSocket.toString(), "Target.closeTarget", { targetId });
 		if (!isRecord(result) || result.success !== true) throw new Error(`ChatGPT Desktop could not close renderer ${targetId}.`);
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			if (!(await this.targetDescriptors()).some((target) => target.id === targetId)) return;
+			await sleep(100);
+		}
+		throw new Error(`ChatGPT Desktop renderer ${targetId} remained present after its close receipt.`);
 	}
 
 	private async listenerReceipt(expectedExecutable: string): Promise<number> {
-		const output = await command("/usr/sbin/lsof", ["-nP", `-iTCP:${this.endpoint.port}`, "-sTCP:LISTEN", "-Fpctn"], 5_000);
+		const output = await lsofListeners(this.endpoint.port);
 		const records = parseLsofRecords(output);
 		if (records.length === 0) throw new Error(`Expected a ChatGPT Desktop CDP listener on ${this.endpoint.origin}; found none.`);
 		const processes: DesktopListenerProcess[] = [];
@@ -1248,8 +1308,9 @@ async function runCdpSession<T>(
 			try { message = JSON.parse(String(event.data)); } catch { return; }
 			if (!isRecord(message) || message.id !== id) return;
 			cleanup();
-			if (isRecord(message.error)) {
-				reject(new Error(String(message.error.message ?? `CDP ${method} failed.`)));
+				if (isRecord(message.error)) {
+					const code = typeof message.error.code === "number" ? message.error.code : -1;
+					reject(new CdpProtocolError(code, String(message.error.message ?? `CDP ${method} failed.`)));
 				return;
 			}
 			resolve(message.result);
@@ -1304,8 +1365,13 @@ export function selectDesktopListenerOwner(
 }
 
 async function signedTeamId(executable: string): Promise<string> {
+	await verifySignedExecutable(executable);
 	const signature = await command("/usr/bin/codesign", ["-dv", "--verbose=4", executable], 10_000, true);
 	return /^TeamIdentifier=(.+)$/m.exec(signature)?.[1]?.trim() ?? "unknown";
+}
+
+async function verifySignedExecutable(executable: string): Promise<void> {
+	await command("/usr/bin/codesign", ["--verify", "--strict", "--verbose=2", executable], 30_000, true);
 }
 
 async function processAncestry(pid: number): Promise<number[]> {
@@ -1334,9 +1400,23 @@ async function command(path: string, args: string[], timeout: number, includeStd
 		return `${result.stdout}${includeStderr ? result.stderr : ""}`;
 	} catch (error) {
 		if (isRecord(error)) {
-			const detail = String(error.stderr ?? error.stdout ?? error.message ?? `${path} failed`);
-			throw new Error(detail.trim());
+			const detail = String(error.stderr ?? error.stdout ?? error.message ?? "").trim();
+			throw new Error(detail || `${path} failed without diagnostic output.`);
 		}
+		throw error;
+	}
+}
+
+async function lsofListeners(port: string): Promise<string> {
+	try {
+		const result = await execFileAsync("/usr/sbin/lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpctn"], {
+			timeout: 5_000,
+			maxBuffer: 1024 * 1024,
+			encoding: "utf8",
+		});
+		return result.stdout;
+	} catch (error) {
+		if (isRecord(error) && error.code === 1 && String(error.stdout ?? "") === "") return "";
 		throw error;
 	}
 }
