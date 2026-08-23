@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.5.0-alpha.2",
+  "version": "0.5.0-alpha.3",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents.",
   "author": {
     "name": "Miles Dahmann"

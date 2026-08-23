@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.2";
+var PACKAGE_VERSION = "0.5.0-alpha.3";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.2";
+var PACKAGE_VERSION2 = "0.5.0-alpha.3";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35918,7 +35918,12 @@ var ProbeSchema = exports_external.object({
   }).strict().optional(),
   runtimeExecutable: exports_external.string().min(1).optional(),
   runtimeBundlePath: exports_external.string().min(1).optional(),
-  runtimeBundleSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional()
+  runtimeBundleSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
+  pool: exports_external.object({
+    size: exports_external.number().int().min(1).max(10),
+    startPort: exports_external.number().int().min(1024).max(65535),
+    rootSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).strict();
 var EnvelopeSchema = exports_external.object({
   version: exports_external.literal(BROWSER_DRIVER_PROTOCOL_VERSION),

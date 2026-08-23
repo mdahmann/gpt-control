@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0-alpha.3] - 2026-08-23
+
+- Added an opt-in native ChatGPT/Codex worker pool with one separately signed
+  macOS app process, persistent profile, private state root, and loopback CDP
+  port per lane.
+- Added exact session-to-lane routing, a fair allocation lock, configurable
+  pool size from one through ten, and clean capacity blockers.
+- Minimized worker windows after launch, restored the previously active app
+  only when the worker still held focus, and stopped an empty lane after its
+  exact GPT-Control session closes.
+- Added an explicit one-time interactive bootstrap gate for fresh profiles,
+  exact process-tree shutdown, and offline release for crashed durable lanes.
+- Added package, bundle-reproducibility, protocol-envelope, and live concurrent
+  acceptance coverage for the pool driver.
+
 ## [0.5.0-alpha.2] - 2026-08-23
 
 - Reserved every mutating desktop run a dedicated native window and persisted

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ChatGptConversationCatalog, ChatGptConversationFindRequest } from "./browser-driver";
 import {
@@ -60,16 +61,21 @@ export function createMacDesktopCdpEnvironment(env: NodeJS.ProcessEnv = process.
 	return new MacDesktopCdpEnvironment(
 		env.GPT_CONTROL_DRIVER_DESKTOP_CDP_ENDPOINT ?? DEFAULT_ENDPOINT,
 		env.GPT_CONTROL_DRIVER_DESKTOP_APP_PATH ?? DEFAULT_APP_PATH,
+		env.GPT_CONTROL_DRIVER_DESKTOP_DEDICATED_PROCESS === "1"
+			? env.GPT_CONTROL_DRIVER_DESKTOP_DEDICATED_PROFILE_ROOT
+			: undefined,
 	);
 }
 
 export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 	private readonly endpoint: URL;
 	private readonly appPath: string;
+	private readonly dedicatedProfileRoot?: string;
 
-	constructor(endpoint: string, appPath = DEFAULT_APP_PATH) {
+	constructor(endpoint: string, appPath = DEFAULT_APP_PATH, dedicatedProfileRoot?: string) {
 		this.endpoint = parseLoopbackEndpoint(endpoint);
 		this.appPath = appPath;
+		this.dedicatedProfileRoot = dedicatedProfileRoot ? resolve(dedicatedProfileRoot) : undefined;
 	}
 
 	async verifyHost(): Promise<DesktopHostReceipt> {
@@ -94,9 +100,15 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 			throw new Error(`CDP listener PID ${listenerPid} is not the verified ChatGPT.app executable.`);
 		}
 		const commandLine = (await command("/bin/ps", ["-p", String(listenerPid), "-o", "command="], 5_000)).trim();
-		if (!commandLine.includes(`--remote-debugging-port=${this.endpoint.port}`)
-			|| !commandLine.includes("--remote-debugging-address=127.0.0.1")) {
+		if (!commandLineHasExactArgument(commandLine, `--remote-debugging-port=${this.endpoint.port}`)
+			|| !commandLineHasExactArgument(commandLine, "--remote-debugging-address=127.0.0.1")) {
 			throw new Error("ChatGPT.app CDP listener lacks the required explicit loopback debugging arguments.");
+		}
+		if (this.dedicatedProfileRoot) {
+			const profileRoot = await realpath(this.dedicatedProfileRoot);
+			if (!commandLineHasExactArgument(commandLine, `--user-data-dir=${profileRoot}`)) {
+				throw new Error("ChatGPT.app dedicated worker listener does not use the exact trusted profile root.");
+			}
 		}
 		const version = await this.fetchJson("/json/version") as Record<string, unknown>;
 		const browserVersion = requiredString(version.Browser, "CDP Browser version");
@@ -268,6 +280,17 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 			throw new Error("ChatGPT Desktop can create only an owned new-chat window; exact-conversation creation is not supported.");
 		}
 		const host = await this.verifyHost();
+		if (this.dedicatedProfileRoot) {
+			const candidates: CdpTargetDescriptor[] = [];
+			for (const target of await this.targetDescriptors()) {
+				if (!isDesktopShellRuntimeUrl(target.url)) continue;
+				if (resolveDesktopShellProviderUrl(await this.desktopShellEvidence(target.id))) candidates.push(target);
+			}
+			if (candidates.length !== 1) {
+				throw new DesktopTargetCreationError(`Dedicated ChatGPT Desktop worker exposed ${candidates.length} eligible app shells; exactly one is required.`, "not_created");
+			}
+			return { id: candidates[0].id, browserInstanceId: host.browserInstanceId };
+		}
 		const version = await this.fetchJson("/json/version");
 		if (!isRecord(version)) throw new Error("ChatGPT Desktop returned an invalid CDP browser descriptor.");
 		const browserSocket = new URL(requiredString(version.webSocketDebuggerUrl, "CDP browser WebSocket URL"));
@@ -968,7 +991,9 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		try {
 			result = await cdpRequest(browserSocket.toString(), "Browser.getWindowForTarget", { targetId });
 		} catch (error) {
-			if (isMissingBrowserWindowError(error)) return undefined;
+			if (isMissingBrowserWindowError(error)) return this.dedicatedProfileRoot
+				? dedicatedProfileWindowId(this.endpoint, this.dedicatedProfileRoot)
+				: undefined;
 			throw error;
 		}
 		if (!isRecord(result) || !Number.isSafeInteger(result.windowId) || (result.windowId as number) < 0) return undefined;
@@ -1156,6 +1181,17 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 	}
 }
 
+export function commandLineHasExactArgument(commandLine: string, expected: string): boolean {
+	if (!expected || /\s/.test(expected)) {
+		throw new Error("ChatGPT Desktop process arguments containing whitespace are not supported for exact identity checks.");
+	}
+	const argumentsList = commandLine.trim().split(/\s+/);
+	const equals = expected.indexOf("=");
+	const prefix = equals >= 0 ? expected.slice(0, equals + 1) : expected;
+	const matches = argumentsList.filter((argument) => argument.startsWith(prefix));
+	return matches.length === 1 && matches[0] === expected;
+}
+
 export function resolveDesktopShellProviderUrl(evidence: DesktopShellEvidence): string | undefined {
 	return resolveDesktopShellProviderUrlInPage(evidence);
 }
@@ -1215,6 +1251,11 @@ function readDesktopShellEvidenceInPage(): DesktopShellEvidence {
 
 function isDesktopShellRuntimeUrl(raw: string): boolean {
 	return raw === "app://-/index.html" || /^https:\/\/chatgpt\.com\/c\/WEB:[A-Za-z0-9-]{8,128}\/?$/.test(raw);
+}
+
+export function dedicatedProfileWindowId(endpoint: URL, profileRoot: string): number {
+	const digest = createHash("sha256").update(`${endpoint.origin}\0${resolve(profileRoot)}`).digest();
+	return 2 ** 48 + digest.readUIntBE(0, 6);
 }
 
 export function parseLoopbackEndpoint(raw: string): URL {

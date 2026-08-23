@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.5.0-alpha.2
+version: 0.5.0-alpha.3
 ---
 
 # GPT-Control
@@ -9,6 +9,20 @@ version: 0.5.0-alpha.2
 GPT-Control controls the signed-in ChatGPT website through one configured,
 secure browser-driver protocol. It does not call a paid API fallback and it does
 not open a replacement browser when the configured driver is unavailable.
+
+When the configured driver is `gpt-control-desktop-pool-driver`, GPT-Control
+allocates separate signed native ChatGPT/Codex worker processes on demand. The
+driver minimizes their windows and restores the user's active app. Agents must
+not launch, focus, move, or poll those windows themselves. Exact process,
+profile, port, renderer, and session receipts—not a visible app title—identify
+each lane.
+
+An uninitialized native lane first attempts a hidden bootstrap. If that cannot
+prove one authenticated ready composer, it fails with a one-time
+interactive-bootstrap blocker. Do not set
+`GPT_CONTROL_DRIVER_DESKTOP_ALLOW_INTERACTIVE_BOOTSTRAP=1` or launch a visible
+setup window unless the user explicitly authorizes that setup. After a lane
+records a ready composer, normal pool launches stay hidden and minimized.
 
 ## When to use it
 

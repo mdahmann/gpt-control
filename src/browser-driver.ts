@@ -861,6 +861,11 @@ const ProbeSchema = z.object({
 	runtimeExecutable: z.string().min(1).optional(),
 	runtimeBundlePath: z.string().min(1).optional(),
 	runtimeBundleSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+	pool: z.object({
+		size: z.number().int().min(1).max(10),
+		startPort: z.number().int().min(1024).max(65_535),
+		rootSha256: z.string().regex(/^[a-f0-9]{64}$/),
+	}).strict().optional(),
 }).strict();
 const EnvelopeSchema = z.object({
 	version: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),

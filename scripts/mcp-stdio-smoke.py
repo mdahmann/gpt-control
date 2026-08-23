@@ -85,7 +85,7 @@ def main() -> int:
     if 2 not in responses or "result" not in responses[2]:
         fail(f"tools/list response missing or failed: {responses.get(2)}", process)
     server = responses[1]["result"].get("serverInfo", {})
-    if server.get("name") != "gpt-control" or server.get("version") != "0.5.0-alpha.2":
+    if server.get("name") != "gpt-control" or server.get("version") != "0.5.0-alpha.3":
         fail(f"unexpected server identity: {server}", process)
     tools = responses[2]["result"].get("tools", [])
     names = {tool.get("name") for tool in tools}

@@ -25,7 +25,7 @@ import type { Launcher } from "./transport";
 import type { Exec, ExecResult } from "./types";
 
 export const DESKTOP_DRIVER_ID = "chatgpt-desktop-cdp/v1";
-export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.2";
+export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.3";
 export const DESKTOP_STATE_WRITER_VERSION = 2;
 
 export interface DesktopCdpTarget {
@@ -231,6 +231,13 @@ export async function handleDesktopDriverRequest(
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
+}
+
+export async function closeDesktopDriverSessionOffline(stateRoot: string, sessionId: string): Promise<void> {
+	await withStateLock(stateRoot, async (state) => {
+		requireSession(state, sessionId);
+		delete state.sessions[sessionId];
+	});
 }
 
 function requiredConversationFindRequest(value: Record<string, unknown>): ChatGptConversationFindRequest {

@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 umask 077
 
-LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.2-verification}
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.3-verification}
 LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
@@ -53,6 +53,10 @@ run_gate bundle-node-syntax node --check dist/gpt-control-mcp.js
 run_gate desktop-bundle-build "$BUN" build src/desktop-driver-cli.ts --target=node --minify-whitespace --outfile="$LOG_DIR/gpt-control-desktop-driver.js"
 run_gate desktop-bundle-current cmp dist/gpt-control-desktop-driver.js "$LOG_DIR/gpt-control-desktop-driver.js"
 run_gate desktop-bundle-node-syntax node --check dist/gpt-control-desktop-driver.js
+run_gate desktop-pool-bundle-build "$BUN" build src/desktop-pool-driver-cli.ts --target=node --minify-whitespace --outfile="$LOG_DIR/gpt-control-desktop-pool-driver.js"
+run_gate desktop-pool-bundle-normalize node scripts/normalize-generated-js.mjs "$LOG_DIR/gpt-control-desktop-pool-driver.js"
+run_gate desktop-pool-bundle-current cmp dist/gpt-control-desktop-pool-driver.js "$LOG_DIR/gpt-control-desktop-pool-driver.js"
+run_gate desktop-pool-bundle-node-syntax node --check dist/gpt-control-desktop-pool-driver.js
 mkdir -p "$LOG_DIR/mcp-home" "$LOG_DIR/mcp-state"
 run_gate bundle-mcp-smoke env   -u OPENAI_API_KEY -u OPENAI_BASE_URL   HOME="$LOG_DIR/mcp-home"   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   GPT_CONTROL_NODE="$NODE"   GPT_CONTROL_HOME="$LOG_DIR/mcp-state"   GPT_CONTROL_WORKSPACE_ROOT="$ROOT"   python3 scripts/mcp-stdio-smoke.py ./bin/gpt-control-mcp
 run_gate browser-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test chrome.test.ts
@@ -63,7 +67,7 @@ run_gate contract-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test ind
 run_gate desktop-driver-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test desktop-driver.test.ts
 run_gate full-tests env -u OPENAI_API_KEY -u OPENAI_BASE_URL "$BUN" test
 run_gate production-audit "$BUN" audit --production
-run_gate shell-syntax bash -n bin/gpt-control-mcp bin/gpt-control-desktop-driver scripts/verify-security.sh
+run_gate shell-syntax bash -n bin/gpt-control-mcp bin/gpt-control-desktop-driver bin/gpt-control-desktop-pool-driver scripts/verify-security.sh
 run_gate javascript-syntax sh -c 'node --check scripts/desktop-cdp-live-smoke.mjs && node --check scripts/chatgpt-desktop-doctor.mjs && node --check scripts/chatgpt-desktop-launch.mjs && node --check scripts/chatgpt-desktop-acceptance.mjs'
 run_gate python-syntax python3 -c 'from pathlib import Path; [compile(path.read_text(), str(path), "exec") for path in (Path("scripts/mcp-stdio-smoke.py"), Path("scripts/package-smoke.py"))]'
 run_gate package-smoke python3 scripts/package-smoke.py
@@ -73,7 +77,7 @@ run_gate mcp-json python3 -m json.tool .mcp.json
 # Bun preserves whitespace inside dependency template literals because removing
 # it can change runtime strings. Check every authored file and verify the
 # generated bundle separately through byte-for-byte reproducibility above.
-run_gate diff-check git diff --check HEAD -- . ':(exclude)dist/gpt-control-desktop-driver.js'
+run_gate diff-check git diff --check HEAD -- . ':(exclude)dist/gpt-control-desktop-driver.js' ':(exclude)dist/gpt-control-desktop-pool-driver.js'
 
 secret_found=0
 : > "$LOG_DIR/secret-scan.log"
@@ -100,7 +104,7 @@ printf 'EXIT=0\n' >> "$LOG_DIR/secret-scan.log"
   printf 'bun=%s\n' "$("$BUN" --version)"
   printf 'node=%s\n' "$(node --version)"
   printf 'codex=%s\n' "$(codex --version 2>/dev/null | tail -1 || true)"
-  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax desktop-bundle-build desktop-bundle-current desktop-bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests desktop-driver-tests full-tests production-audit shell-syntax javascript-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
+  for gate in bun-install typecheck bundle-build bundle-current bundle-node-syntax desktop-bundle-build desktop-bundle-current desktop-bundle-node-syntax desktop-pool-bundle-build desktop-pool-bundle-normalize desktop-pool-bundle-current desktop-pool-bundle-node-syntax bundle-mcp-smoke browser-tests storage-tests transport-tests subagent-tests contract-tests desktop-driver-tests full-tests production-audit shell-syntax javascript-syntax python-syntax package-smoke json-parse plugin-json mcp-json diff-check secret-scan; do
     printf '%s_exit=%s\n' "$gate" "$(sed -n 's/^EXIT=//p' "$LOG_DIR/$gate.log" | tail -1)"
   done
 } > "$LOG_DIR/summary.txt"

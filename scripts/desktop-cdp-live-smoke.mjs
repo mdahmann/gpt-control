@@ -34,12 +34,15 @@ if (uploadPath) await access(resolve(uploadPath));
 
 const probe = await call("probe", {});
 const endpoint = process.env.GPT_CONTROL_DRIVER_DESKTOP_CDP_ENDPOINT ?? "http://127.0.0.1:9236";
-const targetsResponse = await fetch(new URL("/json/list", endpoint), { signal: AbortSignal.timeout(5_000) });
-if (!targetsResponse.ok) throw new Error(`CDP target list returned HTTP ${targetsResponse.status}.`);
-const targets = await targetsResponse.json();
+let targets = [];
+if (!probe.pool) {
+	const targetsResponse = await fetch(new URL("/json/list", endpoint), { signal: AbortSignal.timeout(5_000) });
+	if (!targetsResponse.ok) throw new Error(`CDP target list returned HTTP ${targetsResponse.status}.`);
+	targets = await targetsResponse.json();
+}
 const diagnostic = {
 	probe,
-	endpoint,
+	...(probe.pool ? { pool: probe.pool } : { endpoint }),
 	targets: Array.isArray(targets) ? targets.map((target) => ({ id: target.id, type: target.type, title: target.title, url: target.url })) : [],
 	liveMutationAuthorized: process.env.GPT_CONTROL_DESKTOP_LIVE_MUTATION === "1",
 };
@@ -87,8 +90,12 @@ try {
 		const session = await call("create", { name: `gpt-control:desktop-smoke:${randomUUID()}`, url: "https://chatgpt.com/" });
 		sessions.push(session);
 	}
-	const pageIds = new Set(sessions.map((session) => String(session.pageId)));
-	if (pageIds.size !== sessions.length) throw new Error("Desktop smoke sessions do not own distinct renderer/page identities.");
+	// CDP target ids are process-local and can repeat across isolated desktop
+	// processes. The pool adds its non-sensitive lane number to create receipts,
+	// so the pair is the durable cross-process renderer identity.
+	if (sessions.some((session) => !Number.isSafeInteger(session.desktopPoolLane))) throw new Error("Desktop pool create receipt omitted its exact lane identity.");
+	const rendererIdentities = new Set(sessions.map((session) => `${session.desktopPoolLane}:${String(session.pageId)}`));
+	if (rendererIdentities.size !== sessions.length) throw new Error("Desktop smoke sessions do not own distinct lane/renderer identities.");
 	const runs = sessions.map(async (session, index) => {
 		const prompt = exerciseCancellation
 			? "Could you compare server-side rendering, static generation, incremental regeneration, and client rendering for a large web application, including tradeoffs and several practical examples?"
@@ -133,7 +140,7 @@ try {
 		let currentSession = await call("show", { sessionId: session.sessionId });
 		cleanupUrls.set(session.sessionId, currentSession.url);
 		if (concurrency > 1) {
-			return { sessionId: session.sessionId, pageId: session.pageId, ...receipts, archived: false };
+			return { sessionId: session.sessionId, desktopPoolLane: session.desktopPoolLane, pageId: session.pageId, ...receipts, archived: false };
 		}
 		if (pin) {
 			receipts.pin = await call("manage_conversation", { session: currentSession, operation: { action: "pin" } });
@@ -174,7 +181,7 @@ try {
 			archivedSessionIds.add(result.sessionId);
 		}
 	}
-	console.log(JSON.stringify({ mode: "live", concurrency, distinctPageIds: pageIds.size, results }, null, 2));
+	console.log(JSON.stringify({ mode: "live", concurrency, distinctLaneRendererIdentities: rendererIdentities.size, results }, null, 2));
 } finally {
 	await Promise.all(sessions.filter((session) => !archivedSessionIds.has(session.sessionId)).map(async (session) => {
 		try {

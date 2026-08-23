@@ -46,6 +46,68 @@ The production doctor and launcher execute the bundled TypeScript protocol-v2
 driver. Earlier JavaScript prototype fixtures remain only for historical unit
 tests and are excluded from the published package.
 
+## Separate native worker processes
+
+Use the pool driver when GPT-Control should run in the native app without
+sharing or covering the window that you use. The pool creates a separate,
+officially signed ChatGPT/Codex process for each active lane. Each lane has its
+own persistent profile, private driver state, and loopback CDP port.
+
+```sh
+export GPT_CONTROL_BROWSER_DRIVER="$PWD/bin/gpt-control-desktop-pool-driver"
+export GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE=6
+```
+
+The default pool size is six. The operator can set a value from one through ten.
+The first lane uses port `9237`; later lanes use consecutive ports. These can be
+changed with `GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT` and
+`GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT`.
+
+Each new lane first attempts a hidden bootstrap. On the tested Mac, the signed
+app exposed an authenticated ChatGPT renderer without any native window. If a
+profile instead requires sign-in or first-run interaction, authorize one visible
+setup run with:
+
+```sh
+export GPT_CONTROL_DRIVER_DESKTOP_ALLOW_INTERACTIVE_BOOTSTRAP=1
+```
+
+With that gate, the uninitialized lane can briefly show its native window.
+GPT-Control waits for one authenticated ChatGPT composer, writes a private
+bootstrap receipt, minimizes the lane, and restores the previous app. Remove
+the variable after the requested lanes are initialized. Later launches use the
+hidden/background path. Without the gate, a failed hidden bootstrap returns a
+precise blocker and does not fall back to a visible window.
+
+On demand, the driver:
+
+1. finds an existing exact lane or starts a new native process with its lane's
+   `--user-data-dir` and loopback CDP port;
+2. verifies the app signature, executable, listening PID, profile, and port;
+3. minimizes only that worker process's windows;
+4. restores the app that was active before launch, but only if the worker still
+   has focus;
+5. routes later actions by the exact durable session ID;
+6. stops the exact worker process after its final owned session closes.
+
+If a worker process crashes, GPT-Control does not launch a replacement against
+its durable session. An exact close can release the offline session only after
+the driver proves that the lane port has no listener and no process uses the
+lane profile. Normal recovery never adopts a different process or renderer.
+
+The worker windows stay minimized during normal use, so they do not overlap the
+user's main ChatGPT/Codex window. macOS does not provide a supported public API
+for assigning another app's window to a Space. A user can unminimize a worker
+and move it to another Space manually, but GPT-Control does not depend on that.
+The first process launch can briefly activate a window on some macOS versions;
+the driver immediately minimizes it and restores focus. Reusing a live lane
+does not launch another window.
+
+The pool uses separate native processes, not extra windows in the user's app
+process. A friendly label such as “GPT Workers” is documentation only. Runtime
+identity comes from the exact signed PID, profile root, port, renderer, and
+session receipt.
+
 Read-only sidebar discovery is also available through
 `gpt_conversation_find`. It extracts each exact provider conversation ID from
 the signed app's local rendered row identity. It does not select a row. After
@@ -83,18 +145,15 @@ node scripts/desktop-cdp-live-smoke.mjs --live --concurrency 2
 Repeat with concurrency `3` and `6`. A clean capacity blocker is acceptable.
 Two workers silently sharing one renderer is a failure.
 
-The unified ChatGPT/Codex macOS app permits only one normal-profile process.
-Start that process with the loopback CDP flags before opening the Codex thread
-that will use GPT-Control. A temporary `--user-data-dir` is suitable for
-failure-path tests, but it is not proof that the normal signed-in ChatGPT
-profile can create a ready composer. Do not restart the unified app during an
-active Codex turn.
+The single-process driver uses the user's normal app process and requires that
+process to start with the loopback CDP flags. The pool driver does not restart
+that process. It launches separate processes with persistent pool profiles and
+uses only those processes for worker sessions.
 
-The current macOS acceptance has proved one hidden/background session and two
-independent concurrent windows without changing the frontmost app during chat
-work. For the least disruption, keep the dedicated GPT-Control app instance on
-another Space and create the desired worker-window pool before starting long
-work.
+The current macOS acceptance has proved one hidden/background pool lane and two
+independent concurrent native processes. Both conversations completed and were
+archived; both exact worker processes stopped; and focus returned to the
+original app. Higher staircase concurrency remains an alpha release gate.
 
 Native-shell clicks use trusted CDP mouse input. A capture-phase guard checks
 the exact provider conversation and clicked element inside the page when the

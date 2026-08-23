@@ -83,7 +83,7 @@ process.stdin.on("end", () => {
   let result = {};
   if (request.action === "probe") result = {
     ready: true, driver: "fixture/v2", secureInput: true, protocolVersion: 2,
-    driverVersion: "0.5.0-alpha.2", stateWriterVersion: 2,
+    driverVersion: "0.5.0-alpha.3", stateWriterVersion: 2,
     host: { appPath: "/Applications/ChatGPT.app", bundleId: "com.openai.codex", teamId: "2DC432GLL2", listenerPid: 123, endpoint: "http://127.0.0.1:9236", browserVersion: "Chrome/151", browserInstanceId: "/devtools/browser/12345678" },
     runtimeExecutable: "/usr/bin/node", runtimeBundlePath: "/plugin/dist/driver.js", runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   };
@@ -101,7 +101,7 @@ process.stdin.on("end", () => {
 		process.env.GPT_CONTROL_DRIVER_LOG = log;
 		try {
 			const external = new ExternalCommandBrowserDriver(script);
-			expect(await external.probe()).toMatchObject({ ready: true, driver: "fixture/v2", driverVersion: "0.5.0-alpha.2", stateWriterVersion: 2, runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+			expect(await external.probe()).toMatchObject({ ready: true, driver: "fixture/v2", driverVersion: "0.5.0-alpha.3", stateWriterVersion: 2, runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
 			const created = await external.create("gpt-control:chat:x", "https://chatgpt.com");
 			await external.upload(created, ["/private/snapshot/a.ts"]);
 			await external.fill(created, "secret prompt carried only on stdin");

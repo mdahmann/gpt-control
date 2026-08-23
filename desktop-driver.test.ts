@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	handleDesktopDriverRequest,
+	closeDesktopDriverSessionOffline,
 	DesktopTargetCreationError,
 	type DesktopCdpAction,
 	type DesktopCdpEnvironment,
@@ -14,12 +15,27 @@ import {
 import {
 	MacDesktopCdpEnvironment,
 	CdpProtocolError,
+	commandLineHasExactArgument,
+	dedicatedProfileWindowId,
 	isMissingBrowserWindowError,
 	parseCdpTargetList,
 	parseLoopbackEndpoint,
 	resolveDesktopShellProviderUrl,
 	selectDesktopListenerOwner,
 } from "./src/desktop-cdp-macos";
+import {
+	assertLaneCanLaunch,
+	addPoolLaneReceipt,
+	descendantProcessIds,
+	laneHasExactlyOneReadyShell,
+	loadPoolConfig,
+	listenerProcessPids,
+	poolLanes,
+	profileAssociatedProcessPids,
+	requestRequiresPoolAllocationLock,
+	requestSessionId,
+	withPoolAllocationLock,
+} from "./src/desktop-pool-driver-cli";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -217,7 +233,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.2",
+				driverVersion: "0.5.0-alpha.3",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -252,6 +268,20 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		const shown = await handleDesktopDriverRequest(request("show", { sessionId: session.sessionId }), options);
 		expect(shown).toEqual(created);
 		expect(environment.targets.size).toBe(1);
+	});
+
+	test("releases one exact durable session after its native process is proved offline", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:offline-close",
+			url: "https://chatgpt.com/",
+		}), { environment, stateRoot, allowCreateTarget: true });
+		expect(created.ok).toBe(true);
+		const sessionId = (created.result as { sessionId: string }).sessionId;
+		await closeDesktopDriverSessionOffline(stateRoot, sessionId);
+		expect(Object.keys(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).sessions)).toEqual([]);
+		await expect(closeDesktopDriverSessionOffline(stateRoot, sessionId)).rejects.toThrow("Unknown ChatGPT Desktop session");
 	});
 
 	test("refuses to adopt the signed desktop shell used by the user", async () => {
@@ -993,7 +1023,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.2");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.3");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
@@ -1107,6 +1137,86 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 });
 
 describe("ChatGPT Desktop endpoint policy", () => {
+	test("builds a bounded deterministic native worker pool", () => {
+		const config = loadPoolConfig({
+			HOME: "/tmp/home",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: "/tmp/gpt-control-pool",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "9400",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "3",
+		});
+		const lanes = poolLanes(config);
+		expect(lanes.map((lane) => lane.endpoint)).toEqual([
+			"http://127.0.0.1:9400",
+			"http://127.0.0.1:9401",
+			"http://127.0.0.1:9402",
+		]);
+		expect(new Set(lanes.map((lane) => lane.profileRoot)).size).toBe(3);
+		expect(config.allowInteractiveBootstrap).toBe(false);
+		expect(loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_ALLOW_INTERACTIVE_BOOTSTRAP: "1" }).allowInteractiveBootstrap).toBe(true);
+		expect(() => loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "11" })).toThrow("pool size");
+		expect(() => loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65535", GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "2" })).toThrow("port range");
+		expect(() => loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: "/tmp/pool with spaces" })).toThrow("whitespace");
+	});
+
+	test("routes pool actions only through an exact session id", () => {
+		expect(requestSessionId({ version: 2, action: "show", params: { sessionId: "session-a" } })).toBe("session-a");
+		expect(requestSessionId({ version: 2, action: "fill", params: { session: { sessionId: "session-b" } } })).toBe("session-b");
+		expect(requestSessionId({ version: 2, action: "create", params: {} })).toBeUndefined();
+	});
+
+	test("adds a non-sensitive exact lane receipt to successful pool results", () => {
+		expect(addPoolLaneReceipt({ version: 2, ok: true, result: { sessionId: "session-a", pageId: "target-1" } }, 4)).toEqual({
+			version: 2,
+			ok: true,
+			result: { sessionId: "session-a", pageId: "target-1", desktopPoolLane: 4 },
+		});
+		expect(addPoolLaneReceipt({ version: 2, ok: false, error: "blocked" }, 4)).toEqual({ version: 2, ok: false, error: "blocked" });
+	});
+
+	test("holds the allocation lock across create, discovery, and final-session close", () => {
+		expect(requestRequiresPoolAllocationLock("create")).toBe(true);
+		expect(requestRequiresPoolAllocationLock("find_conversations")).toBe(true);
+		expect(requestRequiresPoolAllocationLock("close")).toBe(true);
+		expect(requestRequiresPoolAllocationLock("show")).toBe(false);
+	});
+
+	test("waits for one exact ready shell and refuses replacement under durable work", () => {
+		expect(laneHasExactlyOneReadyShell([])).toBe(false);
+		expect(laneHasExactlyOneReadyShell([{ surface: "web" }, { surface: "desktop_shell" }])).toBe(true);
+		expect(() => laneHasExactlyOneReadyShell([{ surface: "desktop_shell" }, { surface: "desktop_shell" }])).toThrow("ambiguous");
+		expect(() => assertLaneCanLaunch(2, ["desktop-existing"])).toThrow("durable work");
+		expect(assertLaneCanLaunch(2, [])).toBeUndefined();
+	});
+
+	test("serializes same-process pool allocations with unique lock ownership", async () => {
+		const root = scratch();
+		let active = 0;
+		let maximum = 0;
+		await Promise.all([1, 2].map((value) => withPoolAllocationLock(root, async () => {
+			active += 1;
+			maximum = Math.max(maximum, active);
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			active -= 1;
+			return value;
+		})));
+		expect(maximum).toBe(1);
+	});
+
+	test("recovers a pool allocation lock only after its exact local owner dies", async () => {
+		const root = scratch();
+		const lock = join(root, "allocation.lock");
+		mkdirSync(lock, { mode: 0o700 });
+		writeFileSync(join(lock, "owner.json"), `${JSON.stringify({
+			version: 1,
+			token: "dead-owner-token",
+			pid: 999_999,
+			hostname: hostname(),
+			processStartId: "Mon Jan  1 00:00:00 2001",
+			startedAt: "2001-01-01T00:00:00.000Z",
+		})}\n`, { mode: 0o600 });
+		expect(await withPoolAllocationLock(root, async () => "recovered")).toBe("recovered");
+	});
+
 	test("downgrades only the exact known no-window CDP error", () => {
 		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Browser window not found"))).toBe(true);
 		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Permission denied"))).toBe(false);
@@ -1439,6 +1549,45 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		expect(() => parseLoopbackEndpoint("http://0.0.0.0:9236")).toThrow("loopback");
 		expect(() => parseLoopbackEndpoint("https://127.0.0.1:9236")).toThrow("loopback");
 		expect(() => parseLoopbackEndpoint("http://127.0.0.1:9236/json/list")).toThrow("loopback");
+	});
+
+	test("requires exact process arguments instead of profile-path prefixes", () => {
+		const expected = "--user-data-dir=/Users/test/.gpt-control/desktop-worker-pool/lanes/01/profile";
+		expect(commandLineHasExactArgument(`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT ${expected} --remote-debugging-port=9237`, expected)).toBe(true);
+		expect(commandLineHasExactArgument(`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT ${expected}-other --remote-debugging-port=9237`, expected)).toBe(false);
+		expect(commandLineHasExactArgument(`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT ${expected} ${expected}-other`, expected)).toBe(false);
+		expect(() => commandLineHasExactArgument("ChatGPT --user-data-dir=/tmp/a b", "--user-data-dir=/tmp/a b")).toThrow("whitespace");
+	});
+
+	test("finds only processes using the exact dedicated profile argument", () => {
+		const profile = "/Users/test/.gpt-control/desktop-worker-pool/lanes/01/profile";
+		const processList = [
+			` 101 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --user-data-dir=${profile} --remote-debugging-port=9237`,
+			` 102 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --user-data-dir=${profile}-other --remote-debugging-port=9238`,
+			" 103 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9239",
+		].join("\n");
+		expect(profileAssociatedProcessPids(`${processList}\n 104 browser_crashpad_handler --database=${profile}/Crashpad`, profile)).toEqual([101, 104]);
+		expect(listenerProcessPids("p101\np104\np101\n")).toEqual([101, 104]);
+	});
+
+	test("collects only the exact native worker process tree", () => {
+		const processList = [
+			" 100 1",
+			" 101 100",
+			" 102 101",
+			" 200 1",
+			" 201 200",
+		].join("\n");
+		expect(descendantProcessIds(processList, 100)).toEqual([100, 101, 102]);
+	});
+
+	test("derives a stable reserved window identity for one dedicated profile lane", () => {
+		const endpoint = new URL("http://127.0.0.1:9237");
+		const first = dedicatedProfileWindowId(endpoint, "/tmp/gpt-control/lane-01/profile");
+		expect(first).toBe(dedicatedProfileWindowId(endpoint, "/tmp/gpt-control/lane-01/profile"));
+		expect(first).not.toBe(dedicatedProfileWindowId(new URL("http://127.0.0.1:9238"), "/tmp/gpt-control/lane-01/profile"));
+		expect(first).toBeGreaterThanOrEqual(2 ** 48);
+		expect(first).toBeLessThan(2 ** 49);
 	});
 
 	test("accepts one verified app listener with an OpenAI-signed descendant holding the inherited socket", () => {
