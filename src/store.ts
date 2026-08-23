@@ -194,6 +194,24 @@ const ProviderThrottleSchema = z.object({
 	messageSha256: z.string().regex(/^[a-f0-9]{64}$/),
 });
 
+const MaintenanceReceiptSchema = z.object({
+	version: z.literal(1),
+	id: z.string().regex(/^maint_[a-f0-9]{32}$/),
+	kind: z.enum(["model_catalog", "project_catalog"]),
+	browserDriverId: z.string().min(1).max(128),
+	browserSessionId: z.string().min(1).max(512),
+	browserPageId: z.union([z.string(), z.number()]),
+	browserSessionName: z.string().min(1).max(512),
+	browserUrl: z.string().min(1).max(2048),
+	desktopPoolLane: z.number().int().min(1).max(10).optional(),
+	desktopPoolLeaseState: z.literal("release_unproved"),
+	status: z.enum(["retained", "closed"]),
+	createdAt: z.string(),
+	updatedAt: z.string(),
+});
+
+export type MaintenanceReceipt = z.infer<typeof MaintenanceReceiptSchema>;
+
 export interface ProviderThrottleState {
 	version: 1;
 	reason: "chatgpt_rate_limit";
@@ -358,6 +376,11 @@ export class RunStore {
 		return confinedPath(this.root, "catalogs", `${kind}.json`);
 	}
 
+	private maintenancePath(id: string): string {
+		if (!/^maint_[a-f0-9]{32}$/.test(id)) throw new Error("Invalid maintenance receipt id.");
+		return confinedPath(this.root, "maintenance", `${id}.json`);
+	}
+
 	async init(): Promise<void> {
 		if (!this.legacyStateChecked) {
 			await assertNoLegacySchemaV2State(this.root);
@@ -371,7 +394,19 @@ export class RunStore {
 			secureDirectory(confinedPath(this.root, "requests")),
 			secureDirectory(confinedPath(this.root, "idempotency")),
 			secureDirectory(confinedPath(this.root, "catalogs")),
+			secureDirectory(confinedPath(this.root, "maintenance")),
 		]);
+	}
+
+	async putMaintenanceReceipt(record: MaintenanceReceipt): Promise<void> {
+		await this.init();
+		MaintenanceReceiptSchema.parse(record);
+		await atomicWrite(this.maintenancePath(record.id), record);
+	}
+
+	async getMaintenanceReceipt(id: string): Promise<MaintenanceReceipt> {
+		await this.init();
+		return MaintenanceReceiptSchema.parse(JSON.parse(await safeRead(this.maintenancePath(id))));
 	}
 
 	async getCatalogCache(kind: "models" | "projects"): Promise<unknown | undefined> {

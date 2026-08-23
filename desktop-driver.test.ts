@@ -31,16 +31,17 @@ import {
 	addPoolLaneReceipt,
 	beginLaneStartup,
 	completeReservedLaneResponse,
+	cleanupInterruptedLaneStartup,
 	finishLaneStartup,
 	handleDesktopPoolRequest,
 	laneHasExactlyOneReadyShell,
 	loadPoolConfig,
+	managedPoolLanes,
 	listenerProcessPids,
 	poolLanes,
 	profileAssociatedProcessPids,
 	poolAllowsCreateTarget,
 	provePoolLaneRetryBoundary,
-	requestRequiresPoolAllocationLock,
 	retainInterruptedLaneStartup,
 	requestSessionId,
 	roundRobinLaneOrder,
@@ -251,7 +252,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.5",
+				driverVersion: "0.5.0-alpha.6",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -1041,7 +1042,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.5");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.6");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
@@ -1191,14 +1192,6 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		expect(addPoolLaneReceipt({ version: 2, ok: false, error: "blocked" }, 4)).toEqual({ version: 2, ok: false, error: "blocked" });
 	});
 
-	test("keeps ordinary lane work outside the global allocation lock", () => {
-		expect(requestRequiresPoolAllocationLock("create")).toBe(false);
-		expect(requestRequiresPoolAllocationLock("find_conversations")).toBe(false);
-		expect(requestRequiresPoolAllocationLock("close")).toBe(false);
-		expect(requestRequiresPoolAllocationLock("show")).toBe(false);
-		expect(requestRequiresPoolAllocationLock("attest_offline")).toBe(true);
-	});
-
 	test("requires explicit target-creation authorization for the pool", () => {
 		expect(poolAllowsCreateTarget({})).toBe(false);
 		expect(poolAllowsCreateTarget({ GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET: "0" })).toBe(false);
@@ -1271,6 +1264,134 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		renameSync(original, receiptPath);
 		await finishLaneStartup(replaced);
 		expect(existsSync(receiptPath)).toBe(false);
+	});
+
+	test("waits for a delayed exact endpoint during interrupted startup and closes it", async () => {
+		const root = realpathSync(scratch());
+		const config = loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1" });
+		const lane = poolLanes(config)[0];
+		let clock = 0;
+		let probes = 0;
+		const events: string[] = [];
+		await cleanupInterruptedLaneStartup({
+			lane,
+			config,
+			env: {},
+			token: "test-token",
+			identity: { dev: 1, ino: 1 },
+			interrupted: false,
+			endpointObserved: false,
+		}, {
+			endpointAlive: async () => ++probes >= 3,
+			stopLane: async () => { events.push("stop-exact-browser"); },
+			finish: async () => { events.push("finish-receipt"); },
+			retain: async () => { events.push("retain"); },
+			sleep: async (ms) => { clock += ms; },
+			now: () => clock,
+			timeoutMs: 1_000,
+		});
+		expect(events).toEqual(["stop-exact-browser", "finish-receipt"]);
+	});
+
+	test("offline attestation rejects retained launches in configured and size-drift lanes", async () => {
+		const root = realpathSync(scratch());
+		const poolRoot = join(root, "pool");
+		const fullConfig = loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: poolRoot, GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "2", GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65410" });
+		const oldLane = poolLanes(fullConfig)[1];
+		mkdirSync(dirname(oldLane.profileRoot), { recursive: true, mode: 0o700 });
+		const startup = await beginLaneStartup(oldLane, fullConfig, {});
+		await retainInterruptedLaneStartup(startup, "delayed launch cleanup was not proved");
+
+		const shrunkEnv = {
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: poolRoot,
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65410",
+		};
+		const managed = await managedPoolLanes(loadPoolConfig(shrunkEnv));
+		expect(managed.map(({ index }) => index)).toEqual([1, 2]);
+		const response = await handleDesktopPoolRequest({ version: 2, action: "attest_offline", params: {} }, shrunkEnv);
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("lane 2 has a retained interrupted_cleanup_unproved launch receipt");
+	});
+
+	test("serializes send against close through the actual pool request handler", async () => {
+		const root = realpathSync(scratch());
+		const env = { GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1", GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65420" };
+		const sessionId = "desktop-00000000-0000-4000-8000-000000000001";
+		let entered!: () => void;
+		let release!: () => void;
+		const sendEntered = new Promise<void>((resolve) => { entered = resolve; });
+		const sendHeld = new Promise<void>((resolve) => { release = resolve; });
+		const events: string[] = [];
+		const hooks = {
+			laneSessionIds: async () => [sessionId],
+			ensureLaneReady: async () => undefined,
+			invokeLane: async (_lane: unknown, _config: unknown, request: { action: string }) => {
+				events.push(request.action);
+				if (request.action === "send") { entered(); await sendHeld; }
+				return { version: 2 as const, ok: true, result: {} };
+			},
+			stopLane: async () => { events.push("close"); },
+			closeDesktopDriverSessionOffline: async () => undefined,
+		};
+		const session = { sessionId, pageId: "page-1", name: "owned", url: "https://chatgpt.com/c/provider-chat-1" };
+		const send = handleDesktopPoolRequest({ version: 2, action: "send", params: { session } }, env, hooks);
+		await sendEntered;
+		const close = handleDesktopPoolRequest({ version: 2, action: "close", params: { sessionId } }, env, hooks);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(events).toEqual(["send"]);
+		release();
+		const [sent, closed] = await Promise.all([send, close]);
+		expect(sent.ok).toBe(true);
+		expect(closed.ok).toBe(true);
+		expect(events).toEqual(["send", "close"]);
+	});
+
+	test("keeps discovery out of a lane while create owns it and retries a failed lane safely", async () => {
+		const root = realpathSync(scratch());
+		const env = { GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "2", GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65430" };
+		let createEntered!: () => void;
+		let releaseCreate!: () => void;
+		const entered = new Promise<void>((resolve) => { createEntered = resolve; });
+		const held = new Promise<void>((resolve) => { releaseCreate = resolve; });
+		const invoked: string[] = [];
+		const createHooks = {
+			assertLanePrelaunchSafe: async () => undefined,
+			ensureLaneReady: async (lane: { index: number }) => {
+				if (lane.index === 1) { createEntered(); await held; }
+			},
+			invokeLane: async (lane: { index: number }, _config: unknown, request: { action: string }) => {
+				invoked.push(`${request.action}:${lane.index}`);
+				return { version: 2 as const, ok: true, result: { sessionId: `desktop-00000000-0000-4000-8000-00000000000${lane.index}`, pageId: `page-${lane.index}`, name: "owned", url: "https://chatgpt.com/" } };
+			},
+		};
+		const creating = handleDesktopPoolRequest({ version: 2, action: "create", params: { name: "owned", url: "https://chatgpt.com/" } }, env, createHooks);
+		await entered;
+		const discovery = await handleDesktopPoolRequest({ version: 2, action: "find_conversations", params: { query: "old" } }, env, {
+			endpointAlive: async (endpoint) => endpoint.endsWith(":65430"),
+			verifyLaneHost: async () => undefined,
+			invokeLane: async () => { invoked.push("unsafe-discovery"); return { version: 2, ok: true, result: {} }; },
+		});
+		expect(discovery.ok).toBe(false);
+		expect(invoked).toEqual([]);
+		releaseCreate();
+		expect((await creating).ok).toBe(true);
+		expect(invoked).toEqual(["create:1"]);
+
+		const retryRoot = realpathSync(scratch());
+		const retryEnv = { GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(retryRoot, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "2", GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65440" };
+		const retryEvents: string[] = [];
+		const retried = await handleDesktopPoolRequest({ version: 2, action: "create", params: { name: "owned", url: "https://chatgpt.com/" } }, retryEnv, {
+			assertLanePrelaunchSafe: async () => undefined,
+			ensureLaneReady: async (lane) => {
+				retryEvents.push(`ready:${lane.index}`);
+				if (lane.index === 1) throw new Error("lane one failed");
+			},
+			proveLaneRetrySafe: async (lane) => { retryEvents.push(`proved:${lane.index}`); },
+			invokeLane: async (lane) => ({ version: 2, ok: true, result: { sessionId: `desktop-00000000-0000-4000-8000-00000000000${lane.index}`, pageId: `page-${lane.index}`, name: "owned", url: "https://chatgpt.com/" } }),
+		});
+		expect(retried).toMatchObject({ ok: true, result: { desktopPoolLane: 2 } });
+		expect(retryEvents).toEqual(["ready:1", "proved:1", "ready:2"]);
 	});
 
 	test("does not cold-launch an app for read-only conversation discovery", async () => {

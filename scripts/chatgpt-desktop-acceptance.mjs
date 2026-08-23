@@ -7,18 +7,24 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { sanitizeBrowserDriverEnv, sanitizeGptControlBrokerEnv } from "./driver-env.mjs";
 
 const execFileAsync = promisify(execFile);
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LIVE_ACK = "I_UNDERSTAND_THIS_CREATES_CHATGPT_CONVERSATIONS";
 const STRESS_ACK = "I_UNDERSTAND_THIS_STARTS_MULTIPLE_CHATGPT_SESSIONS";
 const DEFAULT_COOLDOWN_HOURS = 24;
-const EXPECTED_VERSION = "0.5.0-alpha.5";
+const EXPECTED_VERSION = "0.5.0-alpha.6";
+const REQUIRED_LAUNCHERS = [
+  "bin/gpt-control-mcp",
+  "bin/gpt-control-desktop-pool-driver",
+];
 const REQUIRED_BUNDLES = [
   "dist/gpt-control-mcp.js",
   "dist/gpt-control-desktop-driver.js",
   "dist/gpt-control-desktop-pool-driver.js",
 ];
+const DESKTOP_SESSION_ID_PATTERN = /^desktop-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const DEFAULT_QUESTIONS = [
   "When would you use CSS Grid instead of Flexbox?",
   "What is one practical way to improve a form's accessibility?",
@@ -38,6 +44,58 @@ export function assertRuntimeBundleMatch(path, installedHash, trustedHash) {
   if (!/^[a-f0-9]{64}$/.test(installedHash) || !/^[a-f0-9]{64}$/.test(trustedHash) || installedHash !== trustedHash) {
     throw new Error(`Installed runtime bundle does not match trusted exact head: ${path}.`);
   }
+}
+
+export async function resolveContainedRegularFile(root, path, label, executable = false) {
+  const canonicalRoot = await realpath(root);
+  const canonical = await realpath(path);
+  const relation = relative(canonicalRoot, canonical);
+  if (relation === "" || relation === ".") throw new Error(`${label} must be a file inside the installed package root.`);
+  if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) {
+    throw new Error(`${label} escapes the installed package root through a symlink or path alias.`);
+  }
+  const { info } = await readRegularFileNoFollow(canonical, 32 * 1024 * 1024);
+  if (executable && (info.mode & 0o111) === 0) throw new Error(`${label} is not executable.`);
+  return canonical;
+}
+
+async function exactFileHash(path) {
+  return sha256Bytes((await readRegularFileNoFollow(path, 32 * 1024 * 1024)).bytes);
+}
+
+function fileIdentity(info) {
+  return { dev: info.dev, ino: info.ino, size: info.size };
+}
+
+function sameFileIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino && left?.size === right?.size;
+}
+
+async function runtimeFileReceipt(path) {
+  const { info, bytes } = await readRegularFileNoFollow(path, 32 * 1024 * 1024);
+  return { identity: fileIdentity(info), sha256: sha256Bytes(bytes) };
+}
+
+async function assertRuntimeFileStillTrusted(runtime, path) {
+  const current = await runtimeFileReceipt(runtime.files[path]);
+  if (!sameFileIdentity(current.identity, runtime.fileIdentities?.[path])) {
+    throw new Error(`Installed runtime file identity changed after trusted exact-head validation: ${path}.`);
+  }
+  assertRuntimeBundleMatch(path, current.sha256, runtime.fileHashes[path]);
+}
+
+export async function assertRuntimeFilesStillTrusted(runtime) {
+  for (const path of Object.keys(runtime.files)) await assertRuntimeFileStillTrusted(runtime, path);
+}
+
+export async function spawnTrustedRuntime(runtime, path, args, options, spawnChild = spawn) {
+  await assertRuntimeFileStillTrusted(runtime, path);
+  const child = spawnChild(runtime.files[path], args, options);
+  const trusted = assertRuntimeFileStillTrusted(runtime, path).catch((error) => {
+    child.kill?.("SIGKILL");
+    throw error;
+  });
+  return { child, trusted };
 }
 
 function parseArgs(argv) {
@@ -167,19 +225,11 @@ async function waitForChildExit(child, timeoutMs) {
 
 export async function inspectInstalledRuntime(installRoot, env) {
   const root = await realpath(installRoot);
-  const contained = async (path, label) => {
-    const canonical = await realpath(path);
-    const relation = relative(root, canonical);
-    if (relation === "" || relation === ".") throw new Error(`${label} must be a file inside the installed package root.`);
-    if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) {
-      throw new Error(`${label} escapes the installed package root through a symlink or path alias.`);
-    }
-    return canonical;
-  };
-  const launcher = await contained(join(root, "bin", "gpt-control-mcp"), "Installed MCP launcher");
-  const poolDriver = await contained(join(root, "bin", "gpt-control-desktop-pool-driver"), "Installed desktop-pool launcher");
-  const bundles = {};
-  for (const path of REQUIRED_BUNDLES) bundles[path] = await contained(join(root, path), `Installed runtime ${path}`);
+  const files = {};
+  for (const path of REQUIRED_LAUNCHERS) files[path] = await resolveContainedRegularFile(root, join(root, path), `Installed launcher ${path}`, true);
+  for (const path of REQUIRED_BUNDLES) files[path] = await resolveContainedRegularFile(root, join(root, path), `Installed runtime ${path}`);
+  const launcher = files["bin/gpt-control-mcp"];
+  const poolDriver = files["bin/gpt-control-desktop-pool-driver"];
   const installedPackage = JSON.parse((await readRegularFileNoFollow(join(root, "package.json"), 1024 * 1024)).text);
   if (!isRecord(installedPackage) || installedPackage.version !== EXPECTED_VERSION) {
     throw new Error(`Installed GPT-Control version must be exactly ${EXPECTED_VERSION}.`);
@@ -199,24 +249,33 @@ export async function inspectInstalledRuntime(installRoot, env) {
   if (!isRecord(trustedPackage) || trustedPackage.version !== EXPECTED_VERSION) {
     throw new Error(`Trusted exact-head package version must be exactly ${EXPECTED_VERSION}.`);
   }
-  const bundleHashes = {};
-  for (const path of REQUIRED_BUNDLES) {
-    const installedHash = sha256Bytes(await readFile(bundles[path]));
-    const trustedHash = sha256Bytes(await readFile(join(trustedRoot, path)));
+  const fileHashes = {};
+  const fileIdentities = {};
+  for (const path of [...REQUIRED_LAUNCHERS, ...REQUIRED_BUNDLES]) {
+    const trustedPath = await resolveContainedRegularFile(trustedRoot, join(trustedRoot, path), `Trusted exact-head file ${path}`, REQUIRED_LAUNCHERS.includes(path));
+    const installed = await runtimeFileReceipt(files[path]);
+    const installedHash = installed.sha256;
+    const trustedHash = await exactFileHash(trustedPath);
     assertRuntimeBundleMatch(path, installedHash, trustedHash);
-    bundleHashes[path] = installedHash;
+    fileHashes[path] = installedHash;
+    fileIdentities[path] = installed.identity;
   }
-  return { root, launcher, poolDriver, bundles, bundleHashes, sourceHead: head };
+  const bundleHashes = Object.fromEntries(REQUIRED_BUNDLES.map((path) => [path, fileHashes[path]]));
+  const launcherHashes = Object.fromEntries(REQUIRED_LAUNCHERS.map((path) => [path, fileHashes[path]]));
+  return { root, launcher, poolDriver, files, fileHashes, fileIdentities, bundleHashes, launcherHashes, sourceHead: head };
 }
 
 async function startInstalledMcp(installRoot, env, prevalidatedRuntime) {
   const runtime = prevalidatedRuntime ?? await inspectInstalledRuntime(installRoot, env);
   const { root, launcher, poolDriver } = runtime;
-  const child = spawn(launcher, [], {
+  await assertRuntimeFilesStillTrusted(runtime);
+  const launched = await spawnTrustedRuntime(runtime, "bin/gpt-control-mcp", [], {
     cwd: root,
-    env: { ...env, GPT_CONTROL_BROWSER_DRIVER: poolDriver },
+    env: sanitizeGptControlBrokerEnv({ ...env, GPT_CONTROL_BROWSER_DRIVER: poolDriver }),
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const { child } = launched;
+  await launched.trusted;
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { if (stderr.length < 64 * 1024) stderr += chunk; });
@@ -234,7 +293,8 @@ async function startInstalledMcp(installRoot, env, prevalidatedRuntime) {
     for (const required of ["gpt_chat", "gpt_conversation_manage", "gpt_conversation_close"]) {
       if (!names.has(required)) throw new Error(`Installed GPT-Control is missing ${required}.`);
     }
-    return { client, initialized, launcher, poolDriver, runtime, stderr: () => stderr };
+    await assertRuntimeFilesStillTrusted(runtime);
+    return { client, initialized, launcher, poolDriver, runtime, assertRuntime: () => assertRuntimeFilesStillTrusted(runtime), stderr: () => stderr };
   } catch (error) {
     await client.close();
     throw new Error(`${error instanceof Error ? error.message : String(error)}${stderr.trim() ? ` stderr: ${stderr.trim()}` : ""}`);
@@ -252,49 +312,52 @@ async function callTool(client, name, args, timeoutMs = 300_000) {
   return result;
 }
 
-async function attestInstalledPool(env, installRoot, action) {
-  const root = await realpath(installRoot);
-  const poolDriver = await realpath(join(root, "bin", "gpt-control-desktop-pool-driver"));
-  const relation = relative(root, poolDriver);
-  if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) {
-    throw new Error("Installed desktop-pool launcher escapes the installed package root.");
-  }
+async function attestInstalledPool(env, installRoot, action, prevalidatedRuntime) {
+  const runtime = prevalidatedRuntime ?? await inspectInstalledRuntime(installRoot, env);
+  const { poolDriver } = runtime;
+  await assertRuntimeFilesStillTrusted(runtime);
   const request = JSON.stringify({ version: 2, action, params: {} });
   const stdout = await new Promise((resolveOutput, rejectOutput) => {
-    const child = spawn(poolDriver, [], { env, stdio: ["pipe", "pipe", "pipe"] });
-    const output = [];
-    const errors = [];
-    let outputBytes = 0;
-    const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-    child.stdout.on("data", (chunk) => {
-      outputBytes += chunk.length;
-      if (outputBytes <= 16 * 1024 * 1024) output.push(chunk);
-      else child.kill("SIGKILL");
-    });
-    let errorBytes = 0;
-    child.stderr.on("data", (chunk) => {
-      errorBytes += chunk.length;
-      if (errorBytes <= 64 * 1024) errors.push(chunk);
-    });
-    child.on("error", rejectOutput);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        rejectOutput(new Error(Buffer.concat(errors).toString("utf8").trim() || `Installed desktop-pool ${action} exited ${code}.`));
-        return;
-      }
-      if (outputBytes > 16 * 1024 * 1024) {
-        rejectOutput(new Error(`Installed desktop-pool ${action} response exceeded 16 MiB.`));
-        return;
-      }
-      resolveOutput(Buffer.concat(output).toString("utf8"));
-    });
-    child.stdin.end(request);
+    void spawnTrustedRuntime(runtime, "bin/gpt-control-desktop-pool-driver", [], {
+      env: sanitizeBrowserDriverEnv(env), stdio: ["pipe", "pipe", "pipe"],
+    }).then(async ({ child, trusted }) => {
+      const output = [];
+      const errors = [];
+      let outputBytes = 0;
+      const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+      child.stdout.on("data", (chunk) => {
+        outputBytes += chunk.length;
+        if (outputBytes <= 16 * 1024 * 1024) output.push(chunk);
+        else child.kill("SIGKILL");
+      });
+      let errorBytes = 0;
+      child.stderr.on("data", (chunk) => {
+        errorBytes += chunk.length;
+        if (errorBytes <= 64 * 1024) errors.push(chunk);
+      });
+      child.on("error", rejectOutput);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          rejectOutput(new Error(Buffer.concat(errors).toString("utf8").trim() || `Installed desktop-pool ${action} exited ${code}.`));
+          return;
+        }
+        if (outputBytes > 16 * 1024 * 1024) {
+          rejectOutput(new Error(`Installed desktop-pool ${action} response exceeded 16 MiB.`));
+          return;
+        }
+        resolveOutput(Buffer.concat(output).toString("utf8"));
+      });
+      await trusted;
+      child.stdin.end(request);
+    }).catch(rejectOutput);
   });
   const envelope = JSON.parse(stdout.trim());
   if (!isRecord(envelope) || envelope.version !== 2 || envelope.ok !== true || !isRecord(envelope.result)) {
     throw new Error(`Installed desktop-pool ${action} failed: ${envelope?.error ?? "invalid response"}.`);
   }
+  await assertRuntimeFilesStillTrusted(runtime);
+  validatePoolAttestation(envelope.result, action === "attest_offline" ? "offline" : "active", { runtime });
   return envelope.result;
 }
 
@@ -358,10 +421,17 @@ async function releaseCooldownLease(lease) {
 }
 
 export function compactRunReceipt(toolResult, expected = {}) {
+  if (!isRecord(toolResult) || toolResult.isError === true) throw new Error("gpt_chat returned an MCP error result.");
   const structured = toolResult.structuredContent;
   const run = structured?.run;
   const receipt = run?.receipt;
   if (!isRecord(run) || !isRecord(receipt)) throw new Error("gpt_chat omitted its durable run receipt.");
+  if (typeof structured.conversationId !== "string" || !/^conv_[a-f0-9]{32}$/.test(structured.conversationId)) {
+    throw new Error("gpt_chat omitted its typed broker conversation identity.");
+  }
+  if (typeof run.runId !== "string" || !/^run_[a-f0-9]{32}$/.test(run.runId)) {
+    throw new Error("gpt_chat omitted its typed durable run identity.");
+  }
   if (!Number.isSafeInteger(receipt.desktopPoolLane) || receipt.desktopPoolLane < 1 || receipt.desktopPoolLane > 10) {
     throw new Error("gpt_chat omitted its bounded desktop-pool lane receipt.");
   }
@@ -369,6 +439,12 @@ export function compactRunReceipt(toolResult, expected = {}) {
   if (receipt.browserDriverId !== "chatgpt-desktop-pool/v1") throw new Error("gpt_chat did not use the installed desktop-pool driver.");
   for (const [field, value] of [["local browser session", receipt.localBrowserSessionId], ["provider conversation", receipt.providerConversationId], ["provider conversation URL", receipt.providerConversationUrl]]) {
     if (typeof value !== "string" || value.length < 1) throw new Error(`gpt_chat omitted its ${field} identity.`);
+  }
+  if (!DESKTOP_SESSION_ID_PATTERN.test(receipt.localBrowserSessionId)) {
+    throw new Error("gpt_chat returned an invalid local browser-session identity.");
+  }
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(receipt.providerConversationId)) {
+    throw new Error("gpt_chat returned an invalid provider conversation identity.");
   }
   if (receipt.modelVerified !== true || receipt.modelEvidenceKind !== "composer_selector") {
     throw new Error("gpt_chat omitted exact composer model proof.");
@@ -402,7 +478,7 @@ export function compactRunReceipt(toolResult, expected = {}) {
     browserDriverId: receipt.browserDriverId,
     localBrowserSessionId: receipt.localBrowserSessionId,
     providerConversationId: receipt.providerConversationId,
-    providerConversationUrlSha256: providerConversationUrlReceipt(receipt.providerConversationUrl),
+    providerConversationUrlSha256: providerConversationUrlReceipt(receipt.providerConversationUrl, receipt.providerConversationId),
     requestedModel: receipt.requestedModel,
     observedModel: receipt.observedModel,
     requestedEffort: receipt.requestedEffort,
@@ -414,13 +490,83 @@ export function compactRunReceipt(toolResult, expected = {}) {
   };
 }
 
-function providerConversationUrlReceipt(raw) {
+function providerConversationUrlReceipt(raw, expectedId) {
   const url = new URL(raw);
   if (url.origin !== "https://chatgpt.com" || !/^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/[A-Za-z0-9_-]{8,128}\/?$/.test(url.pathname)
     || url.search || url.hash) {
     throw new Error("gpt_chat returned an invalid provider conversation URL.");
   }
+  const match = /^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/([A-Za-z0-9_-]{8,128})\/?$/.exec(url.pathname);
+  if (match?.[1] !== expectedId) throw new Error("gpt_chat provider conversation URL does not match its provider conversation identity.");
   return sha256(url.toString());
+}
+
+function assertExactKeys(value, allowed, label) {
+  const extras = Object.keys(value).filter((key) => !allowed.has(key));
+  if (extras.length > 0) throw new Error(`${label} contains unsupported fields: ${extras.join(", ")}.`);
+}
+
+export function validatePoolAttestation(proof, mode, options = {}) {
+  if (!isRecord(proof)) throw new Error(`Desktop-pool ${mode} attestation is invalid.`);
+  assertExactKeys(proof, new Set([
+    "driver", "mode", "configuredSize", "managedLaneCount", "startPort", "poolRootSha256",
+    "lanes", "attestedAt", "runtimeExecutable", "runtimeBundlePath", "runtimeBundleSha256",
+  ]), `Desktop-pool ${mode} attestation`);
+  if (proof.driver !== "chatgpt-desktop-pool/v1" || proof.mode !== mode) {
+    throw new Error(`Desktop-pool ${mode} attestation has the wrong driver or mode.`);
+  }
+  if (!Number.isSafeInteger(proof.configuredSize) || proof.configuredSize < 1 || proof.configuredSize > 10
+    || !Number.isSafeInteger(proof.managedLaneCount) || proof.managedLaneCount < proof.configuredSize || proof.managedLaneCount > 10
+    || !Number.isSafeInteger(proof.startPort) || proof.startPort < 1024 || proof.startPort > 65_535
+    || !/^[a-f0-9]{64}$/.test(proof.poolRootSha256)
+    || !Number.isFinite(Date.parse(proof.attestedAt ?? ""))
+    || !Array.isArray(proof.lanes) || proof.lanes.length !== proof.managedLaneCount) {
+    throw new Error(`Desktop-pool ${mode} attestation omitted its bounded pool identity.`);
+  }
+  if (options.runtime) {
+    const expectedBundle = options.runtime.files["dist/gpt-control-desktop-pool-driver.js"];
+    const expectedHash = options.runtime.fileHashes["dist/gpt-control-desktop-pool-driver.js"];
+    if (proof.runtimeBundlePath !== expectedBundle || proof.runtimeBundleSha256 !== expectedHash
+      || typeof proof.runtimeExecutable !== "string" || proof.runtimeExecutable.length < 1) {
+      throw new Error(`Desktop-pool ${mode} attestation did not prove the installed runtime bundle identity.`);
+    }
+  }
+  const laneNumbers = new Set();
+  const sessionIds = new Set();
+  let activeCount = 0;
+  for (const lane of proof.lanes) {
+    if (!isRecord(lane)) throw new Error(`Desktop-pool ${mode} attestation contains a non-object lane.`);
+    const active = lane.state === "active";
+    assertExactKeys(lane, new Set(active
+      ? ["lane", "port", "profileSha256", "sessionIds", "state", "listenerPid", "browserInstanceId", "bundleId", "teamId"]
+      : ["lane", "port", "profileSha256", "sessionIds", "state"]), `Desktop-pool lane ${lane.lane ?? "unknown"}`);
+    if (!Number.isSafeInteger(lane.lane) || lane.lane < 1 || lane.lane > 10 || laneNumbers.has(lane.lane)
+      || !Number.isSafeInteger(lane.port) || lane.port < 1024 || lane.port > 65_535
+      || lane.port !== proof.startPort + lane.lane - 1
+      || !/^[a-f0-9]{64}$/.test(lane.profileSha256)
+      || !Array.isArray(lane.sessionIds)
+      || lane.sessionIds.some((id) => typeof id !== "string" || !DESKTOP_SESSION_ID_PATTERN.test(id) || sessionIds.has(id))) {
+      throw new Error(`Desktop-pool ${mode} attestation contains an invalid or duplicate lane identity.`);
+    }
+    laneNumbers.add(lane.lane);
+    for (const id of lane.sessionIds) sessionIds.add(id);
+    if (active) {
+      activeCount += 1;
+      if (mode === "offline" || lane.sessionIds.length !== 1
+        || !Number.isSafeInteger(lane.listenerPid) || lane.listenerPid <= 0
+        || typeof lane.browserInstanceId !== "string" || lane.browserInstanceId.length < 8
+        || !["com.openai.codex", "com.openai.chat"].includes(lane.bundleId)
+        || lane.teamId !== "2DC432GLL2") {
+        throw new Error(`Desktop-pool ${mode} attestation contains invalid active-lane proof.`);
+      }
+    } else if (lane.state !== "offline" || lane.sessionIds.length !== 0) {
+      throw new Error(`Desktop-pool ${mode} attestation contains invalid offline-lane proof.`);
+    }
+  }
+  if (options.expectedActiveCount !== undefined && activeCount !== options.expectedActiveCount) {
+    throw new Error(`Desktop-pool active attestation expected ${options.expectedActiveCount} active lanes; received ${activeCount}.`);
+  }
+  return proof;
 }
 
 export function validateConcurrentReceipts(receipts, activeProof, expectedCount) {
@@ -437,9 +583,7 @@ export function validateConcurrentReceipts(receipts, activeProof, expectedCount)
   unique("providerConversationId", "provider conversations");
   unique("providerConversationUrlSha256", "provider conversation URLs");
   unique("desktopPoolLane", "desktop-pool lanes");
-  if (!isRecord(activeProof) || activeProof.driver !== "chatgpt-desktop-pool/v1" || !Array.isArray(activeProof.lanes)) {
-    throw new Error("Desktop-pool active attestation is invalid.");
-  }
+  validatePoolAttestation(activeProof, "active", { expectedActiveCount: expectedCount });
   const active = activeProof.lanes.filter((lane) => isRecord(lane) && lane.state === "active" && Array.isArray(lane.sessionIds));
   const matched = receipts.map((receipt) => active.find((lane) => lane.lane === receipt.desktopPoolLane && lane.sessionIds.includes(receipt.localBrowserSessionId)));
   if (matched.some((lane) => !lane)) throw new Error("Desktop-pool active attestation does not bind every run to its exact lane session.");
@@ -500,7 +644,8 @@ export async function runAcceptance(argv = process.argv.slice(2), env = process.
   if (!Number.isFinite(cooldownHours) || cooldownHours < 1 || cooldownHours > 168) throw new Error("Live acceptance cooldown must be 1-168 hours.");
   const cooldownPath = resolve(env.GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_STATE ?? join(homedir(), ".gpt-control", "live-acceptance.json"));
   const prevalidatedRuntime = dependencies.startInstalledMcp ? undefined : await inspectInstalledRuntime(installRoot, env);
-  await attestPool(env, installRoot, "attest_offline");
+  const initialOfflineProof = await attestPool(env, installRoot, "attest_offline", prevalidatedRuntime);
+  validatePoolAttestation(initialOfflineProof, "offline", prevalidatedRuntime ? { runtime: prevalidatedRuntime } : {});
   const cooldownLease = await beginCooldown(cooldownPath, options.count, cooldownHours, env.GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_OVERRIDE === "1");
   const childEnv = { ...env, GPT_CONTROL_WORKSPACE_ROOT: workspaceRoot };
   let started;
@@ -547,7 +692,7 @@ export async function runAcceptance(argv = process.argv.slice(2), env = process.
       }
     }
     if (failures.length > 0) throw new AggregateError(failures, `${failures.length} installed product-path call${failures.length === 1 ? "" : "s"} failed.`);
-    const activeProof = await attestPool(env, installRoot, "attest_active");
+    const activeProof = await attestPool(env, installRoot, "attest_active", prevalidatedRuntime);
     validateConcurrentReceipts(receipts, activeProof, options.count);
   } catch (error) {
     primaryError = error;
@@ -570,10 +715,16 @@ export async function runAcceptance(argv = process.argv.slice(2), env = process.
     } catch (error) {
       cleanupErrors.push(`MCP close: ${error instanceof Error ? error.message : String(error)}`);
     }
+    try {
+      await started.assertRuntime?.();
+    } catch (error) {
+      cleanupErrors.push(`installed runtime changed during MCP execution: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   let cleanupProof;
   try {
-    cleanupProof = await attestPool(env, installRoot, "attest_offline");
+    cleanupProof = await attestPool(env, installRoot, "attest_offline", prevalidatedRuntime);
+    validatePoolAttestation(cleanupProof, "offline", prevalidatedRuntime ? { runtime: prevalidatedRuntime } : {});
   } catch (error) {
     cleanupErrors.push(error instanceof Error ? error.message : String(error));
   }
@@ -584,21 +735,29 @@ export async function runAcceptance(argv = process.argv.slice(2), env = process.
       `Installed desktop acceptance failed${cleanupErrors.length ? ` with ${cleanupErrors.length} cleanup blocker${cleanupErrors.length === 1 ? "" : "s"}` : ""}.${stderr().trim() ? ` MCP stderr: ${stderr().trim()}` : ""}`,
     );
   }
+  let result;
+  try {
+    await started.assertRuntime?.();
+    result = {
+      mode: "live",
+      path: "installed-mcp",
+      server: initialized.serverInfo,
+      installRootPathSha256: sha256(await realpath(installRoot)),
+      launcherSha256: started.runtime?.launcherHashes?.["bin/gpt-control-mcp"] ?? sha256Bytes(await readFile(launcher)),
+      poolDriverSha256: started.runtime?.launcherHashes?.["bin/gpt-control-desktop-pool-driver"] ?? sha256Bytes(await readFile(poolDriver)),
+      runtimeBundleHashes: started.runtime?.bundleHashes,
+      sourceHead: started.runtime?.sourceHead,
+      count: options.count,
+      receipts,
+      cleanup: cleanupProof,
+      completedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    await finishCooldown(cooldownPath, "failed", cooldownLease);
+    throw error;
+  }
   await finishCooldown(cooldownPath, "passed", cooldownLease);
-  return {
-    mode: "live",
-    path: "installed-mcp",
-    server: initialized.serverInfo,
-    installRootPathSha256: sha256(await realpath(installRoot)),
-    launcherSha256: sha256Bytes(await readFile(launcher)),
-    poolDriverSha256: sha256Bytes(await readFile(poolDriver)),
-    runtimeBundleHashes: started.runtime?.bundleHashes,
-    sourceHead: started.runtime?.sourceHead,
-    count: options.count,
-    receipts,
-    cleanup: cleanupProof,
-    completedAt: new Date().toISOString(),
-  };
+  return result;
 }
 
 function isRecord(value) {

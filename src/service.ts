@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
@@ -55,7 +55,7 @@ import {
 	type OperatorPolicy,
 } from "./policy";
 import { buildReviewPrompt, parseReviewReport } from "./review";
-import { idempotencyKeyHash, RunStore, type DurableRunRequest } from "./store";
+import { idempotencyKeyHash, RunStore, type DurableRunRequest, type MaintenanceReceipt } from "./store";
 import { passiveTransportDiscovery } from "./transport";
 import type { Exec } from "./types";
 
@@ -65,6 +65,8 @@ const catalogRefreshes = new Map<string, Promise<unknown>>();
 class RestartSuspension extends Error {
 	constructor() { super("GPT-Control monitoring suspended for process restart."); }
 }
+
+class RetainedCreatedSessionError extends Error {}
 
 export interface StartRequest {
 	kind: RunKind;
@@ -284,9 +286,7 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:catalog:${opaqueId("task")}`;
-			const session = await route.driver.create(name, CHATGPT_ORIGIN);
-			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-			try {
+			return this.withMaintenanceSession("model_catalog", route.driver, name, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverModels(ready.session);
 				const record: CatalogCacheRecord<ChatGptModelCatalog> = {
@@ -298,9 +298,7 @@ export class GptControlService {
 				};
 				await this.store.putCatalogCache("models", record);
 				return modelCatalogResult(record, "refreshed");
-			} finally {
-				await route.driver.close(session.sessionId);
-			}
+			});
 		}));
 	}
 
@@ -314,9 +312,7 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:projects:${opaqueId("task")}`;
-			const session = await route.driver.create(name, CHATGPT_ORIGIN);
-			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-			try {
+			return this.withMaintenanceSession("project_catalog", route.driver, name, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverProjects(ready.session);
 				const record: CatalogCacheRecord<ChatGptProjectCatalog> = {
@@ -328,10 +324,78 @@ export class GptControlService {
 				};
 				await this.store.putCatalogCache("projects", record);
 				return projectCatalogResult(record, "refreshed");
-			} finally {
-				await route.driver.close(session.sessionId);
-			}
+			});
 		}));
+	}
+
+	private async withMaintenanceSession<T>(
+		kind: "model_catalog" | "project_catalog",
+		driver: WebChatDriver,
+		name: string,
+		work: (session: DriverSession, expected: ExpectedDriverSession) => Promise<T>,
+		): Promise<T> {
+			const session = await driver.create(name, CHATGPT_ORIGIN);
+			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+		let retainedHandled = false;
+		try {
+			await this.validateCreatedSession(driver, session, expected, async () => {
+				const timestamp = nowIso();
+				const receipt: MaintenanceReceipt = {
+					version: 1,
+					id: `maint_${randomUUID().replaceAll("-", "")}`,
+					kind,
+						browserDriverId: driver.id,
+						browserSessionId: session.sessionId,
+						browserPageId: session.pageId,
+						browserSessionName: session.name,
+					browserUrl: session.url,
+					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: "release_unproved",
+					status: "retained",
+					createdAt: timestamp,
+					updatedAt: timestamp,
+				};
+				await this.store.putMaintenanceReceipt(receipt);
+				return {
+					label: receipt.id,
+					markClosed: async () => this.store.putMaintenanceReceipt({ ...receipt, status: "closed", updatedAt: nowIso() }),
+				};
+			});
+			return await work(session, expected);
+		} catch (error) {
+			if (error instanceof RetainedCreatedSessionError) retainedHandled = true;
+			throw error;
+		} finally {
+			if (!retainedHandled) await driver.close(session.sessionId);
+		}
+	}
+
+	private async validateCreatedSession(
+		driver: WebChatDriver,
+		session: DriverSession,
+		expected: ExpectedDriverSession,
+			retain: () => Promise<{ label: string; markClosed: () => Promise<void> }>,
+		): Promise<void> {
+			if (session.desktopPoolLeaseState !== "release_unproved") {
+				if (session.name !== expected.name) throw new Error("Browser driver returned a session with the wrong ownership name.");
+				await assertExactDriverSession(driver, expected);
+				return;
+			}
+			const durable = await retain();
+			const validationError = session.name !== expected.name
+				? " Browser driver returned a session with the wrong ownership name."
+				: "";
+			try {
+				await driver.close(session.sessionId);
+				await durable.markClosed();
+			} catch (cleanupError) {
+				throw new RetainedCreatedSessionError(
+					`Desktop session creation succeeded, but lifecycle-lock release and cleanup were not proved; durable ownership receipt ${durable.label} was retained.${validationError} Cleanup error: ${errorMessage(cleanupError)}`,
+				);
+			}
+			throw new RetainedCreatedSessionError(
+				`Desktop session creation succeeded, but lifecycle-lock release was not proved; cleanup was proved in durable ownership receipt ${durable.label}.${validationError}`,
+			);
 	}
 
 	async findConversations(request: ChatGptConversationFindRequest = {}): Promise<ChatGptConversationCatalog> {
@@ -728,8 +792,32 @@ export class GptControlService {
 			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
 			let persisted = false;
 			try {
-				if (session.name !== name) throw new Error("Browser driver returned an attached session with the wrong ownership name.");
-				await assertExactDriverSession(route.driver, expected);
+				await this.validateCreatedSession(route.driver, session, expected, async () => {
+					const retained: ConversationRecord = {
+						version: STORAGE_VERSION,
+						id,
+						provider: "browser",
+						providerConversationId: identity.id,
+						providerConversationUrl: identity.url,
+						browserDriverId: route.driver.id,
+						browserSessionId: session.sessionId,
+							browserSessionName: session.name,
+						browserPageId: session.pageId,
+						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: "release_unproved",
+						workspaceRoot: this.policy.workspaceRoot,
+						policyFingerprint: this.policy.fingerprint,
+						mcpSessionId,
+						createdAt: timestamp,
+						updatedAt: timestamp,
+					};
+					await this.store.putConversation(retained);
+					persisted = true;
+					return {
+						label: id,
+						markClosed: async () => { await this.store.updateConversation(id, { closedAt: nowIso() }); },
+					};
+				});
 				const conversation: ConversationRecord = {
 					version: STORAGE_VERSION,
 					id,
@@ -758,6 +846,7 @@ export class GptControlService {
 					browserAssistantTurnCount: ready.observation.snapshot.count,
 				});
 			} catch (error) {
+				if (error instanceof RetainedCreatedSessionError) throw error;
 				try {
 					await assertExactDriverSession(route.driver, expected);
 					await route.driver.close(expected.sessionId);
@@ -1953,8 +2042,29 @@ export class GptControlService {
 		};
 		let persisted = false;
 		try {
-			if (session.name !== name) throw new Error("Browser driver returned a session with the wrong ownership name.");
-			await assertExactDriverSession(available.driver, expected, signal);
+			await this.validateCreatedSession(available.driver, session, expected, async () => {
+					conversation = await this.store.updateConversation(conversation.id, {
+					browserSessionId: session.sessionId,
+					browserSessionName: session.name,
+					browserPageId: session.pageId,
+					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: "release_unproved",
+				});
+				persisted = true;
+				run = await this.store.updateRun(run.id, {
+					receipt: {
+						...run.receipt,
+						browserDriverId: available.driver.id,
+						localBrowserSessionId: session.sessionId,
+						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: "release_unproved",
+					},
+				});
+				return {
+					label: `${conversation.id}/${run.id}`,
+					markClosed: async () => { await this.store.updateConversation(conversation.id, { closedAt: nowIso() }); },
+				};
+			});
 			conversation = await this.store.updateConversation(conversation.id, {
 				browserSessionId: session.sessionId,
 				browserPageId: session.pageId,
@@ -1971,9 +2081,6 @@ export class GptControlService {
 					desktopPoolLeaseState: session.desktopPoolLeaseState,
 				},
 			});
-			if (session.desktopPoolLeaseState === "release_unproved") {
-				throw new Error("Desktop session creation succeeded, but lifecycle-lock release was not proved; durable ownership was retained for explicit recovery.");
-			}
 			if (TERMINAL.has(run.status)) {
 				await assertExactDriverSession(available.driver, expected);
 				await available.driver.close(session.sessionId);
@@ -1982,6 +2089,7 @@ export class GptControlService {
 			}
 			return { conversation, run, driver: available.driver, expected };
 		} catch (error) {
+			if (error instanceof RetainedCreatedSessionError) throw error;
 			if (!persisted) {
 				try {
 					if (session.name !== name) throw new Error("Created browser session did not retain its broker ownership name.");

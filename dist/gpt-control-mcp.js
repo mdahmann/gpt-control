@@ -6633,7 +6633,7 @@ var require_dist = __commonJS(function(exports, module) {
 });
 
 // src/mcp.ts
-import { randomUUID as randomUUID6 } from "crypto";
+import { randomUUID as randomUUID7 } from "crypto";
 import { join as join7, resolve as resolve9 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
 
@@ -29320,10 +29320,10 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.5";
+var PACKAGE_VERSION = "0.5.0-alpha.6";
 
 // src/service.ts
-import { createHash as createHash6 } from "node:crypto";
+import { createHash as createHash6, randomUUID as randomUUID5 } from "node:crypto";
 import { rm as rm5 } from "node:fs/promises";
 import { join as join5, resolve as resolve6 } from "node:path";
 
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.5";
+var PACKAGE_VERSION2 = "0.5.0-alpha.6";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35309,6 +35309,32 @@ function sleep(ms) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
+// scripts/driver-env.mjs
+var BASE_ENV_KEYS = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ"
+]);
+function copyAllowedEnvironment(env, allow) {
+  const output = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string" && (BASE_ENV_KEYS.has(key) || allow(key)))
+      output[key] = value;
+  }
+  return output;
+}
+function sanitizeBrowserDriverEnv(env) {
+  return copyAllowedEnvironment(env, (key) => key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_"));
+}
+
 // src/browser-driver.ts
 var BROWSER_DRIVER_PROTOCOL_VERSION = 2;
 async function assertExactDriverSession(driver, expected, signal) {
@@ -36073,7 +36099,7 @@ async function invokeJsonCommand(command, args, request, signal) {
       child = spawn(command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         signal,
-        env: sanitizedDriverEnv(process.env)
+        env: sanitizeBrowserDriverEnv(process.env)
       });
     } catch (error51) {
       reject(error51);
@@ -36123,17 +36149,6 @@ async function invokeJsonCommand(command, args, request, signal) {
     child.stdin.end(`${request}
 `);
   });
-}
-function sanitizedDriverEnv(env) {
-  const safe = new Set(["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
-  const output = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined)
-      continue;
-    if (safe.has(key) || key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_"))
-      output[key] = value;
-  }
-  return output;
 }
 function offlineProbe(driver, reason) {
   return { ready: false, driver, secureInput: false, protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION, reason };
@@ -36444,6 +36459,21 @@ var ProviderThrottleSchema = exports_external.object({
   recoverySuccesses: exports_external.number().int().nonnegative(),
   messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
 });
+var MaintenanceReceiptSchema = exports_external.object({
+  version: exports_external.literal(1),
+  id: exports_external.string().regex(/^maint_[a-f0-9]{32}$/),
+  kind: exports_external.enum(["model_catalog", "project_catalog"]),
+  browserDriverId: exports_external.string().min(1).max(128),
+  browserSessionId: exports_external.string().min(1).max(512),
+  browserPageId: exports_external.union([exports_external.string(), exports_external.number()]),
+  browserSessionName: exports_external.string().min(1).max(512),
+  browserUrl: exports_external.string().min(1).max(2048),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved"),
+  status: exports_external.enum(["retained", "closed"]),
+  createdAt: exports_external.string(),
+  updatedAt: exports_external.string()
+});
 var TERMINAL = new Set(["completed", "failed", "cancelled", "needs_user"]);
 var TRANSITIONS = {
   queued: new Set(["queued", "running", "failed", "cancelled", "needs_user"]),
@@ -36559,6 +36589,11 @@ class RunStore {
   catalogPath(kind) {
     return confinedPath(this.root, "catalogs", `${kind}.json`);
   }
+  maintenancePath(id) {
+    if (!/^maint_[a-f0-9]{32}$/.test(id))
+      throw new Error("Invalid maintenance receipt id.");
+    return confinedPath(this.root, "maintenance", `${id}.json`);
+  }
   async init() {
     if (!this.legacyStateChecked) {
       await assertNoLegacySchemaV2State(this.root);
@@ -36571,8 +36606,18 @@ class RunStore {
       secureDirectory(confinedPath(this.root, "locks")),
       secureDirectory(confinedPath(this.root, "requests")),
       secureDirectory(confinedPath(this.root, "idempotency")),
-      secureDirectory(confinedPath(this.root, "catalogs"))
+      secureDirectory(confinedPath(this.root, "catalogs")),
+      secureDirectory(confinedPath(this.root, "maintenance"))
     ]);
+  }
+  async putMaintenanceReceipt(record3) {
+    await this.init();
+    MaintenanceReceiptSchema.parse(record3);
+    await atomicWrite(this.maintenancePath(record3.id), record3);
+  }
+  async getMaintenanceReceipt(id) {
+    await this.init();
+    return MaintenanceReceiptSchema.parse(JSON.parse(await safeRead(this.maintenancePath(id))));
   }
   async getCatalogCache(kind) {
     await this.init();
@@ -37548,6 +37593,9 @@ class RestartSuspension extends Error {
   }
 }
 
+class RetainedCreatedSessionError extends Error {
+}
+
 class FairSemaphore {
   limit;
   active = 0;
@@ -37631,9 +37679,7 @@ class GptControlService {
       const route = selectRoute(capabilities, { transport: "browser" });
       assertTransportAllowed(this.policy, route.kind);
       const name = `gpt-control:catalog:${opaqueId("task")}`;
-      const session = await route.driver.create(name, CHATGPT_ORIGIN);
-      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-      try {
+      return this.withMaintenanceSession("model_catalog", route.driver, name, async (session, expected) => {
         const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
         const catalog = await route.driver.discoverModels(ready.session);
         const record3 = {
@@ -37645,9 +37691,7 @@ class GptControlService {
         };
         await this.store.putCatalogCache("models", record3);
         return modelCatalogResult(record3, "refreshed");
-      } finally {
-        await route.driver.close(session.sessionId);
-      }
+      });
     }));
   }
   async listProjects(options = {}) {
@@ -37662,9 +37706,7 @@ class GptControlService {
       const route = selectRoute(capabilities, { transport: "browser" });
       assertTransportAllowed(this.policy, route.kind);
       const name = `gpt-control:projects:${opaqueId("task")}`;
-      const session = await route.driver.create(name, CHATGPT_ORIGIN);
-      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-      try {
+      return this.withMaintenanceSession("project_catalog", route.driver, name, async (session, expected) => {
         const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
         const catalog = await route.driver.discoverProjects(ready.session);
         const record3 = {
@@ -37676,10 +37718,63 @@ class GptControlService {
         };
         await this.store.putCatalogCache("projects", record3);
         return projectCatalogResult(record3, "refreshed");
-      } finally {
-        await route.driver.close(session.sessionId);
-      }
+      });
     }));
+  }
+  async withMaintenanceSession(kind, driver, name, work) {
+    const session = await driver.create(name, CHATGPT_ORIGIN);
+    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+    let retainedHandled = false;
+    try {
+      await this.validateCreatedSession(driver, session, expected, async () => {
+        const timestamp = nowIso();
+        const receipt = {
+          version: 1,
+          id: `maint_${randomUUID5().replaceAll("-", "")}`,
+          kind,
+          browserDriverId: driver.id,
+          browserSessionId: session.sessionId,
+          browserPageId: session.pageId,
+          browserSessionName: session.name,
+          browserUrl: session.url,
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: "release_unproved",
+          status: "retained",
+          createdAt: timestamp,
+          updatedAt: timestamp
+        };
+        await this.store.putMaintenanceReceipt(receipt);
+        return {
+          label: receipt.id,
+          markClosed: async () => this.store.putMaintenanceReceipt({ ...receipt, status: "closed", updatedAt: nowIso() })
+        };
+      });
+      return await work(session, expected);
+    } catch (error51) {
+      if (error51 instanceof RetainedCreatedSessionError)
+        retainedHandled = true;
+      throw error51;
+    } finally {
+      if (!retainedHandled)
+        await driver.close(session.sessionId);
+    }
+  }
+  async validateCreatedSession(driver, session, expected, retain) {
+    if (session.desktopPoolLeaseState !== "release_unproved") {
+      if (session.name !== expected.name)
+        throw new Error("Browser driver returned a session with the wrong ownership name.");
+      await assertExactDriverSession(driver, expected);
+      return;
+    }
+    const durable = await retain();
+    const validationError = session.name !== expected.name ? " Browser driver returned a session with the wrong ownership name." : "";
+    try {
+      await driver.close(session.sessionId);
+      await durable.markClosed();
+    } catch (cleanupError) {
+      throw new RetainedCreatedSessionError(`Desktop session creation succeeded, but lifecycle-lock release and cleanup were not proved; durable ownership receipt ${durable.label} was retained.${validationError} Cleanup error: ${errorMessage2(cleanupError)}`);
+    }
+    throw new RetainedCreatedSessionError(`Desktop session creation succeeded, but lifecycle-lock release was not proved; cleanup was proved in durable ownership receipt ${durable.label}.${validationError}`);
   }
   async findConversations(request = {}) {
     const query = request.query?.replace(/\s+/g, " ").trim();
@@ -38050,9 +38145,34 @@ class GptControlService {
       const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
       let persisted = false;
       try {
-        if (session.name !== name)
-          throw new Error("Browser driver returned an attached session with the wrong ownership name.");
-        await assertExactDriverSession(route.driver, expected);
+        await this.validateCreatedSession(route.driver, session, expected, async () => {
+          const retained = {
+            version: STORAGE_VERSION,
+            id,
+            provider: "browser",
+            providerConversationId: identity.id,
+            providerConversationUrl: identity.url,
+            browserDriverId: route.driver.id,
+            browserSessionId: session.sessionId,
+            browserSessionName: session.name,
+            browserPageId: session.pageId,
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: "release_unproved",
+            workspaceRoot: this.policy.workspaceRoot,
+            policyFingerprint: this.policy.fingerprint,
+            mcpSessionId,
+            createdAt: timestamp,
+            updatedAt: timestamp
+          };
+          await this.store.putConversation(retained);
+          persisted = true;
+          return {
+            label: id,
+            markClosed: async () => {
+              await this.store.updateConversation(id, { closedAt: nowIso() });
+            }
+          };
+        });
         const conversation = {
           version: STORAGE_VERSION,
           id,
@@ -38081,6 +38201,8 @@ class GptControlService {
           browserAssistantTurnCount: ready.observation.snapshot.count
         });
       } catch (error51) {
+        if (error51 instanceof RetainedCreatedSessionError)
+          throw error51;
         try {
           await assertExactDriverSession(route.driver, expected);
           await route.driver.close(expected.sessionId);
@@ -39156,9 +39278,31 @@ class GptControlService {
     };
     let persisted = false;
     try {
-      if (session.name !== name)
-        throw new Error("Browser driver returned a session with the wrong ownership name.");
-      await assertExactDriverSession(available.driver, expected, signal);
+      await this.validateCreatedSession(available.driver, session, expected, async () => {
+        conversation = await this.store.updateConversation(conversation.id, {
+          browserSessionId: session.sessionId,
+          browserSessionName: session.name,
+          browserPageId: session.pageId,
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: "release_unproved"
+        });
+        persisted = true;
+        run = await this.store.updateRun(run.id, {
+          receipt: {
+            ...run.receipt,
+            browserDriverId: available.driver.id,
+            localBrowserSessionId: session.sessionId,
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: "release_unproved"
+          }
+        });
+        return {
+          label: `${conversation.id}/${run.id}`,
+          markClosed: async () => {
+            await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+          }
+        };
+      });
       conversation = await this.store.updateConversation(conversation.id, {
         browserSessionId: session.sessionId,
         browserPageId: session.pageId,
@@ -39175,9 +39319,6 @@ class GptControlService {
           desktopPoolLeaseState: session.desktopPoolLeaseState
         }
       });
-      if (session.desktopPoolLeaseState === "release_unproved") {
-        throw new Error("Desktop session creation succeeded, but lifecycle-lock release was not proved; durable ownership was retained for explicit recovery.");
-      }
       if (TERMINAL2.has(run.status)) {
         await assertExactDriverSession(available.driver, expected);
         await available.driver.close(session.sessionId);
@@ -39186,6 +39327,8 @@ class GptControlService {
       }
       return { conversation, run, driver: available.driver, expected };
     } catch (error51) {
+      if (error51 instanceof RetainedCreatedSessionError)
+        throw error51;
       if (!persisted) {
         try {
           if (session.name !== name)
@@ -39802,7 +39945,7 @@ function abortableSleep2(ms, signal) {
 
 // src/task_store.ts
 import { constants as constants4 } from "node:fs";
-import { createHash as createHash7, randomUUID as randomUUID5 } from "node:crypto";
+import { createHash as createHash7, randomUUID as randomUUID6 } from "node:crypto";
 import { lstat as lstat3, open as open4, readdir as readdir2, rename as rename2 } from "node:fs/promises";
 import { dirname as dirname4, resolve as resolve7 } from "node:path";
 var TERMINAL3 = new Set(["completed", "failed", "cancelled"]);
@@ -40334,7 +40477,7 @@ async function atomicWrite2(path, value, createOnly) {
   const current = await lstat3(path);
   if (current.isSymbolicLink() || !current.isFile())
     throw new Error(`Refused unsafe task destination: ${path}`);
-  const scratch = confinedPath(dirname4(path), `.${randomUUID5()}.tmp`);
+  const scratch = confinedPath(dirname4(path), `.${randomUUID6()}.tmp`);
   const handle = await open4(scratch, "wx", 384);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}
@@ -40946,7 +41089,7 @@ async function prepareBackgroundWorker(service, taskStore, monitors, activationT
       method: "tools/call",
       params: { name: toolName, arguments: params }
     };
-    task = await taskStore.createTask({ ttl: null, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS }, randomUUID6(), request, sessionId);
+    task = await taskStore.createTask({ ttl: null, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS }, randomUUID7(), request, sessionId);
     await taskStore.bindRun(task.taskId, run.id);
     callbackBound = await codexCallback?.register(task.taskId, params.callback_thread_id) ?? false;
     await taskStore.updateTaskStatus(task.taskId, "working", `GPT Worker ${run.id} is prepared for background activation.`);

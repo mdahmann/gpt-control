@@ -176,7 +176,7 @@ uses only those processes for worker sessions.
 
 Earlier experimental heads observed several independent native processes and
 replies, but those raw-driver runs did not prove the normal GPT-Control client
-or fail-closed cleanup. Version 0.5.0-alpha.5 therefore makes no current
+or fail-closed cleanup. Version 0.5.0-alpha.6 therefore makes no current
 installed-product live claim until the canonical runner passes at the exact
 installed commit after the account cool-down.
 
@@ -221,6 +221,15 @@ source head, and complete atomic offline cleanup proof. The installed launchers
 and bundles must resolve inside the install root and match the clean trusted
 exact-head build byte for byte.
 
+Version 0.5.0-alpha.6 also filters the complete acceptance environment through
+the production driver allowlist, requires strict typed active and offline pool
+receipts, binds the provider URL to its provider conversation ID, and checks
+launcher and bundle bytes before and after execution. Attestation securely
+enumerates every existing managed lane, not only the current configured size,
+and a retained launch receipt blocks both active and offline certification.
+Catalog refreshes and exact-chat attachment persist a durable ownership receipt
+before any `show` call when lifecycle-lock release is unproved.
+
 ## Alpha release gates
 
 Do not make this the default driver until the signed-in app proves:
@@ -236,6 +245,6 @@ Do not make this the default driver until the signed-in app proves:
 Historical raw-driver exercises covered model and project discovery, model
 switching, upload, reload continuation, cancellation, organization controls,
 and multiple renderers. Those observations are not acceptance evidence for
-0.5.0-alpha.5. The exact installed package must pass the canonical 1, 2, 3, and
+0.5.0-alpha.6. The exact installed package must pass the canonical 1, 2, 3, and
 6 staircase after low-volume account access is restored; the PR remains draft
 until then.

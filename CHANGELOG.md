@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0-alpha.6] - 2026-08-23
+
+- Filter installed acceptance children through the production environment
+  allowlists and compare both executed launchers plus all runtime bundles with
+  one clean trusted exact head before and after execution.
+- Require strict typed active/offline pool receipts, exact provider ID-to-URL
+  binding, and full installed runtime-bundle evidence.
+- Make attestation cover every existing managed lane after pool-size changes and
+  reject all retained startup receipts.
+- Retain the launch child through bounded signal cleanup and close the exact
+  signed browser if its endpoint appears after interruption.
+- Journal catalog and attached-chat ownership before any show call when
+  lifecycle-lock release is unproved.
+- Add direct request-handler regressions for send versus close, create versus
+  discovery, and safe retry from a failed lane to a healthy lane.
+
 ## [0.5.0-alpha.5] - 2026-08-23
 
 - Bind create cleanup to the complete caller-owned destination tuple and retain

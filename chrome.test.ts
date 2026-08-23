@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,6 +24,7 @@ import {
 	waitForOwnedChatReady,
 } from "./src/chatgpt";
 import { FakeChromeBridge, makeChromeService } from "./test_helpers";
+import { GptControlService } from "./src/service";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -568,6 +569,71 @@ describe("ChatGPT organization controls", () => {
 		expect(bridgeA.activeTabs()).toEqual([]);
 		expect(bridgeB.activeTabs()).toEqual([]);
 	});
+
+	test("journals release-unproved maintenance and attach sessions before show or failed close", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const base = makeChromeService(root, workspace, bridge);
+			const underlying = bridge.capabilities().browser!.driver;
+			let showCalls = 0;
+			let closeCalls = 0;
+			let returnWrongName = false;
+			const driver = new Proxy(underlying, {
+				get(target, property) {
+					if (property === "create") return async (...args: Parameters<typeof underlying.create>) => {
+						const created = await underlying.create(...args);
+						return {
+							...created,
+							...(returnWrongName ? { name: "foreign-session-name" } : {}),
+							desktopPoolLane: 2,
+							desktopPoolLeaseState: "release_unproved" as const,
+						};
+					};
+				if (property === "show") return async () => { showCalls += 1; throw new Error("show must not run"); };
+				if (property === "close") return async () => { closeCalls += 1; throw new Error("close blocked by retained lifecycle lease"); };
+				const value = Reflect.get(target, property);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const service = new GptControlService(bridge.exec, base.store, base.service.policy, {
+			resolveCapabilities: async () => ({
+				browser: { driver, probe: { ready: true, driver: driver.id, secureInput: true, protocolVersion: 2 }, source: "test" },
+			}),
+		});
+
+		await expect(service.listModels({ refresh: true })).rejects.toThrow("durable ownership receipt maint_");
+		expect(showCalls).toBe(0);
+		expect(closeCalls).toBe(1);
+		const maintenanceFiles = readdirSync(join(root, "maintenance"));
+		expect(maintenanceFiles).toHaveLength(1);
+		expect(JSON.parse(readFileSync(join(root, "maintenance", maintenanceFiles[0]), "utf8"))).toMatchObject({
+			kind: "model_catalog",
+			browserSessionName: expect.stringContaining("gpt-control:catalog:"),
+			desktopPoolLane: 2,
+			desktopPoolLeaseState: "release_unproved",
+			status: "retained",
+		});
+
+		await expect(service.attachConversation({ providerConversationId: "attach-chat-123" })).rejects.toThrow("durable ownership receipt conv_");
+		expect(showCalls).toBe(0);
+		expect(closeCalls).toBe(2);
+			const attached = (await base.store.listConversations()).find((conversation) => conversation.providerConversationId === "attach-chat-123");
+			expect(attached).toMatchObject({ desktopPoolLane: 2, desktopPoolLeaseState: "release_unproved" });
+
+			returnWrongName = true;
+			await expect(service.listProjects({ refresh: true })).rejects.toThrow("wrong ownership name");
+			expect(showCalls).toBe(0);
+			expect(closeCalls).toBe(3);
+			const retainedWrongName = readdirSync(join(root, "maintenance"))
+				.map((file) => JSON.parse(readFileSync(join(root, "maintenance", file), "utf8")))
+				.find((receipt) => receipt.kind === "project_catalog");
+			expect(retainedWrongName).toMatchObject({
+				browserSessionName: "foreign-session-name",
+				desktopPoolLeaseState: "release_unproved",
+				status: "retained",
+			});
+		});
 
 	test("pins, renames, moves, and archives one exact owned conversation with read-back", async () => {
 		const bridge = new FakeChromeBridge({ availableProjects: ["Zenbox", "Sequence"] });

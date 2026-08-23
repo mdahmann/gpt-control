@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, link, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -25,7 +25,7 @@ const DEFAULT_POOL_PORT = 9237;
 const DEFAULT_POOL_SIZE = 6;
 const INPUT_LIMIT = 16 * 1024 * 1024;
 
-interface PoolConfig {
+export interface PoolConfig {
 	root: string;
 	appPath: string;
 	startPort: number;
@@ -33,7 +33,7 @@ interface PoolConfig {
 	allowInteractiveBootstrap: boolean;
 }
 
-interface PoolLane {
+export interface PoolLane {
 	index: number;
 	endpoint: string;
 	port: number;
@@ -41,7 +41,46 @@ interface PoolLane {
 	stateRoot: string;
 }
 
-interface ActiveLaneStartup {
+export interface OfflineLaneAttestationReceipt {
+	lane: number;
+	port: number;
+	profileSha256: string;
+	sessionIds: string[];
+	state: "offline";
+}
+
+export interface ActiveLaneAttestationReceipt {
+	lane: number;
+	port: number;
+	profileSha256: string;
+	sessionIds: string[];
+	state: "active";
+	listenerPid: number;
+	browserInstanceId: string;
+	bundleId: string;
+	teamId: string;
+}
+
+interface PoolAttestationBase {
+	driver: typeof POOL_DRIVER_ID;
+	configuredSize: number;
+	managedLaneCount: number;
+	startPort: number;
+	poolRootSha256: string;
+	attestedAt: string;
+}
+
+export type PoolAttestationReceipt =
+	| (PoolAttestationBase & {
+		mode: "offline";
+		lanes: OfflineLaneAttestationReceipt[];
+	})
+	| (PoolAttestationBase & {
+		mode: "active";
+		lanes: Array<OfflineLaneAttestationReceipt | ActiveLaneAttestationReceipt>;
+	});
+
+export interface ActiveLaneStartup {
 	lane: PoolLane;
 	config: PoolConfig;
 	env: NodeJS.ProcessEnv;
@@ -49,6 +88,31 @@ interface ActiveLaneStartup {
 	identity: FileIdentity;
 	interrupted: boolean;
 	endpointObserved: boolean;
+	launchChild?: ChildProcess;
+	launchSettled?: Promise<void>;
+}
+
+export interface InterruptedStartupTestHooks {
+	endpointAlive?: (endpoint: string) => Promise<boolean>;
+	stopLane?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	finish?: (startup: ActiveLaneStartup) => Promise<void>;
+	retain?: (startup: ActiveLaneStartup, detail: string) => Promise<void>;
+	sleep?: (ms: number) => Promise<void>;
+	now?: () => number;
+	timeoutMs?: number;
+}
+
+export interface PoolRequestTestHooks {
+	laneSessionIds?: (lane: PoolLane) => Promise<string[]>;
+	endpointAlive?: (endpoint: string) => Promise<boolean>;
+	assertLanePrelaunchSafe?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	ensureLaneReady?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	proveLaneRetrySafe?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	verifyLaneHost?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	invokeLane?: (lane: PoolLane, config: PoolConfig, request: DesktopDriverRequest, env: NodeJS.ProcessEnv) => Promise<DesktopDriverEnvelope>;
+	stopLane?: (lane: PoolLane, config: PoolConfig, env: NodeJS.ProcessEnv) => Promise<void>;
+	assertLaneIsOffline?: (lane: PoolLane) => Promise<void>;
+	closeDesktopDriverSessionOffline?: (stateRoot: string, sessionId: string) => Promise<void>;
 }
 
 interface LaneLaunchReceipt {
@@ -135,16 +199,38 @@ export function poolLanes(config: PoolConfig): PoolLane[] {
 	});
 }
 
+export async function managedPoolLanes(config: PoolConfig): Promise<PoolLane[]> {
+	const configured = poolLanes(config);
+	const lanesRoot = join(config.root, "lanes");
+	await secureDirectory(lanesRoot);
+	const indices = new Set(configured.map(({ index }) => index));
+	for (const entry of await readdir(lanesRoot, { withFileTypes: true })) {
+		if (!/^\d{2}$/.test(entry.name)) continue;
+		if (entry.isSymbolicLink() || !entry.isDirectory()) {
+			throw new Error(`Refused unsafe ChatGPT Desktop managed lane entry ${entry.name}.`);
+		}
+		const index = Number(entry.name);
+		if (!Number.isSafeInteger(index) || index < 1 || index > 10) {
+			throw new Error(`ChatGPT Desktop managed lane ${entry.name} is outside the supported 1-10 range.`);
+		}
+		if (config.startPort + index - 1 > 65_535) {
+			throw new Error(`ChatGPT Desktop managed lane ${entry.name} exceeds the configured port range.`);
+		}
+		indices.add(index);
+	}
+	return [...indices].sort((left, right) => left - right).map((index) => {
+		const root = join(config.root, "lanes", String(index).padStart(2, "0"));
+		const port = config.startPort + index - 1;
+		return { index, endpoint: `http://127.0.0.1:${port}`, port, profileRoot: join(root, "profile"), stateRoot: join(root, "state") };
+	});
+}
+
 export function requestSessionId(request: DesktopDriverRequest): string | undefined {
 	if (request.action === "show" || request.action === "close" || request.action === "set_state") {
 		return typeof request.params.sessionId === "string" ? request.params.sessionId : undefined;
 	}
 	const session = request.params.session;
 	return isRecord(session) && typeof session.sessionId === "string" ? session.sessionId : undefined;
-}
-
-export function requestRequiresPoolAllocationLock(action: string): boolean {
-	return action === "attest_active" || action === "attest_offline";
 }
 
 export function poolAllowsCreateTarget(env: NodeJS.ProcessEnv): boolean {
@@ -159,6 +245,7 @@ export function addPoolLaneReceipt(response: DesktopDriverEnvelope, laneIndex: n
 export async function handleDesktopPoolRequest(
 	request: DesktopDriverRequest,
 	env: NodeJS.ProcessEnv = process.env,
+	hooks: PoolRequestTestHooks = {},
 ): Promise<DesktopDriverEnvelope> {
 	if (request.version !== 2 || typeof request.action !== "string" || !isRecord(request.params)) {
 		return failure("Invalid browser-driver protocol-v2 request.");
@@ -167,33 +254,35 @@ export async function handleDesktopPoolRequest(
 		const config = loadPoolConfig(env);
 		await secureDirectory(config.root);
 		if (request.action === "probe") return success(await passivePoolProbe(config));
-		const lanes = poolLanes(config);
+		const configuredLanes = poolLanes(config);
+		const lanes = await managedPoolLanes(config);
 		if (request.action === "attest_active" || request.action === "attest_offline") {
 			return success(await attestPoolState(config, lanes, env, request.action === "attest_offline"));
 		}
 		if (request.action === "create") {
-			return await createInReservedLane(request, config, lanes, env);
+			return await createInReservedLane(request, config, configuredLanes, env, hooks);
 		}
 		if (request.action === "find_conversations") {
-			return await findConversationsInRunningLane(lanes, config, request, env);
+			return await findConversationsInRunningLane(lanes, config, request, env, hooks);
 		}
 		const sessionId = requestSessionId(request);
 		if (!sessionId) throw new Error(`Desktop worker-pool action ${request.action} requires an exact session id.`);
-		const lane = await exactSessionLane(lanes, sessionId);
+		const readSessions = hooks.laneSessionIds ?? laneSessionIds;
+		const lane = await exactSessionLane(lanes, sessionId, readSessions);
 		return await withLaneLifecycleLock(lane, async () => {
-			const rebound = await exactSessionLane(lanes, sessionId);
+			const rebound = await exactSessionLane(lanes, sessionId, readSessions);
 			if (rebound.index !== lane.index) throw new Error(`Desktop worker-pool session ${sessionId} changed lanes before action ${request.action}.`);
 			if (request.action === "close") {
-				const bound = await laneSessionIds(lane);
+				const bound = await readSessions(lane);
 				if (bound.length !== 1 || bound[0] !== sessionId) {
 					throw new Error(`ChatGPT Desktop lane ${lane.index} cannot close while another durable session is present.`);
 				}
-				await stopLane(lane, config, env);
-				await closeDesktopDriverSessionOffline(lane.stateRoot, sessionId);
+				await (hooks.stopLane ?? stopLane)(lane, config, env);
+				await (hooks.closeDesktopDriverSessionOffline ?? closeDesktopDriverSessionOffline)(lane.stateRoot, sessionId);
 				return success({});
 			}
-			await ensureLaneReady(lane, config, env);
-			const response = await invokeLane(lane, config, request, env);
+			await (hooks.ensureLaneReady ?? ensureLaneReady)(lane, config, env);
+			const response = await (hooks.invokeLane ?? invokeLane)(lane, config, request, env);
 			return addPoolLaneReceipt(response, lane.index);
 		});
 	} catch (error) {
@@ -206,6 +295,7 @@ async function createInReservedLane(
 	config: PoolConfig,
 	lanes: PoolLane[],
 	env: NodeJS.ProcessEnv,
+	hooks: PoolRequestTestHooks,
 ): Promise<DesktopDriverEnvelope> {
 	const excluded = new Set<number>();
 	const blockers: string[] = [];
@@ -220,7 +310,7 @@ async function createInReservedLane(
 			released = true;
 		};
 		try {
-			await assertLanePrelaunchSafe(lane, config, env);
+			await (hooks.assertLanePrelaunchSafe ?? assertLanePrelaunchSafe)(lane, config, env);
 		} catch (error) {
 			await release();
 			excluded.add(lane.index);
@@ -228,10 +318,10 @@ async function createInReservedLane(
 			continue;
 		}
 		try {
-			await ensureLaneReady(lane, config, env);
+			await (hooks.ensureLaneReady ?? ensureLaneReady)(lane, config, env);
 		} catch (error) {
 			try {
-				await proveLaneRetrySafe(lane, config, env);
+				await (hooks.proveLaneRetrySafe ?? proveLaneRetrySafe)(lane, config, env);
 			} catch (cleanupError) {
 				await release();
 				throw new Error(`ChatGPT Desktop lane ${lane.index} readiness failed and retry cleanup was not proved: ${errorMessage(error)}; ${errorMessage(cleanupError)}`);
@@ -242,13 +332,13 @@ async function createInReservedLane(
 			continue;
 		}
 		try {
-			const response = await invokeLane(lane, config, request, env);
+			const response = await (hooks.invokeLane ?? invokeLane)(lane, config, request, env);
 			if (!response.ok) {
-				const retainedSessionIds = await laneSessionIds(lane);
+				const retainedSessionIds = await (hooks.laneSessionIds ?? laneSessionIds)(lane);
 				try {
-					await stopLane(lane, config, env);
+					await (hooks.stopLane ?? stopLane)(lane, config, env);
 					for (const retainedSessionId of retainedSessionIds) {
-						await closeDesktopDriverSessionOffline(lane.stateRoot, retainedSessionId);
+						await (hooks.closeDesktopDriverSessionOffline ?? closeDesktopDriverSessionOffline)(lane.stateRoot, retainedSessionId);
 					}
 				} catch (cleanupError) {
 					return failure(`${response.error ?? "ChatGPT Desktop create failed."} Cleanup failed: ${errorMessage(cleanupError)}${retainedSessionIds.length > 0 ? ` Retained session IDs: ${retainedSessionIds.join(", ")}.` : ""}`);
@@ -256,13 +346,13 @@ async function createInReservedLane(
 			}
 			return await completeReservedLaneResponse(response, lane.index, release);
 		} catch (error) {
-			const retainedSessionIds = await laneSessionIds(lane).catch(() => []);
+			const retainedSessionIds = await (hooks.laneSessionIds ?? laneSessionIds)(lane).catch(() => []);
 			let cleanupError: unknown;
 			try {
-				if (await endpointAlive(lane.endpoint)) await stopLane(lane, config, env);
-				else await assertLaneIsOffline(lane);
+				if (await (hooks.endpointAlive ?? endpointAlive)(lane.endpoint)) await (hooks.stopLane ?? stopLane)(lane, config, env);
+				else await (hooks.assertLaneIsOffline ?? assertLaneIsOffline)(lane);
 				for (const retainedSessionId of retainedSessionIds) {
-					await closeDesktopDriverSessionOffline(lane.stateRoot, retainedSessionId);
+					await (hooks.closeDesktopDriverSessionOffline ?? closeDesktopDriverSessionOffline)(lane.stateRoot, retainedSessionId);
 				}
 			} catch (caught) {
 				cleanupError = caught;
@@ -326,15 +416,23 @@ async function attestPoolState(
 	lanes: PoolLane[],
 	env: NodeJS.ProcessEnv,
 	requireOffline: boolean,
-): Promise<Record<string, unknown>> {
+): Promise<PoolAttestationReceipt> {
 	return withPoolAllocationLock(config.root, async () => withAllLaneLifecycleLocks(lanes, async () => {
-		const receipts: Array<Record<string, unknown>> = [];
-		for (const lane of lanes) {
-			await secureDirectory(lane.profileRoot);
-			await secureDirectory(lane.stateRoot);
-			const sessionIds = await laneSessionIds(lane);
-			const online = await endpointAlive(lane.endpoint);
-			if (requireOffline) {
+		const common = {
+			driver: POOL_DRIVER_ID,
+			configuredSize: config.size,
+			managedLaneCount: lanes.length,
+			startPort: config.startPort,
+			poolRootSha256: sha256(config.root),
+			attestedAt: new Date().toISOString(),
+		} satisfies PoolAttestationBase;
+		if (requireOffline) {
+			const receipts: OfflineLaneAttestationReceipt[] = [];
+			for (const lane of lanes) {
+				await secureDirectory(lane.profileRoot);
+				await secureDirectory(lane.stateRoot);
+				await assertNoRetainedLaunch(lane);
+				const sessionIds = await laneSessionIds(lane);
 				if (sessionIds.length > 0) {
 					throw new Error(`ChatGPT Desktop lane ${lane.index} retained durable sessions: ${sessionIds.join(", ")}.`);
 				}
@@ -346,8 +444,17 @@ async function attestPoolState(
 					sessionIds: [],
 					state: "offline",
 				});
-				continue;
 			}
+			return { ...common, mode: "offline", lanes: receipts };
+		}
+
+		const receipts: Array<OfflineLaneAttestationReceipt | ActiveLaneAttestationReceipt> = [];
+		for (const lane of lanes) {
+			await secureDirectory(lane.profileRoot);
+			await secureDirectory(lane.stateRoot);
+			await assertNoRetainedLaunch(lane);
+			const sessionIds = await laneSessionIds(lane);
+			const online = await endpointAlive(lane.endpoint);
 			if (sessionIds.length > 0 && !online) {
 				throw new Error(`ChatGPT Desktop lane ${lane.index} has durable sessions without an exact live endpoint.`);
 			}
@@ -374,13 +481,7 @@ async function attestPoolState(
 				teamId: host.teamId,
 			});
 		}
-		return {
-			driver: POOL_DRIVER_ID,
-			mode: requireOffline ? "offline" : "active",
-			poolRootSha256: sha256(config.root),
-			lanes: receipts,
-			attestedAt: new Date().toISOString(),
-		};
+		return { ...common, mode: "active", lanes: receipts };
 	}));
 }
 
@@ -543,10 +644,14 @@ async function writeAllocationCursor(root: string, nextLane: number): Promise<vo
 	}
 }
 
-async function exactSessionLane(lanes: PoolLane[], sessionId: string): Promise<PoolLane> {
+async function exactSessionLane(
+	lanes: PoolLane[],
+	sessionId: string,
+	readSessions: (lane: PoolLane) => Promise<string[]> = laneSessionIds,
+): Promise<PoolLane> {
 	const matches: PoolLane[] = [];
 	for (const lane of lanes) {
-		if ((await laneSessionIds(lane)).includes(sessionId)) matches.push(lane);
+		if ((await readSessions(lane)).includes(sessionId)) matches.push(lane);
 	}
 	if (matches.length !== 1) {
 		throw new Error(matches.length === 0
@@ -575,10 +680,11 @@ async function findConversationsInRunningLane(
 	config: PoolConfig,
 	request: DesktopDriverRequest,
 	env: NodeJS.ProcessEnv,
+	hooks: PoolRequestTestHooks,
 ): Promise<DesktopDriverEnvelope> {
 	const blockers: string[] = [];
 	for (const lane of lanes) {
-		if (!await endpointAlive(lane.endpoint)) continue;
+		if (!await (hooks.endpointAlive ?? endpointAlive)(lane.endpoint)) continue;
 		await secureDirectory(dirname(lane.profileRoot));
 		let lease: PoolLockLease;
 		try {
@@ -592,9 +698,10 @@ async function findConversationsInRunningLane(
 			throw error;
 		}
 		try {
-			if (!await endpointAlive(lane.endpoint)) continue;
-			await laneEnvironment(lane, config, env).verifyHost();
-			return await invokeLane(lane, config, request, env);
+			if (!await (hooks.endpointAlive ?? endpointAlive)(lane.endpoint)) continue;
+			if (hooks.verifyLaneHost) await hooks.verifyLaneHost(lane, config, env);
+			else await laneEnvironment(lane, config, env).verifyHost();
+			return await (hooks.invokeLane ?? invokeLane)(lane, config, request, env);
 		} catch (error) {
 			blockers.push(`lane ${lane.index}: ${errorMessage(error)}`);
 		} finally {
@@ -635,12 +742,15 @@ async function ensureLaneReady(lane: PoolLane, config: PoolConfig, env: NodeJS.P
 	const frontmostPid = await currentFrontmostPid();
 	const startup = await beginLaneStartup(lane, config, env);
 	try {
-		await execFileAsync("/usr/bin/open", [
+		const launch = startLaneApp([
 			...(!interactiveBootstrap ? ["-g", "-j"] : []), "-n", config.appPath, "--args",
 			`--user-data-dir=${lane.profileRoot}`,
 			"--remote-debugging-address=127.0.0.1",
 			`--remote-debugging-port=${lane.port}`,
-		], { timeout: 15_000 });
+		]);
+		startup.launchChild = launch.child;
+		startup.launchSettled = launch.completed;
+		await launch.completed;
 	} catch (error) {
 		if (startup.interrupted) throw error;
 		try {
@@ -689,6 +799,26 @@ async function ensureLaneReady(lane: PoolLane, config: PoolConfig, env: NodeJS.P
 	throw new Error(!bootstrapped && !interactiveBootstrap
 		? `ChatGPT Desktop lane ${lane.index} could not bootstrap in the background: ${startupError}. Set GPT_CONTROL_DRIVER_DESKTOP_ALLOW_INTERACTIVE_BOOTSTRAP=1 for an authorized one-time visible setup run.`
 		: `ChatGPT Desktop lane ${lane.index} did not become ready: ${startupError}`);
+}
+
+function startLaneApp(args: string[]): { child: ChildProcess; completed: Promise<void> } {
+	const child = spawn("/usr/bin/open", args, { stdio: "ignore" });
+	const completed = new Promise<void>((resolveCompleted, rejectCompleted) => {
+		const timer = setTimeout(() => {
+			child.kill("SIGTERM");
+			rejectCompleted(new Error("ChatGPT Desktop launch command exceeded its 15-second bound."));
+		}, 15_000);
+		child.once("error", (error) => {
+			clearTimeout(timer);
+			rejectCompleted(error);
+		});
+		child.once("close", (code, signal) => {
+			clearTimeout(timer);
+			if (code === 0) resolveCompleted();
+			else rejectCompleted(new Error(`ChatGPT Desktop launch command exited ${code ?? signal ?? "unknown"}.`));
+		});
+	});
+	return { child, completed };
 }
 
 function laneLaunchReceiptPath(lane: PoolLane): string {
@@ -819,18 +949,37 @@ async function readLaneLaunchReceipt(
 	return { value: value as LaneLaunchReceipt, identity };
 }
 
-async function cleanupInterruptedLaneStartup(startup: ActiveLaneStartup): Promise<void> {
+export async function cleanupInterruptedLaneStartup(
+	startup: ActiveLaneStartup,
+	hooks: InterruptedStartupTestHooks = {},
+): Promise<void> {
 	startup.interrupted = true;
+	const checkEndpoint = hooks.endpointAlive ?? endpointAlive;
+	const stop = hooks.stopLane ?? stopLane;
+	const finish = hooks.finish ?? finishLaneStartup;
+	const retain = hooks.retain ?? retainInterruptedLaneStartup;
+	const wait = hooks.sleep ?? sleep;
+	const now = hooks.now ?? Date.now;
+	const deadline = now() + (hooks.timeoutMs ?? 15_000);
 	try {
-		if (await endpointAlive(startup.lane.endpoint)) startup.endpointObserved = true;
+		while (!startup.endpointObserved && now() < deadline) {
+			if (await checkEndpoint(startup.lane.endpoint)) {
+				startup.endpointObserved = true;
+				break;
+			}
+			await wait(100);
+		}
 		if (!startup.endpointObserved) {
-			await retainInterruptedLaneStartup(startup, "The exact CDP endpoint was not observed before interruption.");
+			if (startup.launchChild && startup.launchChild.exitCode === null && startup.launchChild.signalCode === null) {
+				startup.launchChild.kill("SIGTERM");
+			}
+			await retain(startup, "The exact CDP endpoint was not observed during the bounded interruption cleanup window.");
 			return;
 		}
-		await stopLane(startup.lane, startup.config, startup.env);
-		await finishLaneStartup(startup);
+		await stop(startup.lane, startup.config, startup.env);
+		await finish(startup);
 	} catch (error) {
-		await retainInterruptedLaneStartup(startup, errorMessage(error)).catch(() => undefined);
+		await retain(startup, errorMessage(error)).catch(() => undefined);
 		throw error;
 	}
 }
@@ -1331,7 +1480,8 @@ export async function runDesktopPoolCli(): Promise<void> {
 		processSignals.off("SIGINT", terminate);
 	}
 	if (terminating) return;
-	if (request.action === "probe" && response.ok && isRecord(response.result)) {
+	if ((request.action === "probe" || request.action === "attest_active" || request.action === "attest_offline")
+		&& response.ok && isRecord(response.result)) {
 		const bundlePath = fileURLToPath(import.meta.url);
 		response = {
 			...response,

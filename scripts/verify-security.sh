@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 umask 077
 
-LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.5-verification}
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.6-verification}
 LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then

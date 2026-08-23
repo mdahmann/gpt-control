@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.5.0-alpha.5
+version: 0.5.0-alpha.6
 ---
 
 # GPT-Control

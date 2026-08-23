@@ -42,6 +42,7 @@ import {
 import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
 import { probeBridge, resolveBridgeLauncher, splitCommandLine, type Launcher } from "./transport";
 import type { Exec } from "./types";
+import { sanitizeBrowserDriverEnv } from "../scripts/driver-env.mjs";
 
 export const BROWSER_DRIVER_PROTOCOL_VERSION = 2;
 export type DriverPageId = string | number;
@@ -1058,7 +1059,7 @@ async function invokeJsonCommand(
 			child = spawn(command, args, {
 				stdio: ["pipe", "pipe", "pipe"],
 				signal,
-				env: sanitizedDriverEnv(process.env),
+				env: sanitizeBrowserDriverEnv(process.env),
 			});
 		} catch (error) {
 			reject(error);
@@ -1100,16 +1101,6 @@ async function invokeJsonCommand(
 		}));
 		child.stdin!.end(`${request}\n`);
 	});
-}
-
-function sanitizedDriverEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	const safe = new Set(["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
-	const output: NodeJS.ProcessEnv = {};
-	for (const [key, value] of Object.entries(env)) {
-		if (value === undefined) continue;
-		if (safe.has(key) || key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_")) output[key] = value;
-	}
-	return output;
 }
 
 function offlineProbe(driver: string, reason: string): DriverProbe {
