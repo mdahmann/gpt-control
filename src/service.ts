@@ -17,6 +17,7 @@ import {
 	type ExpectedDriverSession,
 	type ChatGptConversationCatalog,
 	type ChatGptConversationFindRequest,
+	type DriverSession,
 	type WebChatDriver,
 } from "./browser-driver";
 import {
@@ -1896,13 +1897,27 @@ export class GptControlService {
 			if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
 				throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
 			}
+			const lanes = [conversation.desktopPoolLane, run.receipt.desktopPoolLane, owned.session.desktopPoolLane]
+				.filter((lane): lane is number => lane !== undefined);
+			if (new Set(lanes).size > 1) throw new Error("Desktop-pool lane identity conflicts across durable recovery receipts.");
+			const desktopPoolLane = lanes[0];
+			if (conversation.desktopPoolLane !== desktopPoolLane || conversation.desktopPoolLeaseState !== undefined) {
+				conversation = await this.store.updateConversation(conversation.id, {
+					desktopPoolLane,
+					desktopPoolLeaseState: undefined,
+				});
+			}
 			if (run.receipt.browserDriverId !== owned.driver.id
-				|| run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+				|| run.receipt.localBrowserSessionId !== owned.expected.sessionId
+				|| run.receipt.desktopPoolLane !== desktopPoolLane
+				|| run.receipt.desktopPoolLeaseState !== undefined) {
 				run = await this.store.updateRun(run.id, {
 					receipt: {
 						...run.receipt,
 						browserDriverId: owned.driver.id,
 						localBrowserSessionId: owned.expected.sessionId,
+						desktopPoolLane,
+						desktopPoolLeaseState: undefined,
 					},
 				});
 			}
@@ -1944,6 +1959,7 @@ export class GptControlService {
 				browserSessionId: session.sessionId,
 				browserPageId: session.pageId,
 				desktopPoolLane: session.desktopPoolLane,
+				desktopPoolLeaseState: session.desktopPoolLeaseState,
 			});
 			persisted = true;
 			run = await this.store.updateRun(run.id, {
@@ -1952,8 +1968,12 @@ export class GptControlService {
 					browserDriverId: available.driver.id,
 					localBrowserSessionId: session.sessionId,
 					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: session.desktopPoolLeaseState,
 				},
 			});
+			if (session.desktopPoolLeaseState === "release_unproved") {
+				throw new Error("Desktop session creation succeeded, but lifecycle-lock release was not proved; durable ownership was retained for explicit recovery.");
+			}
 			if (TERMINAL.has(run.status)) {
 				await assertExactDriverSession(available.driver, expected);
 				await available.driver.close(session.sessionId);
@@ -1972,6 +1992,7 @@ export class GptControlService {
 						browserSessionId: session.sessionId,
 						browserPageId: session.pageId,
 						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: session.desktopPoolLeaseState,
 					});
 					await this.store.updateRun(run.id, {
 						receipt: {
@@ -1979,6 +2000,7 @@ export class GptControlService {
 							browserDriverId: available.driver.id,
 							localBrowserSessionId: session.sessionId,
 							desktopPoolLane: session.desktopPoolLane,
+							desktopPoolLeaseState: session.desktopPoolLeaseState,
 						},
 					});
 					throw new Error(
@@ -2008,7 +2030,7 @@ export class GptControlService {
 
 	private async resolveOwnedDriver(
 		conversation: ConversationRecord,
-	): Promise<{ driver: WebChatDriver; expected: ExpectedDriverSession }> {
+	): Promise<{ driver: WebChatDriver; expected: ExpectedDriverSession; session: DriverSession }> {
 		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
 		const available = capabilities.browser;
 		if (!available) throw new Error("The configured secure browser driver is unavailable. No fallback was launched.");
@@ -2021,8 +2043,8 @@ export class GptControlService {
 			pageId: required(conversation.browserPageId, "browser page id"),
 			name: required(conversation.browserSessionName, "browser session name"),
 		};
-		await assertExactDriverSession(available.driver, expected);
-		return { driver: available.driver, expected };
+		const session = await assertExactDriverSession(available.driver, expected);
+		return { driver: available.driver, expected, session };
 	}
 
 	private async persistConversationIdentity(

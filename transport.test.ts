@@ -83,7 +83,7 @@ process.stdin.on("end", () => {
   let result = {};
   if (request.action === "probe") result = {
     ready: true, driver: "fixture/v2", secureInput: true, protocolVersion: 2,
-    driverVersion: "0.5.0-alpha.4", stateWriterVersion: 2,
+    driverVersion: "0.5.0-alpha.5", stateWriterVersion: 2,
     host: { appPath: "/Applications/ChatGPT.app", bundleId: "com.openai.codex", teamId: "2DC432GLL2", listenerPid: 123, endpoint: "http://127.0.0.1:9236", browserVersion: "Chrome/151", browserInstanceId: "/devtools/browser/12345678" },
     runtimeExecutable: "/usr/bin/node", runtimeBundlePath: "/plugin/dist/driver.js", runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   };
@@ -101,7 +101,7 @@ process.stdin.on("end", () => {
 		process.env.GPT_CONTROL_DRIVER_LOG = log;
 		try {
 			const external = new ExternalCommandBrowserDriver(script);
-			expect(await external.probe()).toMatchObject({ ready: true, driver: "fixture/v2", driverVersion: "0.5.0-alpha.4", stateWriterVersion: 2, runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+			expect(await external.probe()).toMatchObject({ ready: true, driver: "fixture/v2", driverVersion: "0.5.0-alpha.5", stateWriterVersion: 2, runtimeBundleSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
 			const created = await external.create("gpt-control:chat:x", "https://chatgpt.com");
 			expect(created.desktopPoolLane).toBe(1);
 			await external.upload(created, ["/private/snapshot/a.ts"]);
@@ -142,7 +142,9 @@ process.stdin.on("end", () => {
   appendFileSync(process.env.GPT_CONTROL_DRIVER_LOG, request.action + "\\n");
   const result = request.action === "create"
     ? { sessionId: "leaked-unless-closed", pageId: "p1", name: request.params.name, url: request.params.url, desktopPoolLane: 11 }
-    : {};
+    : request.action === "show"
+      ? { sessionId: "leaked-unless-closed", pageId: "p1", name: "gpt-control:chat:x", url: "https://chatgpt.com" }
+      : {};
   console.log(JSON.stringify({ version: 2, ok: true, result }));
 });
 `);
@@ -151,7 +153,68 @@ process.stdin.on("end", () => {
 		process.env.GPT_CONTROL_DRIVER_LOG = log;
 		try {
 			await expect(new ExternalCommandBrowserDriver(script).create("gpt-control:chat:x", "https://chatgpt.com")).rejects.toThrow();
-			expect((await Bun.file(log).text()).trim().split("\n")).toEqual(["create", "close"]);
+			expect((await Bun.file(log).text()).trim().split("\n")).toEqual(["create", "show", "close"]);
+		} finally {
+			if (previous === undefined) delete process.env.GPT_CONTROL_DRIVER_LOG;
+			else process.env.GPT_CONTROL_DRIVER_LOG = previous;
+		}
+	});
+
+	test("does not compensate an existing session id when show disproves the create tuple", async () => {
+		const root = scratch();
+		const script = join(root, "existing-id.js");
+		const log = join(root, "actions.jsonl");
+		writeFileSync(script, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  const request = JSON.parse(raw);
+  appendFileSync(process.env.GPT_CONTROL_DRIVER_LOG, request.action + "\\n");
+  const result = request.action === "create"
+    ? { sessionId: "existing-session", pageId: "existing-page", name: request.params.name, url: request.params.url, desktopPoolLane: 11 }
+    : { sessionId: "existing-session", pageId: "existing-page", name: "gpt-control:foreign:existing", url: "https://chatgpt.com" };
+  console.log(JSON.stringify({ version: 2, ok: true, result }));
+});
+`);
+		chmodSync(script, 0o755);
+		const previous = process.env.GPT_CONTROL_DRIVER_LOG;
+		process.env.GPT_CONTROL_DRIVER_LOG = log;
+		try {
+			await expect(new ExternalCommandBrowserDriver(script).create("gpt-control:chat:new", "https://chatgpt.com")).rejects.toThrow("cleanup was not proved");
+			expect((await Bun.file(log).text()).trim().split("\n")).toEqual(["create", "show"]);
+		} finally {
+			if (previous === undefined) delete process.env.GPT_CONTROL_DRIVER_LOG;
+			else process.env.GPT_CONTROL_DRIVER_LOG = previous;
+		}
+	});
+
+	test("does not compensate a malformed create with a mismatched ownership tuple", async () => {
+		const root = scratch();
+		const script = join(root, "mismatched-create.js");
+		const log = join(root, "actions.jsonl");
+		writeFileSync(script, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  const request = JSON.parse(raw);
+  appendFileSync(process.env.GPT_CONTROL_DRIVER_LOG, request.action + "\\n");
+  console.log(JSON.stringify({ version: 2, ok: true, result: {
+    sessionId: "existing-session", pageId: "existing-page",
+    name: "gpt-control:foreign:existing", url: request.params.url,
+    desktopPoolLane: 11,
+  } }));
+});
+`);
+		chmodSync(script, 0o755);
+		const previous = process.env.GPT_CONTROL_DRIVER_LOG;
+		process.env.GPT_CONTROL_DRIVER_LOG = log;
+		try {
+			await expect(new ExternalCommandBrowserDriver(script).create("gpt-control:chat:new", "https://chatgpt.com")).rejects.toThrow();
+			expect((await Bun.file(log).text()).trim().split("\n")).toEqual(["create"]);
 		} finally {
 			if (previous === undefined) delete process.env.GPT_CONTROL_DRIVER_LOG;
 			else process.env.GPT_CONTROL_DRIVER_LOG = previous;

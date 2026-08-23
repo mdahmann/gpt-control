@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.4";
+var PACKAGE_VERSION = "0.5.0-alpha.5";
 
 // src/service.ts
 import { createHash as createHash6 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.4";
+var PACKAGE_VERSION2 = "0.5.0-alpha.5";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -35826,10 +35826,14 @@ var SessionSchema = exports_external.object({
   pageId: exports_external.union([exports_external.string(), exports_external.number()]),
   name: exports_external.string(),
   url: exports_external.string(),
-  desktopPoolLane: exports_external.number().int().min(1).max(10).optional()
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional()
 }).strict();
 var ProvisionalSessionSchema = exports_external.object({
-  sessionId: exports_external.string().min(1).max(512)
+  sessionId: exports_external.string().min(1).max(512),
+  pageId: exports_external.union([exports_external.string(), exports_external.number()]),
+  name: exports_external.string(),
+  url: exports_external.string()
 }).passthrough();
 var SnapshotSchema = exports_external.object({
   count: exports_external.number().int().nonnegative(),
@@ -35935,6 +35939,15 @@ var EnvelopeSchema = exports_external.object({
   result: exports_external.unknown().optional(),
   error: exports_external.string().optional()
 }).strict();
+function sameCreateDestination(observed, requested) {
+  try {
+    const left = new URL(observed);
+    const right = new URL(requested);
+    return left.origin === right.origin && left.pathname.replace(/\/$/, "") === right.pathname.replace(/\/$/, "") && left.search === right.search && !left.hash && !right.hash;
+  } catch {
+    return false;
+  }
+}
 
 class ExternalCommandBrowserDriver {
   command;
@@ -35966,9 +35979,15 @@ class ExternalCommandBrowserDriver {
     if (parsed.success)
       return parsed.data;
     const provisional = ProvisionalSessionSchema.safeParse(raw);
-    if (!provisional.success)
+    if (!provisional.success || provisional.data.name !== name || !sameCreateDestination(provisional.data.url, url2))
       throw parsed.error;
     try {
+      const rebound = ProvisionalSessionSchema.safeParse(await this.call("show", {
+        sessionId: provisional.data.sessionId
+      }));
+      if (!rebound.success || rebound.data.sessionId !== provisional.data.sessionId || rebound.data.pageId !== provisional.data.pageId || rebound.data.name !== name || !sameCreateDestination(rebound.data.url, url2)) {
+        throw new Error("Malformed create receipt did not rebind to the complete caller-owned destination tuple.");
+      }
       await this.close(provisional.data.sessionId);
     } catch (cleanupError) {
       throw new Error(`Browser driver create receipt failed validation and cleanup was not proved for session ${provisional.data.sessionId}: ${errorMessage(cleanupError)}`, { cause: parsed.error });
@@ -36306,6 +36325,7 @@ var ReceiptSchema = exports_external.object({
   providerRunId: exports_external.string().optional(),
   localBrowserSessionId: exports_external.string().optional(),
   desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional(),
   localAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   recoveryAttempts: exports_external.array(RecoverySchema).optional()
 });
@@ -36320,6 +36340,7 @@ var ConversationSchema = exports_external.object({
   browserSessionName: exports_external.string().optional(),
   browserPageId: exports_external.union([exports_external.string(), exports_external.number()]).optional(),
   desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional(),
   browserAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   providerPinned: exports_external.boolean().optional(),
   providerTitle: exports_external.string().optional(),
@@ -39082,12 +39103,24 @@ class GptControlService {
       if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
         throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
       }
-      if (run.receipt.browserDriverId !== owned.driver.id || run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+      const lanes = [conversation.desktopPoolLane, run.receipt.desktopPoolLane, owned.session.desktopPoolLane].filter((lane) => lane !== undefined);
+      if (new Set(lanes).size > 1)
+        throw new Error("Desktop-pool lane identity conflicts across durable recovery receipts.");
+      const desktopPoolLane = lanes[0];
+      if (conversation.desktopPoolLane !== desktopPoolLane || conversation.desktopPoolLeaseState !== undefined) {
+        conversation = await this.store.updateConversation(conversation.id, {
+          desktopPoolLane,
+          desktopPoolLeaseState: undefined
+        });
+      }
+      if (run.receipt.browserDriverId !== owned.driver.id || run.receipt.localBrowserSessionId !== owned.expected.sessionId || run.receipt.desktopPoolLane !== desktopPoolLane || run.receipt.desktopPoolLeaseState !== undefined) {
         run = await this.store.updateRun(run.id, {
           receipt: {
             ...run.receipt,
             browserDriverId: owned.driver.id,
-            localBrowserSessionId: owned.expected.sessionId
+            localBrowserSessionId: owned.expected.sessionId,
+            desktopPoolLane,
+            desktopPoolLeaseState: undefined
           }
         });
       }
@@ -39129,7 +39162,8 @@ class GptControlService {
       conversation = await this.store.updateConversation(conversation.id, {
         browserSessionId: session.sessionId,
         browserPageId: session.pageId,
-        desktopPoolLane: session.desktopPoolLane
+        desktopPoolLane: session.desktopPoolLane,
+        desktopPoolLeaseState: session.desktopPoolLeaseState
       });
       persisted = true;
       run = await this.store.updateRun(run.id, {
@@ -39137,9 +39171,13 @@ class GptControlService {
           ...run.receipt,
           browserDriverId: available.driver.id,
           localBrowserSessionId: session.sessionId,
-          desktopPoolLane: session.desktopPoolLane
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: session.desktopPoolLeaseState
         }
       });
+      if (session.desktopPoolLeaseState === "release_unproved") {
+        throw new Error("Desktop session creation succeeded, but lifecycle-lock release was not proved; durable ownership was retained for explicit recovery.");
+      }
       if (TERMINAL2.has(run.status)) {
         await assertExactDriverSession(available.driver, expected);
         await available.driver.close(session.sessionId);
@@ -39158,14 +39196,16 @@ class GptControlService {
           conversation = await this.store.updateConversation(conversation.id, {
             browserSessionId: session.sessionId,
             browserPageId: session.pageId,
-            desktopPoolLane: session.desktopPoolLane
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: session.desktopPoolLeaseState
           });
           await this.store.updateRun(run.id, {
             receipt: {
               ...run.receipt,
               browserDriverId: available.driver.id,
               localBrowserSessionId: session.sessionId,
-              desktopPoolLane: session.desktopPoolLane
+              desktopPoolLane: session.desktopPoolLane,
+              desktopPoolLeaseState: session.desktopPoolLeaseState
             }
           });
           throw new Error(`${errorMessage2(error51)} Browser cleanup was not proved; durable ownership was retained: ${errorMessage2(cleanupError)}`);
@@ -39204,8 +39244,8 @@ class GptControlService {
       pageId: required2(conversation.browserPageId, "browser page id"),
       name: required2(conversation.browserSessionName, "browser session name")
     };
-    await assertExactDriverSession(available.driver, expected);
-    return { driver: available.driver, expected };
+    const session = await assertExactDriverSession(available.driver, expected);
+    return { driver: available.driver, expected, session };
   }
   async persistConversationIdentity(conversationId, identity, assistantTurnCount) {
     const canonical = providerConversationIdentity(identity.url);

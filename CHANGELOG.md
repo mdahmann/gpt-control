@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.5.0-alpha.5] - 2026-08-23
+
+- Bind create cleanup to the complete caller-owned destination tuple and retain
+  successful session identity when lifecycle-lock release is not proved.
+- Serialize every exact lane action, including Send, close, and discovery,
+  through one fenced lifecycle lease. Read-only discovery no longer launches a
+  cold native worker.
+- Replace numeric-PID shutdown signals with exact verified CDP `Browser.close`
+  and fail closed when native-process cleanup cannot be proved.
+- Require explicit renderer-creation authority for the pool and retry another
+  healthy lane only after the failed lane is proved session-free and offline.
+- Move cleanup attestation behind the pool lock API and require distinct lane,
+  session, process, profile, port, browser, provider, model, and attachment
+  evidence from the installed-product acceptance runner.
+- Verify that installed launchers and runtime bundles stay inside the package,
+  match a clean trusted exact head, and report the exact alpha version.
+
 ## [0.5.0-alpha.4] - 2026-08-23
 
 - Accept and durably record exact native desktop-pool lane receipts.

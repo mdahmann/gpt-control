@@ -129,6 +129,32 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		};
 	}
 
+	async closeBrowser(browserInstanceId: string): Promise<void> {
+		await this.browserCommand(browserInstanceId, "Browser.close", {});
+	}
+
+	private async browserCommand(browserInstanceId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+		const version = await this.fetchJson("/json/version");
+		if (!isRecord(version)) throw new Error("ChatGPT Desktop returned an invalid CDP browser descriptor.");
+		const browserSocket = new URL(requiredString(version.webSocketDebuggerUrl, "CDP browser WebSocket URL"));
+		assertLoopbackWebSocket(browserSocket, this.endpoint.port);
+		if (browserSocket.pathname !== browserInstanceId) {
+			throw new Error("ChatGPT Desktop browser instance changed before process cleanup.");
+		}
+		try {
+			return await cdpRequest(browserSocket.toString(), method, params);
+		} catch (error) {
+			// Some Electron builds close the socket before returning the Browser.close
+			// receipt. Accept that boundary only when the exact endpoint is already gone.
+			try {
+				await this.fetchJson("/json/version");
+			} catch {
+				return undefined;
+			}
+			throw error;
+		}
+	}
+
 	async listTargets(): Promise<DesktopCdpTarget[]> {
 		const targets: DesktopCdpTarget[] = [];
 		for (const target of await this.targetDescriptors()) {

@@ -306,7 +306,7 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
 
-	test("restart repairs a persisted browser session missing from the run receipt", async () => {
+	test("restart repairs persisted browser-session and desktop-lane state missing from the run receipt", async () => {
 		const root = scratch();
 		const workspace = scratch();
 		const bridge = new FakeChromeBridge();
@@ -323,8 +323,11 @@ describe("bounded GPT Worker scheduler", () => {
 		await first.service.store.updateConversation(prepared.conversation.id, {
 			browserSessionId: session.sessionId,
 			browserPageId: session.pageId,
+			desktopPoolLane: 3,
+			desktopPoolLeaseState: "release_unproved",
 		});
 		expect((await first.service.getRun(prepared.run.id)).receipt.localBrowserSessionId).toBeUndefined();
+		expect((await first.service.getRun(prepared.run.id)).receipt.desktopPoolLane).toBeUndefined();
 
 		const second = makeChromeService(root, workspace, bridge);
 		await second.service.schedulePreparedRun(prepared.run.id);
@@ -332,6 +335,10 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(terminal.status).toBe("completed");
 		expect(terminal.receipt.localBrowserSessionId).toBe(session.sessionId);
 		expect(terminal.receipt.browserDriverId).toBe(driver.id);
+		expect(terminal.receipt.desktopPoolLane).toBe(3);
+		expect(terminal.receipt.desktopPoolLeaseState).toBeUndefined();
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLane).toBe(3);
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLeaseState).toBeUndefined();
 		expect(bridge.submittedPrompts).toEqual(["repair session receipt"]);
 	});
 

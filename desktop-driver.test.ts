@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	handleDesktopDriverRequest,
 	closeDesktopDriverSessionOffline,
@@ -26,19 +26,26 @@ import {
 import {
 	assertLaneCanLaunch,
 	assertMinimizedWindowReceipt,
+	assertNoRetainedLaunch,
 	assertRestoredFrontmostPid,
-	assertShutdownProcessMembership,
 	addPoolLaneReceipt,
-	descendantProcessIds,
+	beginLaneStartup,
+	completeReservedLaneResponse,
+	finishLaneStartup,
+	handleDesktopPoolRequest,
 	laneHasExactlyOneReadyShell,
 	loadPoolConfig,
 	listenerProcessPids,
 	poolLanes,
 	profileAssociatedProcessPids,
+	poolAllowsCreateTarget,
+	provePoolLaneRetryBoundary,
 	requestRequiresPoolAllocationLock,
+	retainInterruptedLaneStartup,
 	requestSessionId,
 	roundRobinLaneOrder,
 	withPoolAllocationLock,
+	withLaneLifecycleLock,
 	withReservedFreePoolLane,
 } from "./src/desktop-pool-driver-cli";
 
@@ -92,6 +99,12 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 			browserVersion: "Chrome/151.0.7922.170",
 			browserInstanceId: this.browserInstanceId,
 		};
+	}
+
+	async closeBrowser(browserInstanceId: string): Promise<void> {
+		if (browserInstanceId !== this.browserInstanceId) throw new Error("desktop browser instance changed");
+		this.targets.clear();
+		this.windowIds.clear();
 	}
 
 	async listTargets(): Promise<DesktopCdpTarget[]> {
@@ -238,7 +251,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.4",
+				driverVersion: "0.5.0-alpha.5",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -1028,7 +1041,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.4");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.5");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
@@ -1178,11 +1191,152 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		expect(addPoolLaneReceipt({ version: 2, ok: false, error: "blocked" }, 4)).toEqual({ version: 2, ok: false, error: "blocked" });
 	});
 
-	test("keeps slow create work outside the global lock while serializing discovery and close", () => {
+	test("keeps ordinary lane work outside the global allocation lock", () => {
 		expect(requestRequiresPoolAllocationLock("create")).toBe(false);
-		expect(requestRequiresPoolAllocationLock("find_conversations")).toBe(true);
-		expect(requestRequiresPoolAllocationLock("close")).toBe(true);
+		expect(requestRequiresPoolAllocationLock("find_conversations")).toBe(false);
+		expect(requestRequiresPoolAllocationLock("close")).toBe(false);
 		expect(requestRequiresPoolAllocationLock("show")).toBe(false);
+		expect(requestRequiresPoolAllocationLock("attest_offline")).toBe(true);
+	});
+
+	test("requires explicit target-creation authorization for the pool", () => {
+		expect(poolAllowsCreateTarget({})).toBe(false);
+		expect(poolAllowsCreateTarget({ GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET: "0" })).toBe(false);
+		expect(poolAllowsCreateTarget({ GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET: "1" })).toBe(true);
+	});
+
+	test("preserves a successful create identity when lifecycle-lock release is unproved", async () => {
+		const result = await completeReservedLaneResponse({
+			version: 2,
+			ok: true,
+			result: { sessionId: "session-a", pageId: "target-1", name: "owned", url: "https://chatgpt.com/" },
+		}, 2, async () => { throw new Error("lock changed"); });
+		expect(result).toEqual({
+			version: 2,
+			ok: true,
+			result: {
+				sessionId: "session-a",
+				pageId: "target-1",
+				name: "owned",
+				url: "https://chatgpt.com/",
+				desktopPoolLane: 2,
+				desktopPoolLeaseState: "release_unproved",
+			},
+		});
+	});
+
+	test("retries a failed lane only after session-free offline cleanup is proved", async () => {
+		const events: string[] = [];
+		await provePoolLaneRetryBoundary(2, [], true,
+			async () => { events.push("stop"); },
+			async () => { events.push("offline"); });
+		expect(events).toEqual(["stop", "offline"]);
+
+		await expect(provePoolLaneRetryBoundary(2, ["session-a"], true,
+			async () => { events.push("unsafe-stop"); },
+			async () => { events.push("unsafe-offline"); })).rejects.toThrow("durable sessions remain");
+		expect(events).toEqual(["stop", "offline"]);
+
+		await expect(provePoolLaneRetryBoundary(2, [], true,
+			async () => { throw new Error("close not proved"); },
+			async () => { events.push("must-not-attest"); })).rejects.toThrow("close not proved");
+		expect(events).toEqual(["stop", "offline"]);
+	});
+
+	test("retains interrupted startup ownership and fences a replaced launch receipt", async () => {
+		const root = realpathSync(scratch());
+		const config = loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1" });
+		const lane = poolLanes(config)[0];
+		mkdirSync(dirname(lane.profileRoot), { recursive: true, mode: 0o700 });
+		const receiptPath = join(dirname(lane.profileRoot), "launch.json");
+
+		const retained = await beginLaneStartup(lane, config, {});
+		await retainInterruptedLaneStartup(retained, "startup caller was interrupted");
+		expect(JSON.parse(readFileSync(receiptPath, "utf8"))).toMatchObject({
+			version: 1,
+			lane: 1,
+			state: "interrupted_cleanup_unproved",
+		});
+		await expect(assertNoRetainedLaunch(lane)).rejects.toThrow("Explicit recovery is required");
+		rmSync(receiptPath);
+
+		const replaced = await beginLaneStartup(lane, config, {});
+		const original = `${receiptPath}.original`;
+		linkSync(receiptPath, original);
+		const raw = readFileSync(receiptPath);
+		rmSync(receiptPath);
+		writeFileSync(receiptPath, raw, { mode: 0o600, flag: "wx" });
+		await expect(finishLaneStartup(replaced)).rejects.toThrow("ownership changed");
+		rmSync(receiptPath);
+		renameSync(original, receiptPath);
+		await finishLaneStartup(replaced);
+		expect(existsSync(receiptPath)).toBe(false);
+	});
+
+	test("does not cold-launch an app for read-only conversation discovery", async () => {
+		const root = realpathSync(scratch());
+		const response = await handleDesktopPoolRequest({
+			version: 2,
+			action: "find_conversations",
+			params: { query: "existing title" },
+		}, {
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"),
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65400",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1",
+			GPT_CONTROL_DRIVER_DESKTOP_APP_PATH: join(root, "must-not-launch.app"),
+		});
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("No app was launched");
+	});
+
+	test("serializes every operation that owns the same lane lifecycle", async () => {
+		const root = realpathSync(scratch());
+		const config = loadPoolConfig({ GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"), GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1" });
+		const lane = poolLanes(config)[0];
+		let releaseFirst!: () => void;
+		let firstEntered!: () => void;
+		const entered = new Promise<void>((resolveEntered) => { firstEntered = resolveEntered; });
+		const held = new Promise<void>((resolveRelease) => { releaseFirst = resolveRelease; });
+		const order: string[] = [];
+		const first = withLaneLifecycleLock(lane, async () => {
+			order.push("first-enter");
+			firstEntered();
+			await held;
+			order.push("first-exit");
+		});
+		await entered;
+		const second = withLaneLifecycleLock(lane, async () => { order.push("second-enter"); });
+		await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+		expect(order).toEqual(["first-enter"]);
+		releaseFirst();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+	});
+
+	test("holds the lane lifecycle lease while producing one atomic offline attestation", async () => {
+		const root = realpathSync(scratch());
+		const env = {
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_ROOT: join(root, "pool"),
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_START_PORT: "65401",
+			GPT_CONTROL_DRIVER_DESKTOP_POOL_SIZE: "1",
+		};
+		const config = loadPoolConfig(env);
+		const lane = poolLanes(config)[0];
+		let releaseLane!: () => void;
+		let laneEntered!: () => void;
+		const entered = new Promise<void>((resolveEntered) => { laneEntered = resolveEntered; });
+		const held = new Promise<void>((resolveRelease) => { releaseLane = resolveRelease; });
+		const owner = withLaneLifecycleLock(lane, async () => { laneEntered(); await held; });
+		await entered;
+		let attested = false;
+		const attestation = handleDesktopPoolRequest({ version: 2, action: "attest_offline", params: {} }, env)
+			.then((response) => { attested = true; return response; });
+		await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+		expect(attested).toBe(false);
+		releaseLane();
+		await owner;
+		const response = await attestation;
+		expect(response).toMatchObject({ ok: true, result: { driver: "chatgpt-desktop-pool/v1", mode: "offline" } });
 	});
 
 	test("orders free-lane checks from a durable round-robin cursor", () => {
@@ -1272,6 +1426,24 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Browser window not found"))).toBe(true);
 		expect(isMissingBrowserWindowError(new CdpProtocolError(-32000, "Permission denied"))).toBe(false);
 		expect(isMissingBrowserWindowError(new Error("Browser window not found"))).toBe(false);
+	});
+
+	test("closes only the exact verified browser instance through CDP", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const calls: Array<{ browserInstanceId: string; method: string; params: Record<string, unknown> }> = [];
+		const transport = environment as unknown as {
+			browserCommand: (browserInstanceId: string, method: string, params: Record<string, unknown>) => Promise<unknown>;
+		};
+		transport.browserCommand = async (browserInstanceId, method, params) => {
+			calls.push({ browserInstanceId, method, params });
+			return {};
+		};
+		await environment.closeBrowser("/devtools/browser/exact-worker-instance");
+		expect(calls).toEqual([{
+			browserInstanceId: "/devtools/browser/exact-worker-instance",
+			method: "Browser.close",
+			params: {},
+		}]);
 	});
 
 	test("searches every eligible desktop shell and deduplicates exact matching evidence", async () => {
@@ -1619,23 +1791,6 @@ describe("ChatGPT Desktop endpoint policy", () => {
 		].join("\n");
 		expect(profileAssociatedProcessPids(`${processList}\n 104 browser_crashpad_handler --database=${profile}/Crashpad`, profile)).toEqual([101, 104]);
 		expect(listenerProcessPids("p101\np104\np101\n")).toEqual([101, 104]);
-	});
-
-	test("collects only the exact native worker process tree", () => {
-		const processList = [
-			" 100 1",
-			" 101 100",
-			" 102 101",
-			" 200 1",
-			" 201 200",
-		].join("\n");
-		expect(descendantProcessIds(processList, 100)).toEqual([100, 101, 102]);
-	});
-
-	test("refuses shutdown authority for foreign profile and listener processes", () => {
-		expect(() => assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100, 200]), new Set([101]))).toThrow("unproved");
-		expect(() => assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100]), new Set([101, 201]))).toThrow("unproved");
-		expect(assertShutdownProcessMembership(1, new Set([100, 101]), new Set([100]), new Set([101]))).toBeUndefined();
 	});
 
 	test("requires minimized-window and restored-focus read-back", () => {

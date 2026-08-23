@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const expectedBundlePath = resolve(root, "dist/gpt-control-desktop-driver.js");
 const EXPECTED_DRIVER_ID = "chatgpt-desktop-cdp/v1";
-const EXPECTED_DRIVER_VERSION = "0.5.0-alpha.4";
+const EXPECTED_DRIVER_VERSION = "0.5.0-alpha.5";
 const EXPECTED_STATE_WRITER_VERSION = 2;
 
 export function assertCurrentDesktopEnvironment(env = process.env) {

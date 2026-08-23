@@ -1,7 +1,7 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.5.0-alpha.4
+version: 0.5.0-alpha.5
 ---
 
 # GPT-Control
@@ -164,7 +164,9 @@ replacement page or resubmit an ambiguous prompt.
 To find an existing provider conversation by title, use
 `gpt_conversation_find`. Prefer an exact distinctive title and add `pinned`
 when useful. It searches the authenticated desktop sidebar without opening a
-chat or changing provider state. If the result must be attached, use
+chat or changing provider state. With the native pool, it uses only an
+already-running unreserved lane and returns a blocker instead of cold-launching
+an app. If the result must be attached, use
 `gpt_conversation_find_and_attach`; it fails unless exactly one chat matches.
 
 To continue an existing provider conversation when its exact ID is already

@@ -110,7 +110,9 @@ session receipt.
 
 Read-only sidebar discovery is also available through
 `gpt_conversation_find`. It extracts each exact provider conversation ID from
-the signed app's local rendered row identity. It does not select a row. After
+the signed app's local rendered row identity. It does not select a row, start a
+process, or create a window. The pool uses an already-running unreserved lane
+and returns a blocker when none is available. After
 an exact attachment, `gpt_conversation_read` can return the newest 1–20 visible
 turns and `gpt_conversation_status` can report live state without sending.
 Exact attachment always creates a separate owned renderer and therefore also
@@ -131,9 +133,13 @@ Set an explicit installed package root and the exact mutation acknowledgement:
 ```sh
 export GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT="$HOME/plugins/gpt-control"
 export GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE=I_UNDERSTAND_THIS_CREATES_CHATGPT_CONVERSATIONS
+export GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1
+export GPT_CONTROL_ACCEPTANCE_TRUSTED_SOURCE_ROOT="$PWD"
+export GPT_CONTROL_ACCEPTANCE_EXPECTED_HEAD="$(git rev-parse HEAD)"
 
 node scripts/chatgpt-desktop-acceptance.mjs \
-  --confirm --send --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT"
+  --confirm --send --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT" \
+  --request-file ./desktop-live-request.json
 ```
 
 Do not use a stress run as an ordinary smoke test. Multiple sessions require a
@@ -147,13 +153,16 @@ export GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_STRESS=I_UNDERSTAND_THIS_STARTS_MULTI
 
 node scripts/chatgpt-desktop-acceptance.mjs \
   --confirm --send --stress --count 2 \
-  --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT"
+  --install-root "$GPT_CONTROL_ACCEPTANCE_INSTALL_ROOT" \
+  --request-file ./desktop-live-request.json
 ```
 
 The local cooldown can be configured from 1 through 168 hours with
 `GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_COOLDOWN_HOURS`. Bypassing it requires the
 separate operator-only `GPT_CONTROL_DESKTOP_LIVE_ACCEPTANCE_OVERRIDE=1` gate and
-must not be part of an automated test suite.
+must not be part of an automated test suite. This safeguard applies only to the
+explicit live-acceptance script. It does not rate-limit normal GPT-Control
+Chats, Workers, or Sub-agents.
 
 `desktop-cdp-live-smoke.mjs` remains a low-level exploratory driver harness. It
 is not canonical acceptance evidence. It refuses raw attachment tests because
@@ -167,7 +176,7 @@ uses only those processes for worker sessions.
 
 Earlier experimental heads observed several independent native processes and
 replies, but those raw-driver runs did not prove the normal GPT-Control client
-or fail-closed cleanup. Version 0.5.0-alpha.4 therefore makes no current
+or fail-closed cleanup. Version 0.5.0-alpha.5 therefore makes no current
 installed-product live claim until the canonical runner passes at the exact
 installed commit after the account cool-down.
 
@@ -207,8 +216,10 @@ node scripts/chatgpt-desktop-acceptance.mjs \
 
 The runner does not print prompt or assistant text. It records the exact local
 run/session/lane identities, requested-versus-observed model receipts, provider
-URL hash, attachment-manifest hash, installed launcher and pool-driver hashes,
-and complete offline cleanup proof.
+URL hash, attachment-manifest hash, installed runtime-bundle hashes, trusted
+source head, and complete atomic offline cleanup proof. The installed launchers
+and bundles must resolve inside the install root and match the clean trusted
+exact-head build byte for byte.
 
 ## Alpha release gates
 
@@ -225,6 +236,6 @@ Do not make this the default driver until the signed-in app proves:
 Historical raw-driver exercises covered model and project discovery, model
 switching, upload, reload continuation, cancellation, organization controls,
 and multiple renderers. Those observations are not acceptance evidence for
-0.5.0-alpha.4. The exact installed package must pass the canonical 1, 2, 3, and
+0.5.0-alpha.5. The exact installed package must pass the canonical 1, 2, 3, and
 6 staircase after low-volume account access is restored; the PR remains draft
 until then.

@@ -2,7 +2,7 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.5.0-alpha.4 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
+0.5.0-alpha.5 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
 processes for background workers. Each lane has a private profile, state root,
 and loopback CDP port; GPT-Control minimizes the worker window and restores the
 user's active app after launch. Chrome Bridge remains the default. Version 0.4.4
@@ -62,9 +62,15 @@ The experimental desktop driver is documented in
 unless the operator explicitly configures `GPT_CONTROL_BROWSER_DRIVER`. A
   read-only signed-app diagnostic has passed on macOS. Historical raw-driver
   exercises covered signed-in sends and desktop controls, but they are not
-  accepted as product-path evidence for 0.5.0-alpha.4. The repaired installed
+  accepted as product-path evidence for 0.5.0-alpha.5. The repaired installed
   package must pass the guarded MCP acceptance after the account cool-down.
   Chrome Bridge remains the default, and the native pool remains opt-in.
+
+The native pool does not infer renderer-creation authority from driver
+selection. New GPT-Control-owned renderers require the separate trusted
+`GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1` setting. Without it, the
+pool can probe and search an already-running lane but cannot create or attach a
+conversation.
 
 ## Tools
 
@@ -131,7 +137,9 @@ card receipts are recorded separately when the live DOM exposes them.
 
 Use `gpt_conversation_find` for read-only title and pinned-state discovery in
 the authenticated ChatGPT Desktop sidebar. It returns exact provider IDs and
-does not open a chat, create a window, or change selection. If a title query
+does not open a chat, create a window, or change selection. The native pool
+uses only an already-running unreserved worker lane and returns a clear blocker
+when no such lane exists. If a title query
 must identify one chat, `gpt_conversation_find_and_attach` fails on zero or
 multiple matches and passes the one proved provider ID into the same hardened
 attachment path described below.

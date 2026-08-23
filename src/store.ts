@@ -71,6 +71,7 @@ const ReceiptSchema = z.object({
 	providerRunId: z.string().optional(),
 	localBrowserSessionId: z.string().optional(),
 	desktopPoolLane: z.number().int().min(1).max(10).optional(),
+	desktopPoolLeaseState: z.literal("release_unproved").optional(),
 	localAssistantTurnCount: z.number().int().nonnegative().optional(),
 	recoveryAttempts: z.array(RecoverySchema).optional(),
 });
@@ -85,6 +86,7 @@ const ConversationSchema = z.object({
 	browserSessionName: z.string().optional(),
 	browserPageId: z.union([z.string(), z.number()]).optional(),
 	desktopPoolLane: z.number().int().min(1).max(10).optional(),
+	desktopPoolLeaseState: z.literal("release_unproved").optional(),
 	browserAssistantTurnCount: z.number().int().nonnegative().optional(),
 	providerPinned: z.boolean().optional(),
 	providerTitle: z.string().optional(),

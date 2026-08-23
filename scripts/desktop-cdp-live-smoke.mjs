@@ -53,13 +53,15 @@ if (archiveUrl) {
 		throw new Error("Archive mutation is disabled. Set GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 for this exact cleanup.");
 	}
 	let session;
+	let record;
 	try {
 		session = await call("create", { name: `gpt-control:desktop-cleanup:${randomUUID()}`, url: archiveUrl });
 		const result = await call("manage_conversation", { session, operation: { action: "archive" } });
-		console.log(JSON.stringify({ mode: "archive", ...(includeSensitiveOutput ? { url: archiveUrl } : { urlSha256: sha256(archiveUrl) }), ...result }, null, 2));
+		record = { mode: "archive", ...(includeSensitiveOutput ? { url: archiveUrl } : { urlSha256: sha256(archiveUrl) }), ...result };
 	} finally {
-		if (session) await call("close", { sessionId: session.sessionId }).catch(() => undefined);
+		if (session) await call("close", { sessionId: session.sessionId });
 	}
+	console.log(JSON.stringify(record, null, 2));
 	process.exit(0);
 }
 

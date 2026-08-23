@@ -77,6 +77,8 @@ export interface DriverSession {
 	url: string;
 	/** Non-sensitive native desktop-pool ownership receipt. */
 	desktopPoolLane?: number;
+	/** The pool returned ownership, but could not prove lifecycle-lock release. */
+	desktopPoolLeaseState?: "release_unproved";
 }
 
 export interface ChatGptConversationCatalogEntry {
@@ -771,9 +773,13 @@ const SessionSchema = z.object({
 	name: z.string(),
 	url: z.string(),
 	desktopPoolLane: z.number().int().min(1).max(10).optional(),
+	desktopPoolLeaseState: z.literal("release_unproved").optional(),
 }).strict();
 const ProvisionalSessionSchema = z.object({
 	sessionId: z.string().min(1).max(512),
+	pageId: z.union([z.string(), z.number()]),
+	name: z.string(),
+	url: z.string(),
 }).passthrough();
 const SnapshotSchema = z.object({
 	count: z.number().int().nonnegative(),
@@ -880,6 +886,19 @@ const EnvelopeSchema = z.object({
 	error: z.string().optional(),
 }).strict();
 
+function sameCreateDestination(observed: string, requested: string): boolean {
+	try {
+		const left = new URL(observed);
+		const right = new URL(requested);
+		return left.origin === right.origin
+			&& left.pathname.replace(/\/$/, "") === right.pathname.replace(/\/$/, "")
+			&& left.search === right.search
+			&& !left.hash && !right.hash;
+	} catch {
+		return false;
+	}
+}
+
 export class ExternalCommandBrowserDriver implements WebChatDriver {
 	private readonly command: string;
 	private readonly args: string[];
@@ -913,11 +932,23 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 		const parsed = SessionSchema.safeParse(raw);
 		if (parsed.success) return parsed.data;
 		const provisional = ProvisionalSessionSchema.safeParse(raw);
-		if (!provisional.success) throw parsed.error;
+		if (!provisional.success
+			|| provisional.data.name !== name
+			|| !sameCreateDestination(provisional.data.url, url)) throw parsed.error;
 		try {
 			// A create response can fail local validation after the external driver has
 			// already created durable state. Cleanup is independent of a cancelled
 			// caller so a malformed receipt cannot silently consume a pool lane.
+			const rebound = ProvisionalSessionSchema.safeParse(await this.call("show", {
+				sessionId: provisional.data.sessionId,
+			}));
+			if (!rebound.success
+				|| rebound.data.sessionId !== provisional.data.sessionId
+				|| rebound.data.pageId !== provisional.data.pageId
+				|| rebound.data.name !== name
+				|| !sameCreateDestination(rebound.data.url, url)) {
+				throw new Error("Malformed create receipt did not rebind to the complete caller-owned destination tuple.");
+			}
 			await this.close(provisional.data.sessionId);
 		} catch (cleanupError) {
 			throw new Error(

@@ -25,7 +25,7 @@ import type { Launcher } from "./transport";
 import type { Exec, ExecResult } from "./types";
 
 export const DESKTOP_DRIVER_ID = "chatgpt-desktop-cdp/v1";
-export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.4";
+export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.5";
 export const DESKTOP_STATE_WRITER_VERSION = 2;
 
 export interface DesktopCdpTarget {
@@ -69,6 +69,7 @@ export interface DesktopHostReceipt {
 
 export interface DesktopCdpEnvironment {
 	verifyHost(): Promise<DesktopHostReceipt>;
+	closeBrowser(browserInstanceId: string): Promise<void>;
 	listTargets(): Promise<DesktopCdpTarget[]>;
 	findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog>;
 	createTarget(url: string): Promise<DesktopCdpTargetReceipt>;
