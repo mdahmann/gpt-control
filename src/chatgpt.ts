@@ -17,9 +17,12 @@ export function gptControlPromptProofLine(token: string): string {
 }
 
 const PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
-const SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
+const SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]', 'button[aria-label="Send"]'];
 const FILE_INPUT_SELECTOR = 'input[type="file"]';
 const USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
+const USER_TURN_SELECTOR = '[data-message-author-role="user"], [data-content-search-unit-key$=":user"]';
+const ASSISTANT_TURN_SELECTOR = '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
+const ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"]';
 const EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 const TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 
@@ -431,7 +434,7 @@ export async function submitPrompt(
 }
 
 export function countAssistantTurns(html: string): number {
-	return parse(html).querySelectorAll('[data-message-author-role="assistant"]').length;
+	return parse(html).querySelectorAll(ASSISTANT_TURN_SELECTOR).length;
 }
 
 export async function tabUrl(
@@ -1162,7 +1165,7 @@ export function approvedImageUrl(raw: string): URL | undefined {
 
 export function extractAssistantTurn(html: string): AssistantTurn {
 	const root = parse(html);
-	const turns = root.querySelectorAll('[data-message-author-role="assistant"]');
+	const turns = root.querySelectorAll(ASSISTANT_TURN_SELECTOR);
 	const node = turns.length === 0 ? undefined : turns[turns.length - 1];
 	if (!node) return { text: "", imageUrls: [], hasMarkdown: false };
 	const imageUrls: string[] = [];
@@ -1175,7 +1178,7 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 		seen.add(url.href);
 		imageUrls.push(url.href);
 	}
-	const content = node.querySelector(".markdown");
+	const content = node.querySelector(ASSISTANT_CONTENT_SELECTOR);
 	const text = (content?.structuredText ?? "")
 		.replace(/[ \t]+\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
@@ -1184,16 +1187,18 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 		text,
 		imageUrls,
 		hasMarkdown: Boolean(content),
-		messageId: node.getAttribute("data-message-id") ?? undefined,
+		messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined,
 	};
 }
 
 export function extractChatPageObservation(html: string): ChatPageObservation {
 	const root = parse(html);
 	const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
-	const userTurns = root.querySelectorAll('[data-message-author-role="user"]');
+	const userTurns = root.querySelectorAll(USER_TURN_SELECTOR);
 	const latestUser = userTurns.at(-1);
-	const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? undefined;
+	const latestUserMessageId = latestUser?.getAttribute("data-message-id")
+		?? latestUser?.getAttribute("data-content-search-unit-key")
+		?? undefined;
 	const latestUserPromptNode = latestUser
 		? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean)
 		: undefined;
@@ -1861,10 +1866,25 @@ async function openConversationHeaderMenu(
 ): Promise<void> {
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
-		const buttons = root.querySelectorAll('[data-testid="conversation-options-button"]');
+		const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+		const nativeSidebarButtons = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+		if (nativeSidebarButtons.length > 1) throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
+		if (nativeSidebarButtons.length === 1) {
+			await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+			return;
+		}
+		if (nativeShell) {
+			if (Date.now() >= deadline) break;
+			await sleep(Math.min(pollIntervalMs(), 200));
+			continue;
+		}
+		const buttons = root.querySelectorAll('[data-testid="conversation-options-button"],[aria-label="ChatGPT conversation actions"]');
 		if (buttons.length > 1) throw new Error("ChatGPT conversation action control is ambiguous.");
 		if (buttons.length === 1) {
-			await pickerAction(exec, launcher, "click", tabId, '[data-testid="conversation-options-button"]', signal, expectedTarget);
+			const selector = buttons[0].getAttribute("data-testid") === "conversation-options-button"
+				? '[data-testid="conversation-options-button"]'
+				: '[aria-label="ChatGPT conversation actions"]';
+			await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
 			return;
 		}
 		if (Date.now() >= deadline) break;
@@ -2028,9 +2048,12 @@ async function waitForArchiveReadback(
 	for (;;) {
 		const current = await tabUrl(exec, launcher, tabId, signal);
 		const html = await readPageHtml(exec, launcher, tabId, signal);
+		const root = parse(html);
 		const identity = providerConversationIdentity(exactUrl);
-		const stillListed = identity ? parse(html).querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
-		if (current && new URL(current).toString() !== exactUrl && !stillListed) return;
+		const stillListed = identity ? root.querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
+		const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+		const nativeCurrentListed = root.querySelectorAll('[aria-current="page"] [data-thread-title]').length > 0;
+		if (nativeShell ? !nativeCurrentListed : Boolean(current && new URL(current).toString() !== exactUrl && !stillListed)) return;
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const driver = resolve(process.env.GPT_CONTROL_BROWSER_DRIVER ?? resolve(root, "bin/gpt-control-desktop-driver"));
 const live = process.argv.includes("--live");
+const archiveIndex = process.argv.indexOf("--archive-url");
+const archiveUrl = archiveIndex >= 0 ? process.argv[archiveIndex + 1] : undefined;
 const concurrencyIndex = process.argv.indexOf("--concurrency");
 const concurrency = concurrencyIndex >= 0 ? Number(process.argv[concurrencyIndex + 1]) : 1;
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6) throw new Error("--concurrency must be an integer from 1 through 6.");
@@ -25,6 +27,21 @@ const diagnostic = {
 	liveMutationAuthorized: process.env.GPT_CONTROL_DESKTOP_LIVE_MUTATION === "1",
 };
 
+if (archiveUrl) {
+	if (process.env.GPT_CONTROL_DESKTOP_LIVE_MUTATION !== "1") {
+		throw new Error("Archive mutation is disabled. Set GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 for this exact cleanup.");
+	}
+	let session;
+	try {
+		session = await call("create", { name: `gpt-control:desktop-cleanup:${randomUUID()}`, url: archiveUrl });
+		const result = await call("manage_conversation", { session, operation: { action: "archive" } });
+		console.log(JSON.stringify({ mode: "archive", url: archiveUrl, ...result }, null, 2));
+	} finally {
+		if (session) await call("close", { sessionId: session.sessionId }).catch(() => undefined);
+	}
+	process.exit(0);
+}
+
 if (!live) {
 	console.log(JSON.stringify({ mode: "diagnostic", ...diagnostic }, null, 2));
 	process.exit(0);
@@ -37,6 +54,15 @@ if (concurrency > 1 && process.env.GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGE
 }
 
 const sessions = [];
+const questions = [
+	"When would you use CSS Grid instead of Flexbox?",
+	"What makes a website feel fast to a visitor?",
+	"What's one simple way to improve a form's accessibility?",
+	"How do you decide what belongs in a React component?",
+	"What is a good use case for a container query?",
+	"Why is semantic HTML useful?",
+];
+const questionOffset = randomInt(questions.length);
 try {
 	for (let index = 0; index < concurrency; index += 1) {
 		const session = await call("create", { name: `gpt-control:desktop-smoke:${randomUUID()}`, url: "https://chatgpt.com/" });
@@ -45,13 +71,14 @@ try {
 	const pageIds = new Set(sessions.map((session) => String(session.pageId)));
 	if (pageIds.size !== sessions.length) throw new Error("Desktop smoke sessions do not own distinct renderer/page identities.");
 	const runs = sessions.map(async (session, index) => {
-		const token = `DESKTOP_CDP_PONG_${index + 1}_${randomUUID().replaceAll("-", "")}`;
-		const prompt = `Reply with exactly ${token} and no other text.`;
+		const prompt = questions[(questionOffset + index) % questions.length];
 		const initial = await waitReady(session);
 		await call("fill", { session, prompt });
 		await call("send", { session });
-		const completion = await waitCompletion(session, initial.snapshot?.count ?? 0, token);
-		return { sessionId: session.sessionId, pageId: session.pageId, token, response: completion.snapshot.text };
+		const completion = await waitCompletion(session, initial.snapshot?.count ?? 0);
+		const currentSession = await call("show", { sessionId: session.sessionId });
+		await call("manage_conversation", { session: currentSession, operation: { action: "archive" } });
+		return { sessionId: session.sessionId, pageId: session.pageId, response: completion.snapshot.text, archived: true };
 	});
 	const results = await Promise.all(runs);
 	console.log(JSON.stringify({ mode: "live", concurrency, distinctPageIds: pageIds.size, results }, null, 2));
@@ -70,14 +97,14 @@ async function waitReady(session) {
 	throw new Error(`Desktop composer did not become ready: ${last?.stateSummary ?? "no observation"}`);
 }
 
-async function waitCompletion(session, baseline, token) {
+async function waitCompletion(session, baseline) {
 	const deadline = Date.now() + 180_000;
 	let last;
 	let stable = 0;
 	while (Date.now() < deadline) {
 		last = await call("observe", { session });
 		const final = last.snapshot?.count > baseline
-			&& last.snapshot?.text === token
+			&& (last.snapshot?.text ?? "").trim().length >= 10
 			&& !last.answering
 			&& !last.thinking
 			&& !last.toolRunning;
@@ -104,7 +131,7 @@ async function call(action, params) {
 			clearTimeout(timer);
 			let envelope;
 			try { envelope = JSON.parse(stdout.trim()); } catch { rejectCall(new Error(stderr.trim() || `Desktop driver returned invalid JSON: ${stdout.slice(0, 400)}`)); return; }
-			if (!envelope.ok) { rejectCall(new Error(envelope.error || stderr.trim() || `Desktop driver ${action} failed.`)); return; }
+			if (!envelope.ok) { rejectCall(new Error(`Desktop driver ${action} failed: ${envelope.error || stderr.trim() || "unknown error"}`)); return; }
 			resolveCall(envelope.result);
 		});
 		child.stdin.end(request);

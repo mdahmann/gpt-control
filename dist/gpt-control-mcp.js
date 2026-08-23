@@ -33779,9 +33779,12 @@ var CHATGPT_ORIGIN = "https://chatgpt.com";
 var GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "Task:";
 var LEGACY_GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
 var PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
-var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
+var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]', 'button[aria-label="Send"]'];
 var FILE_INPUT_SELECTOR = 'input[type="file"]';
 var USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
+var USER_TURN_SELECTOR = '[data-message-author-role="user"], [data-content-search-unit-key$=":user"]';
+var ASSISTANT_TURN_SELECTOR = '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
+var ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"]';
 var EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 var TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 
@@ -34024,7 +34027,7 @@ async function actOnPrivateSelector(exec, launcher, tabId, selectors, expectedTa
   throw new Error(`Could not ${options.what}. Last error: ${lastError}`);
 }
 function countAssistantTurns(html) {
-  return parse6(html).querySelectorAll('[data-message-author-role="assistant"]').length;
+  return parse6(html).querySelectorAll(ASSISTANT_TURN_SELECTOR).length;
 }
 async function tabUrl(exec, launcher, tabId, signal) {
   const payload = await bridgeJson(exec, launcher, ["getTabs"], signal);
@@ -34381,7 +34384,7 @@ function approvedImageUrl(raw) {
 }
 function extractAssistantTurn(html) {
   const root = parse6(html);
-  const turns = root.querySelectorAll('[data-message-author-role="assistant"]');
+  const turns = root.querySelectorAll(ASSISTANT_TURN_SELECTOR);
   const node = turns.length === 0 ? undefined : turns[turns.length - 1];
   if (!node)
     return { text: "", imageUrls: [], hasMarkdown: false };
@@ -34397,7 +34400,7 @@ function extractAssistantTurn(html) {
     seen.add(url2.href);
     imageUrls.push(url2.href);
   }
-  const content = node.querySelector(".markdown");
+  const content = node.querySelector(ASSISTANT_CONTENT_SELECTOR);
   const text = (content?.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
 
@@ -34406,15 +34409,15 @@ function extractAssistantTurn(html) {
     text,
     imageUrls,
     hasMarkdown: Boolean(content),
-    messageId: node.getAttribute("data-message-id") ?? undefined
+    messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
   };
 }
 function extractChatPageObservation(html) {
   const root = parse6(html);
   const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
-  const userTurns = root.querySelectorAll('[data-message-author-role="user"]');
+  const userTurns = root.querySelectorAll(USER_TURN_SELECTOR);
   const latestUser = userTurns.at(-1);
-  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? undefined;
+  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? latestUser?.getAttribute("data-content-search-unit-key") ?? undefined;
   const latestUserPromptNode = latestUser ? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean) : undefined;
   const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
@@ -34786,11 +34789,26 @@ async function conversationSidebarOptionsSelector(exec, launcher, tabId, provide
 async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
-    const buttons = root.querySelectorAll('[data-testid="conversation-options-button"]');
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeSidebarButtons = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+    if (nativeSidebarButtons.length > 1)
+      throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
+    if (nativeSidebarButtons.length === 1) {
+      await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+      return;
+    }
+    if (nativeShell) {
+      if (Date.now() >= deadline)
+        break;
+      await sleep(Math.min(pollIntervalMs(), 200));
+      continue;
+    }
+    const buttons = root.querySelectorAll('[data-testid="conversation-options-button"],[aria-label="ChatGPT conversation actions"]');
     if (buttons.length > 1)
       throw new Error("ChatGPT conversation action control is ambiguous.");
     if (buttons.length === 1) {
-      await pickerAction(exec, launcher, "click", tabId, '[data-testid="conversation-options-button"]', signal, expectedTarget);
+      const selector = buttons[0].getAttribute("data-testid") === "conversation-options-button" ? '[data-testid="conversation-options-button"]' : '[aria-label="ChatGPT conversation actions"]';
+      await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
       return;
     }
     if (Date.now() >= deadline)
@@ -34904,9 +34922,12 @@ async function waitForArchiveReadback(exec, launcher, tabId, exactUrl, deadline,
   for (;; ) {
     const current = await tabUrl(exec, launcher, tabId, signal);
     const html = await readPageHtml(exec, launcher, tabId, signal);
+    const root = parse6(html);
     const identity = providerConversationIdentity(exactUrl);
-    const stillListed = identity ? parse6(html).querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
-    if (current && new URL(current).toString() !== exactUrl && !stillListed)
+    const stillListed = identity ? root.querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeCurrentListed = root.querySelectorAll('[aria-current="page"] [data-thread-title]').length > 0;
+    if (nativeShell ? !nativeCurrentListed : Boolean(current && new URL(current).toString() !== exactUrl && !stillListed))
       return;
     if (Date.now() >= deadline)
       break;

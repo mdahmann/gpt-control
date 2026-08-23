@@ -647,6 +647,38 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(observation.answering).toBe(false);
 	});
 
+	test("observes native ChatGPT Desktop user and assistant turns", () => {
+		const observation = extractChatPageObservation(`<main>
+			<div data-content-search-unit-key="fallback-turn-0:0:user">
+				<div data-user-message-bubble="true"><div class="text-size-chat whitespace-pre-wrap"><div class="_MarkdownRoot_native"><p>desktop question</p></div></div></div>
+			</div>
+			<div data-content-search-unit-key="fallback-turn-0:2:assistant">
+				<span>ChatGPT said:</span><div class="_MarkdownRoot_native"><p>desktop answer</p></div>
+			</div>
+			<div contenteditable="true" aria-label="Message ChatGPT"></div>
+		</main>`);
+		expect(observation.snapshot).toMatchObject({ count: 1, text: "desktop answer", hasMarkdown: true });
+		expect(observation.latestUserPromptSha256).toBe(createHash("sha256").update("desktop question").digest("hex"));
+		expect(observation.composerReady).toBe(true);
+	});
+
+	test("uses the native ChatGPT Desktop Send control", async () => {
+		const attempts: string[] = [];
+		const exec = async (_command: string, args: string[]) => {
+			const selector = args[2] ?? "";
+			attempts.push(selector);
+			const success = selector === 'button[aria-label="Send"]';
+			return {
+				stdout: JSON.stringify(success ? { success: true, result: {} } : { success: false, error: `No element found: ${selector}` }),
+				stderr: success ? "" : `No element found: ${selector}`,
+				code: success ? 0 : 1,
+				killed: false,
+			};
+		};
+		await clickSend(exec, { command: "desktop-test", args: [], origin: "desktop test" }, 1);
+		expect(attempts.at(-1)).toBe('button[aria-label="Send"]');
+	});
+
 	test("hashes bounded browser-visible tool cards without treating them as trusted output", () => {
 		const observation = extractChatPageObservation('<main><div data-testid="tool-result-card">Zenbox computer_overview host zenbox-vm</div><form><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation.visibleToolCards).toHaveLength(1);

@@ -42,8 +42,11 @@ It does not create a conversation or send a message.
 
 ## Explicit live acceptance
 
-The live harness uses disposable exact-PONG prompts and closes its owned
-sessions. It does not run unless this separate mutation gate is present:
+The live harness sends one ordinary web-development question from a small
+rotating set, requires one stable reply, and then releases its local session
+ownership. It does not add test tokens or machine-looking verification text to
+the conversation. After read-back, it archives the disposable chat through the
+same desktop session. It does not run unless this separate mutation gate is present:
 
 ```sh
 GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
@@ -51,7 +54,9 @@ node scripts/desktop-cdp-live-smoke.mjs --live
 ```
 
 Additional renderers are disabled by default. To test more than one distinct
-session, explicitly enable target creation:
+session, explicitly enable target creation. The driver uses the signed app's
+native **New Window** command and restores the previously frontmost app after
+the new renderer becomes ready:
 
 ```sh
 export GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1
@@ -62,6 +67,22 @@ node scripts/desktop-cdp-live-smoke.mjs --live --concurrency 2
 
 Repeat with concurrency `3` and `6`. A clean capacity blocker is acceptable.
 Two workers silently sharing one renderer is a failure.
+
+The current macOS acceptance has proved one hidden/background session and two
+independent concurrent windows without changing the frontmost app during chat
+work. New Window can briefly activate ChatGPT before focus restoration. For the
+least disruption, keep the dedicated GPT-Control app instance on another Space
+and create the desired worker-window pool before starting long work.
+
+Native-shell clicks use trusted CDP mouse input. A capture-phase guard checks
+the exact provider conversation and clicked element inside the page when the
+trusted event arrives. A conversation change or layout miss blocks the event.
+Direct `/c/<id>` attachment uses the exact native sidebar row and requires
+stable identity read-back before any management action.
+
+Native `reload`, keyboard `press`, and file `upload` remain disabled until they
+have an equivalent atomic identity guard. Chrome Bridge remains available for
+work that requires those actions.
 
 ## Alpha release gates
 
@@ -74,3 +95,7 @@ Do not make this the default driver until the signed-in app proves:
 - cancellation and ambiguous Send no-replay behavior;
 - background operation without focus stealing;
 - distinct renderer ownership at concurrency 1, 2, 3, and 6.
+
+As of the current experiment, one background send/read/archive flow and two
+concurrent renderer identities have passed live. The 3- and 6-window acceptance
+levels remain release gates.

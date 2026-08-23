@@ -21,6 +21,8 @@ export interface DesktopCdpTarget {
 	type: "page" | "webview";
 	title: string;
 	url: string;
+	surface?: "web" | "desktop_shell";
+	runtimeUrl?: string;
 }
 
 export type DesktopCdpAction =
@@ -45,6 +47,7 @@ export interface DesktopCdpEnvironment {
 	createTarget(url: string): Promise<DesktopCdpTarget>;
 	navigateTarget(targetId: string, url: string): Promise<DesktopCdpTarget>;
 	readHtml(targetId: string): Promise<string>;
+	elementExists(targetId: string, selector: string, expectedUrl?: string): Promise<boolean>;
 	act(targetId: string, action: DesktopCdpAction): Promise<unknown>;
 	screenshot(targetId: string): Promise<string>;
 	closeTarget(targetId: string): Promise<void>;
@@ -74,6 +77,7 @@ interface DesktopSessionState {
 	name: string;
 	tabId: number;
 	targetId: string;
+	surface?: "web" | "desktop_shell";
 	url: string;
 	state: "working" | "needs_user" | "completed";
 	sendState: "prepared" | "attempted" | "submitted";
@@ -229,7 +233,12 @@ class DesktopCdpBridge {
 		}
 		if (request.action === "click" || request.action === "hover") {
 			const selector = requiredString(payload.selector, "selector");
-			if (request.action === "click" && isSendSelector(selector)) await this.markSendAttempted(session.sessionId);
+			if (request.action === "click" && isSendSelector(selector)) {
+				if (!await this.options.environment.elementExists(session.targetId, selector, expectedTarget.url)) {
+					throw new Error(`No element found: ${selector}`);
+				}
+				await this.markSendAttempted(session.sessionId);
+			}
 			return this.options.environment.act(session.targetId, {
 				kind: request.action,
 				selector,
@@ -289,11 +298,14 @@ class DesktopCdpBridge {
 		if (operation === "close") {
 			const sessionId = requiredString(rest[0], "sessionId");
 			let targetId = "";
+			let surface: DesktopSessionState["surface"];
 			await withStateLock(this.options.stateRoot, async (state) => {
-				targetId = requireSession(state, sessionId).targetId;
+				const session = requireSession(state, sessionId);
+				targetId = session.targetId;
+				surface = session.surface;
 				delete state.sessions[sessionId];
 			});
-			if (targetId) await this.options.environment.closeTarget(targetId);
+			if (targetId && surface !== "desktop_shell") await this.options.environment.closeTarget(targetId);
 			return { success: true };
 		}
 		throw new Error(`Unsupported desktop taskSession operation: ${operation}`);
@@ -302,26 +314,54 @@ class DesktopCdpBridge {
 	private async navigateSession(sessionId: string, url: string): Promise<{ tabId: number }> {
 		let snapshot = await this.sessionById(sessionId);
 		if (!snapshot.targetId) {
-			const targets = await this.options.environment.listTargets();
-			const state = await readState(this.options.stateRoot);
-			const claimed = new Set(Object.values(state.sessions).map((session) => session.targetId).filter(Boolean));
-			let target = targets.find((candidate) => eligibleTarget(candidate) && !claimed.has(candidate.id));
-			if (!target) {
-				const activeClaims = claimed.size;
-				if (activeClaims > 0 && !this.options.allowCreateTarget) {
-					throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
+			let createdTarget: DesktopCdpTarget | undefined;
+				try {
+					const targets = await this.options.environment.listTargets();
+					const state = await readState(this.options.stateRoot);
+					const claimed = new Set(Object.values(state.sessions).map((session) => session.targetId).filter(Boolean));
+					const available = targets.filter((candidate) => eligibleTarget(candidate) && !claimed.has(candidate.id));
+					let target = targets.find((candidate) => eligibleTarget(candidate)
+						&& !claimed.has(candidate.id)
+						&& sameExactUrl(candidate.url, url));
+					let navigated: DesktopCdpTarget | undefined;
+					if (!target && providerConversationIdentity(url)) {
+						for (const candidate of available) {
+							try {
+								navigated = await this.options.environment.navigateTarget(candidate.id, url);
+								target = candidate;
+								break;
+							} catch (error) {
+								if (!errorMessage(error).includes("exact ChatGPT Desktop sidebar conversation is unavailable or ambiguous")) throw error;
+							}
+						}
+					}
+					target ??= available[0];
+					if (!target) {
+					const activeClaims = claimed.size;
+					if (activeClaims > 0 && !this.options.allowCreateTarget) {
+						throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
+					}
+					createdTarget = await this.options.environment.createTarget(url);
+					target = createdTarget;
 				}
-				target = await this.options.environment.createTarget(url);
+					navigated ??= await this.options.environment.navigateTarget(target.id, url);
+				await withStateLock(this.options.stateRoot, async (current) => {
+					const session = requireSession(current, sessionId);
+					if (session.targetId && session.targetId !== navigated.id) throw new Error("Desktop session target changed during claim.");
+					const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== sessionId && entry.targetId === navigated.id);
+					if (duplicate) throw new Error("Desktop renderer is already owned by another GPT-Control session.");
+					session.targetId = navigated.id;
+					session.surface = navigated.surface;
+					session.url = exactChatGptUrl(navigated.url);
+				});
+			} catch (error) {
+				await withStateLock(this.options.stateRoot, async (state) => {
+					const current = state.sessions[sessionId];
+					if (current && !current.targetId) delete state.sessions[sessionId];
+				});
+				if (createdTarget) await this.options.environment.closeTarget(createdTarget.id).catch(() => undefined);
+				throw error;
 			}
-			const navigated = await this.options.environment.navigateTarget(target.id, url);
-			await withStateLock(this.options.stateRoot, async (current) => {
-				const session = requireSession(current, sessionId);
-				if (session.targetId && session.targetId !== navigated.id) throw new Error("Desktop session target changed during claim.");
-				const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== sessionId && entry.targetId === navigated.id);
-				if (duplicate) throw new Error("Desktop renderer is already owned by another GPT-Control session.");
-				session.targetId = navigated.id;
-				session.url = exactChatGptUrl(navigated.url);
-			});
 			snapshot = await this.sessionById(sessionId);
 		} else {
 			await this.assertExactTarget(snapshot);
@@ -350,9 +390,22 @@ class DesktopCdpBridge {
 			}
 			if (!sameExactUrl(expected.url, session.url)) throw new Error("Desktop exact target recorded URL changed before the browser action.");
 		}
-		const targets = await this.options.environment.listTargets();
-		let target = targets.find((candidate) => candidate.id === session.targetId);
-		if (!target) {
+			let targets = await this.options.environment.listTargets();
+			let target = targets.find((candidate) => candidate.id === session.targetId);
+			if (target
+				&& !eligibleTarget(target)
+				&& session.surface === "desktop_shell"
+				&& session.sendState === "attempted"
+				&& session.url === `${CHATGPT_ORIGIN}/`) {
+				const deadline = Date.now() + 5_000;
+				while (Date.now() < deadline && !eligibleTarget(target)) {
+					await sleep(100);
+					targets = await this.options.environment.listTargets();
+					target = targets.find((candidate) => candidate.id === session.targetId);
+					if (!target) break;
+				}
+			}
+			if (!target) {
 			const identity = providerConversationIdentity(session.url);
 			if (identity) {
 				const state = await readState(this.options.stateRoot);
@@ -371,6 +424,7 @@ class DesktopCdpBridge {
 						const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== session.sessionId && entry.targetId === target?.id);
 						if (duplicate) throw new Error("Replacement ChatGPT Desktop renderer became owned by another session.");
 						durable.targetId = target!.id;
+						durable.surface = target!.surface;
 						durable.url = identity.url;
 					});
 					session = await this.sessionById(session.sessionId);
@@ -554,6 +608,7 @@ function parseState(value: unknown): DesktopDriverState {
 			|| typeof candidate.name !== "string"
 			|| !Number.isInteger(candidate.tabId)
 			|| typeof candidate.targetId !== "string"
+			|| (candidate.surface !== undefined && candidate.surface !== "web" && candidate.surface !== "desktop_shell")
 			|| typeof candidate.url !== "string"
 			|| !new Set(["working", "needs_user", "completed"]).has(String(candidate.state))
 			|| !new Set(["prepared", "attempted", "submitted"]).has(String(candidate.sendState))
@@ -656,7 +711,10 @@ function requiredDriverState(value: unknown): "working" | "needs_user" | "comple
 }
 
 function isSendSelector(selector: string): boolean {
-	return selector.includes("send-button") || selector.includes("Send prompt") || selector.includes("composer-send");
+	return selector.includes("send-button")
+		|| selector.includes("Send prompt")
+		|| selector.includes("composer-send")
+		|| selector === 'button[aria-label="Send"]';
 }
 
 function commandResult(ok: boolean, result?: unknown, error?: string): ExecResult {
