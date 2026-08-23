@@ -1,15 +1,23 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
-import { runDriverCli } from "../src/desktop-cdp-driver.mjs";
+import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-export async function main() {
-  await runDriverCli();
-}
+// Compatibility entry point. Keep both published executable names on the one
+// live-verified TypeScript driver rather than exposing the earlier preview
+// implementation as a second runtime.
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const child = spawn(process.execPath, [resolve(root, "dist/gpt-control-desktop-driver.js")], {
+  cwd: root,
+  env: process.env,
+  stdio: "inherit",
+});
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stdout.write(`${JSON.stringify({ version: 2, ok: false, error: message })}\n`);
-    process.exitCode = 1;
-  });
-}
+child.on("error", (error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
+child.on("exit", (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exitCode = code ?? 1;
+});

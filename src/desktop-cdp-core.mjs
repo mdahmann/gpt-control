@@ -679,9 +679,14 @@ export async function assertRegularUploadFiles(files) {
   const verified = [];
   for (const input of files) {
     if (typeof input !== "string" || !input) throw new Error("Desktop upload path is invalid.");
+    const inputStat = await lstat(input);
+    if (!inputStat.isFile() || inputStat.isSymbolicLink()) throw new Error(`Desktop upload is not a regular file: ${input}`);
     const resolved = await realpath(input);
-    const stat = await lstat(resolved);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Desktop upload is not a regular file: ${input}`);
+    const resolvedStat = await lstat(resolved);
+    if (!resolvedStat.isFile() || resolvedStat.isSymbolicLink()
+      || inputStat.dev !== resolvedStat.dev || inputStat.ino !== resolvedStat.ino) {
+      throw new Error(`Desktop upload identity changed during verification: ${input}`);
+    }
     verified.push(resolved);
   }
   return verified;

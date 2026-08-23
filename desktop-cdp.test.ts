@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -210,7 +210,7 @@ describe("durable state and file boundaries", () => {
     const link = join(root, "link.txt");
     await writeFile(file, "ok");
     await symlink(file, link);
-    expect(await assertRegularUploadFiles([file])).toEqual([file]);
+    expect(await assertRegularUploadFiles([file])).toEqual([await realpath(file)]);
     await expect(assertRegularUploadFiles([link])).rejects.toThrow(/regular file/i);
   });
 });
