@@ -45,6 +45,9 @@ Read-only sidebar discovery is also available through
 the signed app's local rendered row identity. It does not select a row. After
 an exact attachment, `gpt_conversation_read` can return the newest 1–20 visible
 turns and `gpt_conversation_status` can report live state without sending.
+Exact attachment always creates a separate owned renderer and therefore also
+requires `GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1`; it never borrows
+the user's current window.
 
 ## Explicit live acceptance
 
@@ -61,8 +64,8 @@ node scripts/desktop-cdp-live-smoke.mjs --live
 
 Additional renderers are disabled by default. To test more than one distinct
 session, explicitly enable target creation. The driver uses the signed app's
-native **New Window** command and restores the previously frontmost app after
-the new renderer becomes ready:
+loopback CDP endpoint to create one exact independently owned background
+window and records the returned renderer ID:
 
 ```sh
 export GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1
@@ -74,11 +77,18 @@ node scripts/desktop-cdp-live-smoke.mjs --live --concurrency 2
 Repeat with concurrency `3` and `6`. A clean capacity blocker is acceptable.
 Two workers silently sharing one renderer is a failure.
 
+The unified ChatGPT/Codex macOS app permits only one normal-profile process.
+Start that process with the loopback CDP flags before opening the Codex thread
+that will use GPT-Control. A temporary `--user-data-dir` is suitable for
+failure-path tests, but it is not proof that the normal signed-in ChatGPT
+profile can create a ready composer. Do not restart the unified app during an
+active Codex turn.
+
 The current macOS acceptance has proved one hidden/background session and two
 independent concurrent windows without changing the frontmost app during chat
-work. New Window can briefly activate ChatGPT before focus restoration. For the
-least disruption, keep the dedicated GPT-Control app instance on another Space
-and create the desired worker-window pool before starting long work.
+work. For the least disruption, keep the dedicated GPT-Control app instance on
+another Space and create the desired worker-window pool before starting long
+work.
 
 Native-shell clicks use trusted CDP mouse input. A capture-phase guard checks
 the exact provider conversation and clicked element inside the page when the

@@ -29,6 +29,7 @@ export interface DesktopCdpTarget {
 	type: "page" | "webview";
 	title: string;
 	url: string;
+	browserInstanceId?: string;
 	surface?: "web" | "desktop_shell";
 	runtimeUrl?: string;
 }
@@ -47,6 +48,7 @@ export interface DesktopHostReceipt {
 	listenerPid: number;
 	endpoint: string;
 	browserVersion: string;
+	browserInstanceId: string;
 }
 
 export interface DesktopCdpEnvironment {
@@ -55,11 +57,12 @@ export interface DesktopCdpEnvironment {
 	findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog>;
 	createTarget(url: string): Promise<DesktopCdpTarget>;
 	navigateTarget(targetId: string, url: string): Promise<DesktopCdpTarget>;
+	windowId(targetId: string): Promise<number | undefined>;
 	readHtml(targetId: string): Promise<string>;
 	elementExists(targetId: string, selector: string, expectedUrl?: string): Promise<boolean>;
 	act(targetId: string, action: DesktopCdpAction): Promise<unknown>;
 	screenshot(targetId: string): Promise<string>;
-	closeTarget(targetId: string): Promise<void>;
+	closeTarget(targetId: string, browserInstanceId?: string): Promise<void>;
 }
 
 export interface DesktopDriverRequest {
@@ -86,8 +89,14 @@ interface DesktopSessionState {
 	name: string;
 	tabId: number;
 	targetId: string;
+	windowId?: number;
+	browserInstanceId?: string;
 	surface?: "web" | "desktop_shell";
 	createdTarget?: boolean;
+	closeState?: "requested" | "target_closed";
+	closeOwnerToken?: string;
+	closeOwnerPid?: number;
+	closeOwnerHostname?: string;
 	url: string;
 	state: "working" | "needs_user" | "completed";
 	sendState: "prepared" | "attempted" | "submitted";
@@ -114,8 +123,8 @@ export async function handleDesktopDriverRequest(
 			await options.environment.verifyHost();
 			return success({ ready: true, driver: DESKTOP_DRIVER_ID, secureInput: true, protocolVersion: 2 });
 		}
-		await options.environment.verifyHost();
-		const bridge = new DesktopCdpBridge(options);
+		const host = await options.environment.verifyHost();
+		const bridge = new DesktopCdpBridge(options, host);
 		const driver: WebChatDriver = new ChromeBridgeBrowserDriver(bridge.exec, bridge.launcher);
 		const params = request.params;
 		switch (request.action) {
@@ -203,7 +212,7 @@ class DesktopCdpBridge {
 		},
 	};
 
-	constructor(private readonly options: DesktopDriverOptions) {}
+	constructor(private readonly options: DesktopDriverOptions, private host: DesktopHostReceipt) {}
 
 	readonly exec: Exec = async (command, args): Promise<ExecResult> => {
 		try {
@@ -339,22 +348,102 @@ class DesktopCdpBridge {
 		if (operation === "state") {
 			const sessionId = requiredString(rest[0], "sessionId");
 			const next = requiredDriverState(rest[1]);
-			await withStateLock(this.options.stateRoot, async (state) => { requireSession(state, sessionId).state = next; });
+			await withStateLock(this.options.stateRoot, async (state) => {
+				const session = requireSession(state, sessionId);
+				assertSessionNotClosing(session);
+				session.state = next;
+			});
 			return { success: true };
 		}
 		if (operation === "close") {
 			const sessionId = requiredString(rest[0], "sessionId");
-			let targetId = "";
-			let surface: DesktopSessionState["surface"];
-			let createdTarget = false;
+			const closeToken = randomUUID();
+			const snapshot = await withStateLock(this.options.stateRoot, async (state) => {
+				const session = requireSession(state, sessionId);
+				session.closeState ??= "requested";
+				if (session.closeState === "target_closed") return { session: { ...session }, claimed: new Set<string>() };
+				if (session.closeOwnerToken) {
+					if (session.closeOwnerHostname !== hostname()) throw new Error(`Desktop session ${sessionId} close is owned by another host.`);
+					if (session.closeOwnerPid && processIsAlive(session.closeOwnerPid)) throw new Error(`Desktop session ${sessionId} close is already in progress.`);
+				}
+				session.closeOwnerToken = closeToken;
+				session.closeOwnerPid = process.pid;
+				session.closeOwnerHostname = hostname();
+				return {
+					session: { ...session },
+					claimed: new Set(Object.values(state.sessions)
+						.filter((entry) => entry.sessionId !== sessionId)
+						.map((entry) => entry.targetId)
+						.filter(Boolean)),
+				};
+			});
+			if (snapshot.session.closeState === "target_closed") {
+				await withStateLock(this.options.stateRoot, async (state) => { delete state.sessions[sessionId]; });
+				return { success: true };
+			}
+			let ownedTargetId: string | undefined;
+			try {
+				const session = snapshot.session;
+				if (session.createdTarget === true && !session.browserInstanceId) {
+					throw new Error(`Desktop session ${sessionId} uses legacy ownership state and cannot safely close its renderer automatically; the durable record was retained for manual cleanup.`);
+				}
+				if (session.targetId && session.createdTarget === true
+					&& session.browserInstanceId === this.host.browserInstanceId) {
+					const targets = await this.options.environment.listTargets();
+					let owned = snapshot.claimed.has(session.targetId)
+						? undefined
+						: targets.find((target) => target.id === session.targetId);
+					if (session.windowId !== undefined) {
+						if (owned && await this.options.environment.windowId(owned.id) !== session.windowId) owned = undefined;
+						if (!owned) {
+							const replacements: DesktopCdpTarget[] = [];
+							for (const candidate of targets) {
+								if (snapshot.claimed.has(candidate.id)) continue;
+								if (await this.options.environment.windowId(candidate.id) === session.windowId) replacements.push(candidate);
+							}
+							if (replacements.length > 1) throw new Error(`Desktop session ${sessionId} has ambiguous replacement renderers in its owned window.`);
+							owned = replacements[0];
+						}
+					} else if (!owned) {
+						throw new Error(`Desktop session ${sessionId} lost its exact renderer and has no native window identity; the durable record was retained for manual cleanup.`);
+					}
+					ownedTargetId = owned?.id;
+					if (ownedTargetId) {
+						ownedTargetId = await withStateLock(this.options.stateRoot, async (state) => {
+							const durable = requireSession(state, sessionId);
+							if (durable.closeOwnerToken !== closeToken) throw new Error(`Desktop session ${sessionId} close ownership changed.`);
+							const duplicate = Object.values(state.sessions)
+								.find((entry) => entry.sessionId !== sessionId && entry.targetId === ownedTargetId);
+							if (duplicate) return undefined;
+							durable.targetId = ownedTargetId!;
+							return ownedTargetId;
+						});
+						if (ownedTargetId) await this.options.environment.closeTarget(ownedTargetId, session.browserInstanceId);
+					}
+				}
+				await withStateLock(this.options.stateRoot, async (state) => {
+					const durable = requireSession(state, sessionId);
+					if (durable.closeOwnerToken !== closeToken) throw new Error(`Desktop session ${sessionId} close ownership changed.`);
+					durable.closeState = "target_closed";
+					delete durable.closeOwnerToken;
+					delete durable.closeOwnerPid;
+					delete durable.closeOwnerHostname;
+				});
+			} catch (error) {
+				await withStateLock(this.options.stateRoot, async (state) => {
+					const durable = state.sessions[sessionId];
+					if (durable?.closeOwnerToken !== closeToken) return;
+					delete durable.closeOwnerToken;
+					delete durable.closeOwnerPid;
+					delete durable.closeOwnerHostname;
+				});
+				throw error;
+			}
 			await withStateLock(this.options.stateRoot, async (state) => {
 				const session = requireSession(state, sessionId);
-				targetId = session.targetId;
-				surface = session.surface;
-				createdTarget = session.createdTarget === true;
+				if (session.closeState !== "target_closed") throw new Error(`Desktop session ${sessionId} has not completed target cleanup.`);
 				delete state.sessions[sessionId];
 			});
-			if (targetId && (surface !== "desktop_shell" || createdTarget)) await this.options.environment.closeTarget(targetId);
 			return { success: true };
 		}
 		throw new Error(`Unsupported desktop taskSession operation: ${operation}`);
@@ -364,42 +453,52 @@ class DesktopCdpBridge {
 		let snapshot = await this.sessionById(sessionId);
 		if (!snapshot.targetId) {
 			let createdTarget: DesktopCdpTarget | undefined;
-				try {
-					const targets = await this.options.environment.listTargets();
-					const state = await readState(this.options.stateRoot);
-					const claimed = new Set(Object.values(state.sessions).map((session) => session.targetId).filter(Boolean));
-					const available = targets.filter((candidate) => eligibleTarget(candidate) && !claimed.has(candidate.id));
-					let target = targets.find((candidate) => eligibleTarget(candidate)
+			try {
+				const targets = await this.options.environment.listTargets();
+				const state = await readState(this.options.stateRoot);
+				const claimed = new Set(Object.values(state.sessions).map((session) => session.targetId).filter(Boolean));
+				const available = targets.filter((candidate) => eligibleTarget(candidate) && !claimed.has(candidate.id));
+				const exactProviderConversation = providerConversationIdentity(url);
+				let target: DesktopCdpTarget | undefined;
+				let navigated: DesktopCdpTarget | undefined;
+				if (exactProviderConversation) {
+					if (!this.options.allowCreateTarget) {
+						throw new Error("Exact ChatGPT conversation attachment requires a new owned renderer, but dedicated target creation is disabled.");
+					}
+					createdTarget = await this.options.environment.createTarget(CHATGPT_ORIGIN);
+					target = createdTarget;
+				} else {
+					target = targets.find((candidate) => eligibleTarget(candidate)
 						&& !claimed.has(candidate.id)
 						&& sameExactUrl(candidate.url, url));
-					let navigated: DesktopCdpTarget | undefined;
-					if (!target && providerConversationIdentity(url)) {
-						for (const candidate of available) {
-							try {
-								navigated = await this.options.environment.navigateTarget(candidate.id, url);
-								target = candidate;
-								break;
-							} catch (error) {
-								if (!errorMessage(error).includes("exact ChatGPT Desktop sidebar conversation is unavailable or ambiguous")) throw error;
-							}
-						}
-					}
 					target ??= available[0];
 					if (!target) {
-					const activeClaims = claimed.size;
-					if (activeClaims > 0 && !this.options.allowCreateTarget) {
-						throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
+						const activeClaims = claimed.size;
+						if (activeClaims > 0 && !this.options.allowCreateTarget) {
+							throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
+						}
+						createdTarget = await this.options.environment.createTarget(url);
+						target = createdTarget;
 					}
-					createdTarget = await this.options.environment.createTarget(providerConversationIdentity(url) ? CHATGPT_ORIGIN : url);
-					target = createdTarget;
 				}
-					navigated ??= await this.options.environment.navigateTarget(target.id, url);
+				navigated ??= await this.options.environment.navigateTarget(target.id, url);
+				const ownershipHost = await this.options.environment.verifyHost();
+				if (createdTarget?.browserInstanceId && createdTarget.browserInstanceId !== ownershipHost.browserInstanceId) {
+					throw new Error("ChatGPT Desktop browser instance changed during native renderer creation.");
+				}
+				const provedTarget = (await this.options.environment.listTargets())
+					.find((candidate) => candidate.id === navigated.id && sameExactUrl(candidate.url, navigated.url));
+				if (!provedTarget) throw new Error("ChatGPT Desktop renderer ownership changed before durable claim.");
+				this.host = ownershipHost;
+				const windowId = await this.options.environment.windowId(navigated.id);
 				await withStateLock(this.options.stateRoot, async (current) => {
 					const session = requireSession(current, sessionId);
 					if (session.targetId && session.targetId !== navigated.id) throw new Error("Desktop session target changed during claim.");
 					const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== sessionId && entry.targetId === navigated.id);
 					if (duplicate) throw new Error("Desktop renderer is already owned by another GPT-Control session.");
 					session.targetId = navigated.id;
+					session.windowId = windowId;
+					session.browserInstanceId = ownershipHost.browserInstanceId;
 					session.surface = navigated.surface;
 					session.createdTarget = createdTarget?.id === navigated.id;
 					session.url = exactChatGptUrl(navigated.url);
@@ -409,7 +508,7 @@ class DesktopCdpBridge {
 					const current = state.sessions[sessionId];
 					if (current && !current.targetId) delete state.sessions[sessionId];
 				});
-				if (createdTarget) await this.options.environment.closeTarget(createdTarget.id).catch(() => undefined);
+				if (createdTarget) await this.options.environment.closeTarget(createdTarget.id, this.host.browserInstanceId).catch(() => undefined);
 				throw error;
 			}
 			snapshot = await this.sessionById(sessionId);
@@ -433,6 +532,10 @@ class DesktopCdpBridge {
 	}
 
 	private async assertExactTarget(session: DesktopSessionState, expected?: ExactBrowserActionTarget): Promise<DesktopSessionState> {
+		assertSessionNotClosing(session);
+		if (!session.browserInstanceId || session.browserInstanceId !== this.host.browserInstanceId) {
+			throw new Error("ChatGPT Desktop browser instance changed; durable renderer ownership is no longer valid.");
+		}
 		if (!session.targetId) throw new Error(`Desktop session ${session.sessionId} owns no renderer.`);
 		if (expected) {
 			if (expected.sessionId !== session.sessionId || expected.tabId !== session.tabId || expected.name !== session.name) {
@@ -442,6 +545,8 @@ class DesktopCdpBridge {
 		}
 			let targets = await this.options.environment.listTargets();
 			let target = targets.find((candidate) => candidate.id === session.targetId);
+			if (target && session.windowId !== undefined
+				&& await this.options.environment.windowId(target.id) !== session.windowId) target = undefined;
 			if (target
 				&& !eligibleTarget(target)
 				&& session.surface === "desktop_shell"
@@ -455,6 +560,9 @@ class DesktopCdpBridge {
 					if (!target) break;
 				}
 			}
+			if (!target && session.windowId === undefined) {
+				throw new Error("Desktop exact target renderer changed and no native window identity is available for safe rebinding.");
+			}
 			if (!target) {
 			const identity = providerConversationIdentity(session.url);
 			if (identity) {
@@ -463,10 +571,14 @@ class DesktopCdpBridge {
 					.filter((entry) => entry.sessionId !== session.sessionId)
 					.map((entry) => entry.targetId)
 					.filter(Boolean));
-				const matches = targets.filter((candidate) => {
+				const matches: DesktopCdpTarget[] = [];
+				for (const candidate of targets) {
 					const candidateIdentity = eligibleTarget(candidate) ? providerConversationIdentity(candidate.url) : undefined;
-					return candidateIdentity?.id === identity.id && !claimed.has(candidate.id);
-				});
+					if (candidateIdentity?.id !== identity.id || claimed.has(candidate.id)) continue;
+					if (session.windowId !== undefined
+						&& await this.options.environment.windowId(candidate.id) !== session.windowId) continue;
+					matches.push(candidate);
+				}
 				if (matches.length === 1) {
 					target = matches[0];
 					await withStateLock(this.options.stateRoot, async (current) => {
@@ -474,6 +586,7 @@ class DesktopCdpBridge {
 						const duplicate = Object.values(current.sessions).find((entry) => entry.sessionId !== session.sessionId && entry.targetId === target?.id);
 						if (duplicate) throw new Error("Replacement ChatGPT Desktop renderer became owned by another session.");
 						durable.targetId = target!.id;
+					durable.windowId = await this.options.environment.windowId(target!.id);
 						durable.surface = target!.surface;
 						durable.url = identity.url;
 					});
@@ -501,12 +614,15 @@ class DesktopCdpBridge {
 	}
 
 	private async sessionById(sessionId: string): Promise<DesktopSessionState> {
-		return requireSession(await readState(this.options.stateRoot), sessionId);
+		const session = requireSession(await readState(this.options.stateRoot), sessionId);
+		assertSessionNotClosing(session);
+		return session;
 	}
 
 	private async sessionByTabId(tabId: number): Promise<DesktopSessionState> {
 		const session = Object.values((await readState(this.options.stateRoot)).sessions).find((entry) => entry.tabId === tabId);
 		if (!session) throw new Error(`Desktop tab ${tabId} is not owned by GPT-Control.`);
+		assertSessionNotClosing(session);
 		return session;
 	}
 
@@ -669,8 +785,16 @@ function parseState(value: unknown): DesktopDriverState {
 			|| typeof candidate.name !== "string"
 			|| !Number.isInteger(candidate.tabId)
 			|| typeof candidate.targetId !== "string"
+			|| (candidate.windowId !== undefined && (!Number.isSafeInteger(candidate.windowId) || (candidate.windowId as number) < 0))
+			|| (candidate.browserInstanceId !== undefined && (typeof candidate.browserInstanceId !== "string" || candidate.browserInstanceId.length < 8 || candidate.browserInstanceId.length > 256))
 			|| (candidate.surface !== undefined && candidate.surface !== "web" && candidate.surface !== "desktop_shell")
 			|| (candidate.createdTarget !== undefined && typeof candidate.createdTarget !== "boolean")
+			|| (candidate.closeState !== undefined && candidate.closeState !== "requested" && candidate.closeState !== "target_closed")
+			|| (candidate.closeOwnerToken !== undefined && (typeof candidate.closeOwnerToken !== "string" || candidate.closeOwnerToken.length < 8))
+			|| (candidate.closeOwnerPid !== undefined && (!Number.isSafeInteger(candidate.closeOwnerPid) || (candidate.closeOwnerPid as number) <= 0))
+			|| (candidate.closeOwnerHostname !== undefined && (typeof candidate.closeOwnerHostname !== "string" || candidate.closeOwnerHostname === ""))
+			|| ((candidate.closeOwnerToken === undefined) !== (candidate.closeOwnerPid === undefined))
+			|| ((candidate.closeOwnerToken === undefined) !== (candidate.closeOwnerHostname === undefined))
 			|| typeof candidate.url !== "string"
 			|| !new Set(["working", "needs_user", "completed"]).has(String(candidate.state))
 			|| !new Set(["prepared", "attempted", "submitted"]).has(String(candidate.sendState))
@@ -687,6 +811,10 @@ function requireSession(state: DesktopDriverState, sessionId: string): DesktopSe
 	const session = state.sessions[sessionId];
 	if (!session) throw new Error(`Unknown ChatGPT Desktop session: ${sessionId}`);
 	return session;
+}
+
+function assertSessionNotClosing(session: DesktopSessionState): void {
+	if (session.closeState) throw new Error(`Desktop session ${session.sessionId} is closing; only close retry is allowed.`);
 }
 
 function eligibleTarget(target: DesktopCdpTarget): boolean {
