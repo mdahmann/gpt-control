@@ -94,6 +94,12 @@ export interface ChatGptConversationActionResult {
 	verifiedAt: string;
 }
 
+export interface ChatGptConversationTurn {
+	role: "user" | "assistant";
+	text: string;
+	messageId?: string;
+}
+
 export interface ExactBrowserActionTarget {
 	sessionId: string;
 	tabId: number;
@@ -660,38 +666,130 @@ export async function manageChatGptConversation(
 	const deadline = Date.now() + timeoutMs;
 	if (action.action === "rename") {
 		const title = normalizeManagementLabel(action.title, 128, "title");
-		const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
-		await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
-		await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
-		await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
-		await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
-		await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
-		await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
-		return { title, verifiedAt: nowIso() };
+		try {
+			const nativeTitleSelector = nativeHeaderTitleSelector(await readPageHtml(exec, launcher, tabId, signal));
+			if (nativeTitleSelector && expectedTarget) {
+				try {
+					await privateBridgeJson(exec, launcher, "doubleClick", {
+						tabId, selector: nativeTitleSelector, expectedTarget,
+					}, signal);
+				} catch (error) {
+					const interrupted = /trusted click.*(?:blocked|pending)/i.test(error instanceof Error ? error.message : String(error));
+					const editorReady = parse(await readPageHtml(exec, launcher, tabId, signal))
+						.querySelectorAll('[aria-label="Chat title"]').length === 1;
+					if (!interrupted || !editorReady) throw error;
+				}
+			} else {
+				const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
+				if (optionsSelector === '[aria-current="page"] button[aria-label="Chat actions"]') {
+					await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+				} else {
+					await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
+				}
+				await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
+			}
+			await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
+			await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
+			try {
+				await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
+			} catch (error) {
+				const interrupted = /trusted key was blocked/i.test(error instanceof Error ? error.message : String(error));
+				const editorClosed = parse(await readPageHtml(exec, launcher, tabId, signal))
+					.querySelectorAll('[aria-label="Chat title"]').length === 0;
+				if (!interrupted || !editorClosed) throw error;
+			}
+			await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
+			return { title, verifiedAt: nowIso() };
+		} catch (error) {
+			await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+			throw error;
+		}
 	}
 
-	await openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+	const nativeDesktop = isNativeDesktopShell(await readPageHtml(exec, launcher, tabId, signal));
 	if (action.action === "move") {
 		const project = normalizeManagementLabel(action.project, 128, "project");
-		await clickLiveMenuItem(exec, launcher, tabId, "Move to project", deadline, signal, expectedTarget);
-		const option = await waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal);
-		await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
-		await waitForProjectReadback(exec, launcher, tabId, identity.id, project, deadline, signal);
-		return { project, verifiedAt: nowIso() };
+		let lastError: unknown;
+		for (let attempt = 0; attempt < (nativeDesktop ? 2 : 1); attempt += 1) {
+			const moveDeadline = Date.now() + timeoutMs;
+			try {
+				if (nativeDesktop) {
+					await openNativeHeaderConversationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+				} else {
+					await openConversationOrganizationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+				}
+				await clickLiveMenuItem(exec, launcher, tabId, ["Move to project", "Project"], moveDeadline, signal, expectedTarget);
+				const option = await waitForProjectMenuOption(exec, launcher, tabId, project, moveDeadline, signal);
+				if (nativeDesktop && expectedTarget) {
+					if (attempt === 0) {
+						const activation = await privateBridgeJson(exec, launcher, "activate", { tabId, selector: option.selector, expectedTarget }, signal);
+						const alerts = Array.isArray(activation.visibleAlerts) ? activation.visibleAlerts.map(String) : [];
+						const refusal = alerts.find((message) => /could(?:n't| not) update the conversation(?:'s|s) project/i.test(message));
+						if (refusal) throw new Error(`ChatGPT refused the project move: ${refusal}`);
+					} else {
+						await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+					}
+					await privateBridgeJson(exec, launcher, "reload", { tabId, expectedTarget }, signal);
+					await waitForSelectorInHtml(
+						exec,
+						launcher,
+						tabId,
+						'#prompt-textarea,div[contenteditable="true"][aria-label="Message ChatGPT"]',
+						moveDeadline,
+						signal,
+					);
+					await verifyNativeProjectMembership(exec, launcher, tabId, project, true, moveDeadline, signal, expectedTarget);
+				} else {
+					await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+					await waitForProjectReadback(exec, launcher, tabId, identity.id, project, moveDeadline, signal);
+				}
+				return { project, verifiedAt: nowIso() };
+			} catch (error) {
+				lastError = error;
+				await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+			}
+		}
+		throw lastError;
 	}
 	if (action.action === "archive") {
+		if (nativeDesktop) {
+			await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+			const nativeRemovalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+			if (nativeRemovalLabel) {
+				const project = nativeRemovalLabel.replace(/^Remove from\s+/i, "").trim();
+				await clickLiveMenuItem(exec, launcher, tabId, nativeRemovalLabel, deadline, signal, expectedTarget);
+				await verifyNativeProjectMembership(exec, launcher, tabId, project, false, deadline, signal, expectedTarget);
+			} else {
+				await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+			}
+			await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+		} else {
+			await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+			const removalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+			if (removalLabel) {
+				await clickLiveMenuItem(exec, launcher, tabId, removalLabel, deadline, signal, expectedTarget);
+				await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+			}
+		}
 		await clickLiveMenuItem(exec, launcher, tabId, "Archive", deadline, signal, expectedTarget);
 		await waitForArchiveReadback(exec, launcher, tabId, identity.url, deadline, signal);
 		return { archived: true, verifiedAt: nowIso() };
 	}
+	await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
 	const desired = action.action === "pin";
-	const already = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+	const openMenuState = conversationPinMenuState(await readPageHtml(exec, launcher, tabId, signal));
+	const already = openMenuState ?? isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
 	if (already !== desired) {
-		await clickLiveMenuItem(exec, launcher, tabId, desired ? "Pin chat" : "Unpin chat", deadline, signal, expectedTarget);
+		await clickLiveMenuItem(exec, launcher, tabId, desired ? ["Pin chat", "Pin"] : ["Unpin chat", "Unpin"], deadline, signal, expectedTarget);
+		await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
 	}
 	for (;;) {
-		const pinned = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
-		if (pinned === desired) return { pinned, verifiedAt: nowIso() };
+		const html = await readPageHtml(exec, launcher, tabId, signal);
+		const pinned = conversationPinMenuState(html) ?? isConversationPinned(html, identity.id);
+		if (pinned === desired) {
+			await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+			return { pinned, verifiedAt: nowIso() };
+		}
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
@@ -1161,6 +1259,28 @@ export function approvedImageUrl(raw: string): URL | undefined {
 	if (url.protocol !== "https:") return undefined;
 	const host = url.hostname.toLowerCase();
 	return IMAGE_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url : undefined;
+}
+
+export function extractConversationTurns(html: string, limit = 10): ChatGptConversationTurn[] {
+	if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
+	const root = parse(html);
+	const turns = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`).map((node) => {
+		const assistant = node.getAttribute("data-message-author-role") === "assistant"
+			|| (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
+		const content = assistant
+			? node.querySelector(ASSISTANT_CONTENT_SELECTOR)
+			: USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
+		const text = (content?.structuredText ?? node.structuredText ?? "")
+			.replace(/[ \t]+\n/g, "\n")
+			.replace(/\n{3,}/g, "\n\n")
+			.trim();
+		return {
+			role: assistant ? "assistant" as const : "user" as const,
+			text,
+			messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined,
+		};
+	}).filter((turn) => turn.text.length > 0);
+	return turns.slice(-limit);
 }
 
 export function extractAssistantTurn(html: string): AssistantTurn {
@@ -1787,7 +1907,12 @@ async function pickerAction(
 
 function extractAdvancedPickerState(html: string, composerSelector: string): AdvancedPickerState | undefined {
 	const root = parse(html);
-	const active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+	let active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+	if (!active) {
+		const composer = root.querySelector(composerSelector);
+		const menuId = composer?.getAttribute("aria-expanded") === "true" ? composer.getAttribute("aria-controls") : undefined;
+		if (menuId) active = root.querySelector(`[id="${cssString(menuId)}"]`);
+	}
 	if (!active) return undefined;
 	const rows = active.querySelectorAll('[role="menuitem"]');
 	const model = rows.find((node) => /^Model(?:\s|$)/i.test(nodeLabel(node)));
@@ -1796,10 +1921,15 @@ function extractAdvancedPickerState(html: string, composerSelector: string): Adv
 	return {
 		currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
 		currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
-		modelSelector: model ? exactNodeSelector(model) : undefined,
-		effortSelector: effort ? exactNodeSelector(effort) : undefined,
+		modelSelector: model ? pickerSubmenuOwnerSelector(model) : undefined,
+		effortSelector: effort ? pickerSubmenuOwnerSelector(effort) : undefined,
 		composerSelector,
 	};
+}
+
+function pickerSubmenuOwnerSelector(node: HTMLElement): string | undefined {
+	const id = node.getAttribute("id");
+	return id ? `[id="${cssString(id)}"]` : exactNodeSelector(node);
 }
 
 function pickerRowValue(label: string, prefix: "Model" | "Effort"): string | undefined {
@@ -1813,6 +1943,7 @@ function extractPickerRadioOptions(html: string, ownerSelector?: string): Array<
 	return uniqueElements([
 		...root.querySelectorAll('[role="menuitemradio"]'),
 		...root.querySelectorAll('[role="option"]'),
+		...(ownerId ? root.querySelectorAll('[role="menuitem"]') : []),
 	]).filter((node) => {
 		if (!ownerId) return true;
 		return node.closest('[role="menu"]')?.getAttribute("aria-labelledby") === ownerId;
@@ -1831,8 +1962,8 @@ function extractPickerRadioOptions(html: string, ownerSelector?: string): Array<
 
 function extractChatGptProjects(html: string): string[] {
 	const root = parse(html);
-	const names = root.querySelectorAll('button[aria-label^="Open project options for "]')
-		.map((node) => (node.getAttribute("aria-label") ?? "").replace(/^Open project options for\s+/i, "").trim())
+	const names = root.querySelectorAll('button[aria-label^="Open project options for "],button[aria-label^="Project actions for "]')
+		.map((node) => (node.getAttribute("aria-label") ?? "").replace(/^(?:Open project options|Project actions) for\s+/i, "").trim())
 		.filter(Boolean);
 	return [...new Set(names)];
 }
@@ -1850,13 +1981,17 @@ async function conversationSidebarOptionsSelector(
 		const matches = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`);
 		if (matches.length > 1) throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
 		if (matches.length === 1) return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+		const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+		const nativeMatches = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+		if (nativeMatches.length > 1) throw new Error("ChatGPT native sidebar exposes duplicate controls for the exact conversation.");
+		if (nativeShell && nativeMatches.length === 1) return '[aria-current="page"] button[aria-label="Chat actions"]';
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
 }
 
-async function openConversationHeaderMenu(
+async function openConversationOrganizationMenu(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
@@ -1870,7 +2005,27 @@ async function openConversationHeaderMenu(
 		const nativeSidebarButtons = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
 		if (nativeSidebarButtons.length > 1) throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
 		if (nativeSidebarButtons.length === 1) {
-			await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+			try {
+				await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+			} catch (error) {
+				if (!/trusted click.*blocked/i.test(error instanceof Error ? error.message : String(error))) throw error;
+				if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+					if (Date.now() >= deadline) throw error;
+					await sleep(Math.min(pollIntervalMs(), 200));
+					continue;
+				}
+			}
+			return;
+		}
+		const nativeHeaderButtons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+		if (nativeHeaderButtons.length > 1) throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+		if (nativeHeaderButtons.length === 1 && !nativeShell) {
+			try {
+				await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+			} catch (error) {
+				if (!/trusted click.*blocked/i.test(error instanceof Error ? error.message : String(error))
+					|| !hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) throw error;
+			}
 			return;
 		}
 		if (nativeShell) {
@@ -1893,30 +2048,90 @@ async function openConversationHeaderMenu(
 	throw new Error("ChatGPT conversation action control is unavailable.");
 }
 
-async function clickLiveMenuItem(
+async function openNativeHeaderConversationMenu(
 	exec: Exec,
 	launcher: Launcher,
 	tabId: number,
-	label: string,
 	deadline: number,
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
-		const matches = root.querySelectorAll('[role="menuitem"]')
-			.filter((node) => nodeLabel(node).toLowerCase() === label.toLowerCase());
-		if (matches.length > 1) throw new Error(`ChatGPT menu action ${label} is ambiguous.`);
+		const buttons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+		if (buttons.length > 1) throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+		if (buttons.length === 1) {
+			try {
+				await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+			} catch (error) {
+				if (!/trusted click.*blocked/i.test(error instanceof Error ? error.message : String(error))) throw error;
+				if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+					if (Date.now() >= deadline) throw error;
+					await sleep(Math.min(pollIntervalMs(), 200));
+					continue;
+				}
+			}
+			return;
+		}
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error("ChatGPT native header conversation control is unavailable.");
+}
+
+function isNativeDesktopShell(html: string): boolean {
+	return parse(html).querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+}
+
+function nativeHeaderTitleSelector(html: string): string | undefined {
+	const root = parse(html);
+	if (root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length === 0) return undefined;
+	const currentTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+	if (currentTitles.length !== 1) return undefined;
+	const title = nodeLabel(currentTitles[0]);
+	if (!title) return undefined;
+	const matches = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button')
+		.filter((node) => nodeLabel(node) === title);
+	if (matches.length > 1) throw new Error("ChatGPT native header title is ambiguous; rename refused.");
+	return matches.length === 1 ? "text=" + title : undefined;
+}
+
+function hasOpenConversationActionMenu(html: string): boolean {
+	const known = new Set(["pin", "pin chat", "unpin", "unpin chat", "rename", "archive", "project", "move to project", "share", "delete chat"]);
+	const labels = parse(html).querySelectorAll('[role="menuitem"]')
+		.map((node) => normalizePickerLabel(nodeLabel(node)))
+		.filter((label) => known.has(label));
+	return new Set(labels).size >= 2;
+}
+
+async function clickLiveMenuItem(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	label: string | readonly string[],
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	const labels = (Array.isArray(label) ? label : [label]).map((value) => value.toLowerCase());
+	const displayLabel = Array.isArray(label) ? label.join(" or ") : label;
+	let observed: string[] = [];
+	for (;;) {
+		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
+		const menuItems = root.querySelectorAll('[role="menuitem"]');
+		observed = [...new Set(menuItems.map((node) => nodeLabel(node)).filter(Boolean))];
+		const matches = menuItems.filter((node) => labels.includes(nodeLabel(node).toLowerCase()));
+		if (matches.length > 1) throw new Error(`ChatGPT menu action ${displayLabel} is ambiguous.`);
 		if (matches.length === 1) {
 			const selector = exactNodeSelector(matches[0]);
-			if (!selector) throw new Error(`ChatGPT menu action ${label} has no exact selector.`);
+			if (!selector) throw new Error(`ChatGPT menu action ${displayLabel} has no exact selector.`);
 			await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
 			return;
 		}
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
-	throw new Error(`ChatGPT menu action ${label} is unavailable.`);
+	throw new Error(`ChatGPT menu action ${displayLabel} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 
 async function waitForSelectorInHtml(
@@ -1973,14 +2188,24 @@ async function waitForConversationTitle(
 	deadline: number,
 	signal?: AbortSignal,
 ): Promise<void> {
+	let observedNativeTitles: string[] = [];
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
 		const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
 		if (links.length === 1 && nodeLabel(links[0]).includes(title)) return;
+		const nativeTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+		observedNativeTitles = nativeTitles.map((node) => {
+			const marker = node.getAttribute("data-thread-title")?.trim();
+			return marker && marker.toLowerCase() !== "true" ? marker : nodeLabel(node);
+		}).filter(Boolean);
+		if (nativeTitles.length === 1) {
+			const observed = observedNativeTitles[0] ?? "";
+			if (normalizePickerLabel(observed) === normalizePickerLabel(title)) return;
+		}
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
-	throw new Error(`ChatGPT rename read-back failed for ${title}.`);
+	throw new Error(`ChatGPT rename read-back failed for ${title} (observed: ${observedNativeTitles.join(", ") || "none"}).`);
 }
 
 async function waitForProjectMenuOption(
@@ -1991,25 +2216,61 @@ async function waitForProjectMenuOption(
 	deadline: number,
 	signal?: AbortSignal,
 ): Promise<ModelOptionObservation> {
+	let observed: string[] = [];
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
 		const options = root.querySelectorAll('[role="menuitem"]').map((node) => ({
 			label: projectOptionLabel(node),
 			selector: exactNodeSelector(node) ?? "",
 		})).filter((option) => option.label && option.selector);
+		observed = [...new Set(options.map((option) => option.label))];
 		const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(project));
 		if (matches.length > 1) throw new Error(`ChatGPT project ${project} is ambiguous.`);
 		if (matches.length === 1) return matches[0];
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
-	throw new Error(`ChatGPT project ${project} is unavailable.`);
+	throw new Error(`ChatGPT project ${project} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 
 function projectOptionLabel(node: HTMLElement): string {
 	const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
 	const last = lines.at(-1) ?? nodeLabel(node);
 	return last.replace(/^Default color.*?Folder\s+/i, "").trim();
+}
+
+async function verifyNativeProjectMembership(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	project: string,
+	expectedPresent: boolean,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<void> {
+	const expectedRemoval = normalizePickerLabel(`Remove from ${project}`);
+	let observed: string[] = [];
+	for (;;) {
+		await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+		const labels = parse(await readPageHtml(exec, launcher, tabId, signal))
+			.querySelectorAll('[role="menuitem"]')
+			.map((node) => nodeLabel(node))
+			.filter(Boolean);
+		observed = labels;
+		const removalLabels = labels.filter((label) => /^Remove from\s+\S/i.test(label));
+		if (removalLabels.length > 1) throw new Error("ChatGPT project membership read-back is ambiguous.");
+		const exactPresent = removalLabels.some((label) => normalizePickerLabel(label) === expectedRemoval);
+		const genericMove = labels.some((label) => normalizePickerLabel(label) === "move to project");
+		if ((expectedPresent && exactPresent) || (!expectedPresent && removalLabels.length === 0 && genericMove)) {
+			await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+			return;
+		}
+		await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => undefined);
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT project membership read-back failed for ${project} (expected: ${expectedPresent ? "present" : "absent"}; observed: ${observed.join(", ") || "none"}).`);
 }
 
 async function waitForProjectReadback(
@@ -2021,20 +2282,27 @@ async function waitForProjectReadback(
 	deadline: number,
 	signal?: AbortSignal,
 ): Promise<void> {
+	let lastCurrent: string | undefined;
+	let observedMarkers: string[] = [];
+	let observedNotices: string[] = [];
 	for (;;) {
 		const html = await readPageHtml(exec, launcher, tabId, signal);
 		const root = parse(html);
 		const notices = [...root.querySelectorAll('[role="status"]'), ...root.querySelectorAll('[role="alert"]')];
+		observedNotices = notices.map((node) => nodeLabel(node)).filter(Boolean);
 		if (notices.some((node) => /mov/i.test(nodeLabel(node)) && normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project)))) return;
 		const current = await tabUrl(exec, launcher, tabId, signal);
+		lastCurrent = current;
 		const inProjectConversation = current ? new RegExp(`/g/[^/]+/c/${providerConversationId}(?:[?#]|$)`).test(new URL(current).pathname) : false;
 		const projectMarkers = root.querySelectorAll('[data-testid*="project"], [aria-label*="project"], [aria-label*="Project"]');
+		observedMarkers = projectMarkers.map((node) => nodeLabel(node)).filter(Boolean);
 		if (inProjectConversation && projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project)))) return;
+		if (projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)) === normalizePickerLabel(`Projects ${project}`))) return;
 		if (root.querySelector(`[data-gpt-control-project="${cssString(project)}"]`)) return;
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
-	throw new Error(`ChatGPT move read-back failed for project ${project}.`);
+	throw new Error(`ChatGPT move read-back failed for project ${project} (url: ${lastCurrent ?? "unknown"}; notices: ${observedNotices.join(", ") || "none"}; markers: ${observedMarkers.join(", ") || "none"}).`);
 }
 
 async function waitForArchiveReadback(
@@ -2065,6 +2333,21 @@ function isConversationPinned(html: string, providerConversationId: string): boo
 	const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
 	return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "")
 		|| link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+}
+
+function conversationPinMenuState(html: string): boolean | undefined {
+	const labels = parse(html).querySelectorAll('[role="menuitem"]').map((node) => normalizePickerLabel(nodeLabel(node)));
+	if (labels.includes("unpin") || labels.includes("unpin chat")) return true;
+	if (labels.includes("pin") || labels.includes("pin chat")) return false;
+	return undefined;
+}
+
+function projectRemovalMenuLabel(html: string): string | undefined {
+	const labels = parse(html).querySelectorAll('[role="menuitem"]')
+		.map((node) => nodeLabel(node))
+		.filter((label) => /^Remove from\s+\S/i.test(label));
+	if (labels.length > 1) throw new Error("ChatGPT project-removal action is ambiguous; archive refused.");
+	return labels[0];
 }
 
 function normalizeManagementLabel(value: string, maxLength: number, field: string): string {

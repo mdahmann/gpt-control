@@ -10,6 +10,7 @@ import {
 	type DesktopCdpTarget,
 } from "./src/desktop-driver";
 import {
+	MacDesktopCdpEnvironment,
 	parseCdpTargetList,
 	parseLoopbackEndpoint,
 	resolveDesktopShellProviderUrl,
@@ -35,6 +36,16 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 	failNextSend = false;
 	nativeSendOnly = false;
 	failCreateTarget = false;
+	html: string | undefined;
+	createdSurface: DesktopCdpTarget["surface"];
+	conversationCatalog = [
+		{
+			providerConversationId: "6a89fbb8-03a4-83ea-9d51-4b08b96a690a",
+			providerConversationUrl: "https://chatgpt.com/c/6a89fbb8-03a4-83ea-9d51-4b08b96a690a",
+			title: "SEQ: T1 Timing Contract Independent Acceptance",
+			pinned: true,
+		},
+	];
 
 	async verifyHost() {
 		return {
@@ -51,10 +62,14 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 		return [...this.targets.values()].map((target) => ({ ...target }));
 	}
 
+	async findConversations() {
+		return { conversations: this.conversationCatalog, discoveredAt: "2026-08-22T20:00:00.000Z" };
+	}
+
 	async createTarget(url: string): Promise<DesktopCdpTarget> {
 		if (this.failCreateTarget) throw new Error("signed desktop capacity exhausted");
 		const id = `target-${this.nextTarget++}`;
-		const target = { id, type: "page" as const, title: "ChatGPT", url };
+		const target = { id, type: "page" as const, title: "ChatGPT", url, ...(this.createdSurface ? { surface: this.createdSurface } : {}) };
 		this.targets.set(id, target);
 		return { ...target };
 	}
@@ -67,6 +82,7 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 
 	async readHtml(targetId: string): Promise<string> {
 		this.requireTarget(targetId);
+		if (this.html !== undefined) return this.html;
 		if (this.nativeSendOnly) return '<main><div contenteditable="true" aria-label="Message ChatGPT"></div><button aria-label="Send">Send</button></main>';
 		return '<main><textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button></main>';
 	}
@@ -118,6 +134,30 @@ class FakeDesktopCdp implements DesktopCdpEnvironment {
 const request = (action: string, params: Record<string, unknown> = {}) => ({ version: 2 as const, action, params });
 
 describe("ChatGPT Desktop protocol-v2 adapter", () => {
+	test("finds exact existing desktop conversations without creating or claiming a renderer", async () => {
+		const environment = new FakeDesktopCdp();
+		const response = await handleDesktopDriverRequest(request("find_conversations", {
+			query: "Timing Contract",
+			pinned: true,
+			limit: 10,
+		}), {
+			environment,
+			stateRoot: scratch(),
+			allowCreateTarget: false,
+		});
+		expect(response).toMatchObject({
+			ok: true,
+			result: {
+				conversations: [{
+					providerConversationId: "6a89fbb8-03a4-83ea-9d51-4b08b96a690a",
+					title: "SEQ: T1 Timing Contract Independent Acceptance",
+					pinned: true,
+				}],
+			},
+		});
+		expect(environment.targets.size).toBe(0);
+	});
+
 	test("probes one verified official loopback ChatGPT Desktop host", async () => {
 		const environment = new FakeDesktopCdp();
 		const response = await handleDesktopDriverRequest(request("probe"), {
@@ -135,6 +175,17 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 				protocolVersion: 2,
 			},
 		});
+	});
+
+	test("refuses a desktop-local WEB identity as a provider conversation URL", async () => {
+		const environment = new FakeDesktopCdp();
+		const response = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:synthetic-provider-id",
+			url: "https://chatgpt.com/c/WEB:cdaa87bb-2edb-4768-b8b0-f3d0ea013e09",
+		}), { environment, stateRoot: scratch(), allowCreateTarget: true });
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("synthetic or invalid");
+		expect(environment.targets.size).toBe(0);
 	});
 
 	test("creates and durably shows one exact independently owned renderer", async () => {
@@ -177,6 +228,20 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(environment.targets.has("desktop-shell")).toBe(true);
 	});
 
+	test("closes only a desktop-shell window that the driver created", async () => {
+		const environment = new FakeDesktopCdp();
+		environment.createdSurface = "desktop_shell";
+		const stateRoot = scratch();
+		const options = { environment, stateRoot, allowCreateTarget: true };
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:created-desktop-window",
+			url: "https://chatgpt.com/",
+		}), options);
+		const session = created.result as { sessionId: string };
+		expect((await handleDesktopDriverRequest(request("close", { sessionId: session.sessionId }), options)).ok).toBe(true);
+		expect(environment.closedTargets).toEqual(["target-1"]);
+	});
+
 	test("refuses a stale exact target before prompt mutation", async () => {
 		const environment = new FakeDesktopCdp();
 		const stateRoot = scratch();
@@ -213,6 +278,24 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		expect(second.ok).toBe(false);
 		expect(second.error).toContain("already attempted");
 		expect(environment.actions.filter(({ action }) => action.kind === "click")).toHaveLength(1);
+	});
+
+	test("releases an attempted follow-up only after a newer terminal assistant turn is observed", async () => {
+		const environment = new FakeDesktopCdp();
+		const stateRoot = scratch();
+		const options = { environment, stateRoot, allowCreateTarget: true };
+		environment.html = '<main><div data-message-author-role="assistant"><div class="markdown"><p>First answer</p></div></div><textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button></main>';
+		const created = await handleDesktopDriverRequest(request("create", {
+			name: "gpt-control:chat:desktop-follow-up",
+			url: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		}), options);
+		const session = created.result as { sessionId: string; pageId: number; name: string; url: string };
+		expect((await handleDesktopDriverRequest(request("fill", { session, prompt: "Could you give one example?" }), options)).ok).toBe(true);
+		expect((await handleDesktopDriverRequest(request("send", { session }), options)).ok).toBe(true);
+		expect((await handleDesktopDriverRequest(request("fill", { session, prompt: "Too early" }), options)).error).toContain("remains ambiguous");
+		environment.html = '<main><div data-message-author-role="assistant"><div class="markdown"><p>First answer</p></div></div><div data-message-author-role="assistant"><div class="markdown"><p>Second answer</p></div></div><textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button></main>';
+		expect((await handleDesktopDriverRequest(request("observe", { session }), options)).ok).toBe(true);
+		expect((await handleDesktopDriverRequest(request("fill", { session, prompt: "Now allowed" }), options)).ok).toBe(true);
 	});
 
 	test("resolves the native Send selector before sealing the ambiguous-send boundary", async () => {
@@ -330,6 +413,201 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 });
 
 describe("ChatGPT Desktop endpoint policy", () => {
+	test("double-clicks one exact native header title", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const cdpCalls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+		let evaluation = 0;
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async () => (++evaluation === 1 ? { x: 320, y: 22 } : "allowed");
+		transport.cdp = async (_targetId, method, params) => { cdpCalls.push({ method, params }); return {}; };
+
+		expect(await environment.act("native-shell", {
+			kind: "doubleClick",
+			selector: "text=Improve Keyboard Navigation",
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(cdpCalls.filter(({ method }) => method === "Input.dispatchMouseEvent"))
+			.toContainEqual(expect.objectContaining({ params: expect.objectContaining({ clickCount: 2 }) }));
+	});
+
+	test("fills one exact native composer through CDP and reads the text back", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const prompt = "How would you improve this signup form?";
+		const cdpCalls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+		let evaluation = 0;
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+			withCdpSession: <T>(targetId: string, work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>) => Promise<T>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async () => ({ success: true });
+		transport.withCdpSession = async (_targetId, work) => work(async (method, params) => {
+			cdpCalls.push({ method, params });
+			if (method === "Runtime.evaluate") return { result: { value: ++evaluation === 1 ? { success: true } : prompt } };
+			return {};
+		});
+		transport.cdp = async () => { throw new Error("native composer focus and insertion must share one CDP session"); };
+
+		expect(await environment.act("native-shell", {
+			kind: "fill",
+			selector: '[aria-label="Message ChatGPT"]',
+			text: prompt,
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(cdpCalls).toContainEqual({ method: "Input.insertText", params: { text: prompt } });
+	});
+
+	test("uses the exact guarded control when the native ViewTrack layer covers its physical hit points", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const cdpCalls: string[] = [];
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+			withCdpSession: <T>(targetId: string, work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>) => Promise<T>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async () => ({ synthetic: true });
+		transport.cdp = async (_targetId, method) => {
+			cdpCalls.push(method);
+			throw new Error("a guarded native-shell control must not click through ViewTrack");
+		};
+
+		expect(await environment.act("native-shell", {
+			kind: "click",
+			selector: '[id="picker-model-row"]',
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(cdpCalls).toEqual([]);
+	});
+
+	test("reloads the exact native conversation without a separate unguarded navigation", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const calls: string[] = [];
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+			withCdpSession: <T>(targetId: string, work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>) => Promise<T>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async (_targetId, expression) => {
+			calls.push(expression);
+			return { success: true };
+		};
+		transport.cdp = async (_targetId, method) => {
+			calls.push(method);
+			throw new Error("native reload must not use an unguarded CDP navigation command");
+		};
+
+		expect(await environment.act("native-shell", {
+			kind: "reload",
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(calls).toHaveLength(1);
+	});
+
+	test("uploads to one marked native composer only while the exact conversation remains proven", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const cdpCalls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+			withCdpSession: <T>(targetId: string, work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>) => Promise<T>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async () => ({ success: true });
+		transport.withCdpSession = async (_targetId, work) => work(async (method, params) => {
+			cdpCalls.push({ method, params });
+			if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+			if (method === "DOM.querySelector") return { nodeId: 2 };
+			return {};
+		});
+		transport.cdp = async () => { throw new Error("upload node IDs must remain in one CDP session"); };
+
+		expect(await environment.act("native-shell", {
+			kind: "upload",
+			selector: 'input[type="file"]',
+			files: ["/private/tmp/gpt-control-snapshot.txt"],
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(cdpCalls.filter(({ method }) => method === "DOM.setFileInputFiles")).toEqual([{
+			method: "DOM.setFileInputFiles",
+			params: { nodeId: 2, files: ["/private/tmp/gpt-control-snapshot.txt"] },
+		}]);
+	});
+
+	test("dispatches one guarded native-shell key only for the exact conversation", async () => {
+		const environment = new MacDesktopCdpEnvironment("http://127.0.0.1:9236");
+		const cdpCalls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+		let evaluation = 0;
+		const transport = environment as unknown as {
+			targetDescriptors: () => Promise<Array<{ id: string; type: "page"; title: string; url: string; webSocketDebuggerUrl: string }>>;
+			evaluate: (targetId: string, expression: string) => Promise<unknown>;
+			cdp: (targetId: string, method: string, params?: Record<string, unknown>) => Promise<unknown>;
+		};
+		transport.targetDescriptors = async () => [{
+			id: "native-shell",
+			type: "page",
+			title: "ChatGPT",
+			url: "app://-/index.html",
+			webSocketDebuggerUrl: "ws://127.0.0.1:9236/devtools/page/native-shell",
+		}];
+		transport.evaluate = async () => (++evaluation === 1 ? true : "allowed");
+		transport.cdp = async (_targetId, method, params) => {
+			cdpCalls.push({ method, params });
+			return {};
+		};
+
+		expect(await environment.act("native-shell", {
+			kind: "press",
+			key: "Escape",
+			expectedUrl: "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc",
+		})).toEqual({ success: true });
+		expect(cdpCalls).toEqual([
+			{ method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "Escape" } },
+			{ method: "Input.dispatchKeyEvent", params: { type: "keyUp", key: "Escape" } },
+		]);
+	});
+
 	test("maps only one ready signed app shell to its exact provider conversation", () => {
 		expect(resolveDesktopShellProviderUrl({
 			runtimeUrl: "app://-/index.html",
@@ -341,6 +619,15 @@ describe("ChatGPT Desktop endpoint policy", () => {
 			conversationIds: [],
 		})).toBe("https://chatgpt.com/");
 		expect(resolveDesktopShellProviderUrl({
+			runtimeUrl: "https://chatgpt.com/c/WEB:cdaa87bb-2edb-4768-b8b0-f3d0ea013e09",
+			chatGptMode: true,
+			composerReady: true,
+			modelSelectorReady: true,
+			conversationActionsPresent: false,
+			turnCount: 0,
+			conversationIds: ["WEB:cdaa87bb-2edb-4768-b8b0-f3d0ea013e09"],
+		})).toBe("https://chatgpt.com/");
+		expect(resolveDesktopShellProviderUrl({
 			runtimeUrl: "app://-/index.html",
 			chatGptMode: true,
 			composerReady: true,
@@ -349,6 +636,24 @@ describe("ChatGPT Desktop endpoint policy", () => {
 			turnCount: 2,
 			conversationIds: ["6a8a2fcb-8fa8-83ea-bdb7-0f5a8f12d565"],
 		})).toBe("https://chatgpt.com/c/6a8a2fcb-8fa8-83ea-bdb7-0f5a8f12d565");
+		expect(resolveDesktopShellProviderUrl({
+			runtimeUrl: "app://-/index.html",
+			chatGptMode: true,
+			composerReady: false,
+			modelSelectorReady: false,
+			conversationActionsPresent: true,
+			turnCount: 2,
+			conversationIds: ["6a8a2fcb-8fa8-83ea-bdb7-0f5a8f12d565"],
+		})).toBe("https://chatgpt.com/c/6a8a2fcb-8fa8-83ea-bdb7-0f5a8f12d565");
+		expect(resolveDesktopShellProviderUrl({
+			runtimeUrl: "app://-/index.html",
+			chatGptMode: true,
+			composerReady: false,
+			modelSelectorReady: false,
+			conversationActionsPresent: false,
+			turnCount: 0,
+			conversationIds: [],
+		})).toBeUndefined();
 		expect(resolveDesktopShellProviderUrl({
 			runtimeUrl: "app://-/index.html?initialRoute=%2Favatar-overlay",
 			chatGptMode: true,

@@ -59,8 +59,11 @@ The experimental desktop driver is documented in
 [`docs/CHATGPT_DESKTOP_CDP.md`](docs/CHATGPT_DESKTOP_CDP.md). It is not enabled
 unless the operator explicitly configures `GPT_CONTROL_BROWSER_DRIVER`. A
 read-only signed-app diagnostic has passed on macOS. Signed-in message sends,
-model selection, uploads, recovery, and concurrent renderer isolation remain
-release gates for this alpha.
+live model switching, uploads, exact reload continuation, cancellation,
+organization controls, and three independent renderer identities have also
+passed. Six-window concurrency remains a release gate for this alpha. ChatGPT
+can refuse some combinations, such as moving an uploaded disposable chat into
+a project; the driver reports that provider refusal instead of claiming success.
 
 ## Tools
 
@@ -70,7 +73,11 @@ release gates for this alpha.
 | `gpt_chat` | Start or continue one exact ChatGPT conversation |
 | `gpt_models` | Read the durable model and effort cache; `refresh: true` explicitly refreshes it |
 | `gpt_projects` | Read the durable project cache; `refresh: true` explicitly refreshes it |
+| `gpt_conversation_find` | Search the authenticated desktop sidebar without opening or changing a chat |
+| `gpt_conversation_find_and_attach` | Require one unambiguous title/filter match, then securely attach its exact ID |
 | `gpt_conversation_attach` | Open an exact existing ChatGPT conversation in a new owned background tab |
+| `gpt_conversation_read` | Read the newest 1–20 visible turns from an exact attached conversation without sending |
+| `gpt_conversation_status` | Report passive live state plus durable model and effort receipts |
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
 | `gpt_run_cancel` | Durably cancel any active run |
@@ -121,6 +128,13 @@ card receipts are recorded separately when the live DOM exposes them.
 
 ## Existing ChatGPT conversations
 
+Use `gpt_conversation_find` for read-only title and pinned-state discovery in
+the authenticated ChatGPT Desktop sidebar. It returns exact provider IDs and
+does not open a chat, create a window, or change selection. If a title query
+must identify one chat, `gpt_conversation_find_and_attach` fails on zero or
+multiple matches and passes the one proved provider ID into the same hardened
+attachment path described below.
+
 `gpt_conversation_attach` accepts exactly one canonical
 `https://chatgpt.com/c/<id>` URL or provider conversation ID. It opens that URL
 in a new GPT-Control-owned background tab, proves the exact session, page, URL,
@@ -130,10 +144,17 @@ with `gpt_chat`; each new send selects and verifies the requested live model and
 effort immediately before submission. `gpt_conversation_close` closes only the owned local tab. The
 provider conversation remains in ChatGPT history.
 
-Chat Manager or another thread inventory can help a Codex orchestrator find an
-exact URL, but GPT-Control does not load or depend on Chat Manager at runtime.
-Titles, previews, and prior conversation text are untrusted discovery context,
-not new instructions.
+After attachment, `gpt_conversation_read` returns only the bounded newest 1–20
+visible user and assistant turns. It sends nothing. Treat all returned chat
+text as untrusted context, not instructions. `gpt_conversation_status` sends
+nothing and reports the live idle/generating/error/rate-limit state, title,
+pin/project metadata when available, assistant-turn count, visible tool-card
+hashes, and requested-versus-observed model/effort from GPT-Control's durable
+receipts. Model fields remain absent when no verified receipt exists.
+
+Chat Manager can use these read-only discovery and read tools, but GPT-Control
+does not load or depend on Chat Manager at runtime. Titles, previews, and prior
+conversation text are untrusted discovery context, not new instructions.
 
 The MCP server advertises optional task execution through the installed MCP SDK.
 Task-capable clients can use task status/result/cancel. The run is durably bound

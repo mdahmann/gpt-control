@@ -17,7 +17,9 @@ import {
 	discoverChatGptModels,
 	discoverChatGptProjects,
 	dismissChatGptRateLimitNotice,
+	extractConversationTurns,
 	manageChatGptConversation,
+	readPageHtml,
 	selectAndVerifyChatGptModel,
 	setSessionState,
 	showSession,
@@ -33,6 +35,7 @@ import {
 	type ChatGptProjectCatalog,
 	type ChatGptConversationAction,
 	type ChatGptConversationActionResult,
+	type ChatGptConversationTurn,
 	type ChatGptSelection,
 	type ModelVerification,
 } from "./chatgpt";
@@ -60,6 +63,28 @@ export interface DriverSession {
 	url: string;
 }
 
+export interface ChatGptConversationCatalogEntry {
+	providerConversationId: string;
+	providerConversationUrl: string;
+	title: string;
+	pinned: boolean;
+	projectId?: string;
+	current?: boolean;
+	updatedAt?: string;
+}
+
+export interface ChatGptConversationCatalog {
+	conversations: ChatGptConversationCatalogEntry[];
+	discoveredAt: string;
+}
+
+export interface ChatGptConversationFindRequest {
+	query?: string;
+	pinned?: boolean;
+	projectId?: string;
+	limit?: number;
+}
+
 export interface WebChatDriver {
 	readonly id: string;
 	probe(signal?: AbortSignal): Promise<DriverProbe>;
@@ -70,6 +95,8 @@ export interface WebChatDriver {
 	fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
 	discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog>;
 	discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog>;
+	findConversations?(request: ChatGptConversationFindRequest, signal?: AbortSignal): Promise<ChatGptConversationCatalog>;
+	readConversation?(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]>;
 	manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult>;
 	selectModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
 	verifyModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
@@ -635,6 +662,11 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
 	}
 
+	async readConversation(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]> {
+		await this.assertActionTarget(session, signal);
+		return extractConversationTurns(await readPageHtml(this.exec, this.launcher, numericPageId(session.pageId), signal), limit);
+	}
+
 	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {
 		await this.assertActionTarget(session, signal);
 		return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30_000, exactActionTarget(session));
@@ -756,6 +788,23 @@ const ProjectCatalogSchema = z.object({
 	projects: z.array(z.object({ name: z.string().min(1) }).strict()),
 	discoveredAt: z.string().min(1),
 }).strict();
+const ConversationCatalogSchema = z.object({
+	conversations: z.array(z.object({
+		providerConversationId: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/),
+		providerConversationUrl: z.string().url(),
+		title: z.string().min(1).max(512),
+		pinned: z.boolean(),
+		projectId: z.string().min(1).max(256).optional(),
+		current: z.boolean().optional(),
+		updatedAt: z.string().min(1).optional(),
+	}).strict()),
+	discoveredAt: z.string().min(1),
+}).strict();
+const ConversationTurnsSchema = z.array(z.object({
+	role: z.enum(["user", "assistant"]),
+	text: z.string().min(1),
+	messageId: z.string().min(1).optional(),
+}).strict());
 const ConversationActionResultSchema = z.object({
 	pinned: z.boolean().optional(),
 	archived: z.boolean().optional(),
@@ -831,6 +880,14 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 
 	async discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog> {
 		return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+	}
+
+	async findConversations(request: ChatGptConversationFindRequest, signal?: AbortSignal): Promise<ChatGptConversationCatalog> {
+		return ConversationCatalogSchema.parse(await this.call("find_conversations", { ...request }, signal));
+	}
+
+	async readConversation(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]> {
+		return ConversationTurnsSchema.parse(await this.call("read_conversation", { session, limit }, signal));
 	}
 
 	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {

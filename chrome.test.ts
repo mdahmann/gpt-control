@@ -9,7 +9,10 @@ import {
 	captureOwnedScreenshot,
 	clickSend,
 	createSession,
+	discoverChatGptModels,
+	discoverChatGptProjects,
 	extractChatPageObservation,
+	extractConversationTurns,
 	extractComposerModel,
 	fillPrompt,
 	openChat,
@@ -174,6 +177,28 @@ describe("observed Chrome failures", () => {
 });
 
 describe("truthful composer model provenance", () => {
+	test("discovers the native desktop picker and project action labels", async () => {
+		const { bridge, tabId } = await readyFake({
+			currentEffortPicker: true,
+			desktopPickerMarkup: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+			availableProjects: ["Projects", "Sequence"],
+		});
+		const catalog = await discoverChatGptModels(bridge.exec, bridge.launcher, tabId, undefined, 200);
+		expect(catalog).toMatchObject({
+			currentModel: "GPT-5.6 Sol",
+			currentEffort: "Pro",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.5" }],
+			efforts: [{ label: "Instant" }, { label: "Medium" }, { label: "High" }, { label: "Extra High" }, { label: "Pro" }],
+		});
+		expect(await discoverChatGptProjects(bridge.exec, bridge.launcher, tabId, undefined, 200)).toMatchObject({
+			projects: [{ name: "Projects" }, { name: "Sequence" }],
+		});
+	});
+
 	test("discovers the live underlying models and effort levels without sending", async () => {
 		const bridge = new FakeChromeBridge({
 			currentEffortPicker: true,
@@ -555,6 +580,49 @@ describe("ChatGPT organization controls", () => {
 		expect(await service.manageConversation(conversationId, { action: "archive" })).toMatchObject({ archived: true });
 		expect((await service.store.getConversation(conversationId)).closedAt).toBeDefined();
 	});
+
+	test("proves native project membership, removes the chat from its project, and then archives it", async () => {
+		const bridge = new FakeChromeBridge({
+			availableProjects: ["Zenbox", "Sequence"],
+			desktopOrganizationMarkup: true,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({ kind: "chat", prompt: "native organization target", timeoutMs: 1000 });
+		const conversationId = started.conversation.id;
+		expect(await service.manageConversation(conversationId, { action: "move", project: "Zenbox" })).toMatchObject({ project: "Zenbox" });
+		expect(await service.manageConversation(conversationId, { action: "archive" })).toMatchObject({ archived: true });
+		expect((await service.store.getConversation(conversationId)).closedAt).toBeDefined();
+	});
+
+	test("reports passive exact-conversation status without sending another prompt", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "High",
+			availableModels: ["GPT-5.6 Sol"],
+			availableEfforts: ["High"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "chat",
+			prompt: "status target",
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "High",
+			timeoutMs: 1000,
+		});
+		const status = await service.conversationStatus(started.conversation.id);
+		expect(status).toMatchObject({
+			conversationId: started.conversation.id,
+			providerConversationUrl: started.run.receipt.providerConversationUrl,
+			state: "idle",
+			assistantTurnCount: 1,
+			requestedModel: "GPT-5.6 Sol",
+			observedModel: "GPT-5.6 Sol",
+			requestedEffort: "High",
+			observedEffort: "High",
+		});
+		expect(bridge.submittedPrompts).toEqual(["status target"]);
+	});
 });
 
 describe("honest terminal state and owned-tab boundaries", () => {
@@ -660,6 +728,19 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(observation.snapshot).toMatchObject({ count: 1, text: "desktop answer", hasMarkdown: true });
 		expect(observation.latestUserPromptSha256).toBe(createHash("sha256").update("desktop question").digest("hex"));
 		expect(observation.composerReady).toBe(true);
+	});
+
+	test("reads only the bounded newest visible turns from an attached desktop conversation", () => {
+		const turns = extractConversationTurns(`<main>
+			<div data-content-search-unit-key="fallback-turn-0:0:user"><div data-user-message-bubble="true"><div class="_MarkdownRoot_native"><p>first question</p></div></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:1:assistant"><div class="_MarkdownRoot_native"><p>first answer</p></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:2:user"><div data-user-message-bubble="true"><div class="_MarkdownRoot_native"><p>second question</p></div></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:3:assistant"><div class="_MarkdownRoot_native"><p>second answer</p></div></div>
+		</main>`, 2);
+		expect(turns).toEqual([
+			{ role: "user", text: "second question", messageId: "fallback-turn-0:2:user" },
+			{ role: "assistant", text: "second answer", messageId: "fallback-turn-0:3:assistant" },
+		]);
 	});
 
 	test("uses the native ChatGPT Desktop Send control", async () => {

@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { promisify } from "node:util";
+import type { ChatGptConversationCatalog, ChatGptConversationFindRequest } from "./browser-driver";
 import {
 	type DesktopCdpAction,
 	type DesktopCdpEnvironment,
@@ -105,6 +107,104 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 			targets.push({ id: target.id, type: target.type, title: target.title, url: target.url, runtimeUrl: target.url, surface: "web" });
 		}
 		return targets;
+	}
+
+	async findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog> {
+		const shells = (await this.targetDescriptors()).filter((target) => target.url === "app://-/index.html");
+		if (shells.length !== 1) {
+			throw new Error(`ChatGPT Desktop conversation discovery requires one main app shell; found ${shells.length}.`);
+		}
+		const payload = JSON.stringify({
+			query: request.query?.toLocaleLowerCase() ?? "",
+			pinned: request.pinned,
+			projectId: request.projectId,
+			limit: request.limit ?? 20,
+		});
+		const raw = await this.evaluate(shells[0].id, `(() => {
+			const request = ${payload};
+			const idGrammar = /^[A-Za-z0-9_-]{8,128}$/;
+			const normalized = value => String(value || '').replace(/\\s+/g, ' ').trim();
+			const records = [];
+			for (const titleNode of document.querySelectorAll('[data-thread-title]')) {
+				const title = normalized(titleNode.textContent);
+				if (!title || (request.query && !title.toLocaleLowerCase().includes(request.query))) continue;
+				const row = titleNode.closest('[role="button"]');
+				if (!row) continue;
+				const ids = new Set();
+				const projectIds = new Set();
+				const pinValues = new Set();
+				const updateTimes = new Set();
+				const visited = new Set();
+				let inspected = 0;
+				const visit = (value, depth, parentKey) => {
+					if (value == null || depth > 8 || inspected > 10000) return;
+					if ((typeof value !== 'object' && typeof value !== 'function') || visited.has(value)) return;
+					visited.add(value);
+					inspected += 1;
+					for (const key of Object.keys(value).slice(0, 300)) {
+						let child;
+						try { child = value[key]; } catch { continue; }
+						if ((key === 'conversationId' || (key === 'id' && parentKey === 'conversation'))
+							&& typeof child === 'string' && idGrammar.test(child)) ids.add(child);
+						if (key === 'projectId' && typeof child === 'string' && idGrammar.test(child)) projectIds.add(child);
+						if (key === 'isPinned' && typeof child === 'boolean') pinValues.add(child);
+						if ((key === 'update_time' || key === 'updatedAt') && typeof child === 'string') updateTimes.add(child);
+						if (depth < 8 && !/^(?:return|owner|stateNode|_debug)/i.test(key)) visit(child, depth + 1, key);
+					}
+				};
+				let element = row;
+				for (let level = 0; element && level < 2; level += 1, element = element.parentElement) {
+					for (const key of Object.keys(element)) if (key.startsWith('__react')) visit(element[key], 0, '');
+				}
+				if (ids.size !== 1 || projectIds.size > 1 || pinValues.size > 1 || updateTimes.size > 1) continue;
+				const providerConversationId = [...ids][0];
+				const projectId = [...projectIds][0];
+				const pinned = [...pinValues][0] === true;
+				const updatedAt = [...updateTimes][0];
+				if (request.pinned !== undefined && pinned !== request.pinned) continue;
+				if (request.projectId !== undefined && projectId !== request.projectId) continue;
+				records.push({
+					providerConversationId,
+					providerConversationUrl: 'https://chatgpt.com/c/' + providerConversationId,
+					title,
+					pinned,
+					...(projectId ? { projectId } : {}),
+					...(row.closest('[aria-current="page"]') ? { current: true } : {}),
+					...(updatedAt ? { updatedAt } : {}),
+				});
+			}
+			const deduped = new Map();
+			for (const record of records) {
+				const previous = deduped.get(record.providerConversationId);
+				if (previous && previous.title !== record.title) throw new Error('ChatGPT Desktop conversation title identity is inconsistent.');
+				deduped.set(record.providerConversationId, previous ? { ...previous, ...record, pinned: previous.pinned || record.pinned } : record);
+			}
+			return [...deduped.values()].slice(0, request.limit);
+		})()`);
+		if (!Array.isArray(raw)) throw new Error("ChatGPT Desktop returned an invalid conversation catalog.");
+		const conversations = raw.map((entry) => {
+			if (!isRecord(entry)
+				|| typeof entry.providerConversationId !== "string"
+				|| !/^[A-Za-z0-9_-]{8,128}$/.test(entry.providerConversationId)
+				|| typeof entry.providerConversationUrl !== "string"
+				|| typeof entry.title !== "string"
+				|| typeof entry.pinned !== "boolean"
+				|| (entry.projectId !== undefined && typeof entry.projectId !== "string")
+				|| (entry.current !== undefined && typeof entry.current !== "boolean")
+				|| (entry.updatedAt !== undefined && typeof entry.updatedAt !== "string")) {
+				throw new Error("ChatGPT Desktop returned an invalid conversation catalog entry.");
+			}
+			return {
+				providerConversationId: entry.providerConversationId,
+				providerConversationUrl: entry.providerConversationUrl,
+				title: entry.title,
+				pinned: entry.pinned,
+				...(entry.projectId ? { projectId: entry.projectId } : {}),
+				...(entry.current === true ? { current: true } : {}),
+				...(typeof entry.updatedAt === "string" ? { updatedAt: entry.updatedAt } : {}),
+			};
+		});
+		return { conversations, discoveredAt: new Date().toISOString() };
 	}
 
 	async createTarget(url: string): Promise<DesktopCdpTarget> {
@@ -232,8 +332,32 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 	async act(targetId: string, action: DesktopCdpAction): Promise<unknown> {
 		const runtime = (await this.targetDescriptors()).find((candidate) => candidate.id === targetId)?.url;
 		const desktopShell = isDesktopShellRuntimeUrl(runtime ?? "");
-		if (desktopShell && (action.kind === "reload" || action.kind === "press" || action.kind === "upload")) {
-			throw new Error(`ChatGPT Desktop native-shell ${action.kind} is disabled until it can verify provider identity atomically.`);
+		if (desktopShell && action.kind === "reload") {
+			if (!action.expectedUrl) throw new Error("ChatGPT Desktop native-shell reload requires an exact provider URL.");
+			const expected = JSON.stringify(action.expectedUrl);
+			const evidenceReader = readDesktopShellEvidenceInPage.toString();
+			const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
+			return this.evaluate(targetId, `(() => {
+				const canonical = value => { const url = new URL(value); return url.origin + url.pathname.replace(/\\/$/, '') + url.search; };
+				const current = (${providerResolver})((${evidenceReader})());
+				if (!current || canonical(current) !== canonical(${expected})) {
+					throw new Error('expectedTarget exact ChatGPT conversation changed before native reload');
+				}
+				setTimeout(() => location.reload(), 0);
+				return { success: true };
+			})()`);
+		}
+		if (desktopShell && action.kind === "upload") {
+			if (!action.expectedUrl) throw new Error("ChatGPT Desktop native-shell upload requires an exact provider URL.");
+			return this.uploadDesktopShellFiles(targetId, action.selector, action.files, action.expectedUrl);
+		}
+		if (desktopShell && action.kind === "fill") {
+			if (!action.expectedUrl) throw new Error("ChatGPT Desktop native-shell fill requires an exact provider URL.");
+			return this.fillDesktopShellComposer(targetId, action.selector, action.text, action.expectedUrl);
+		}
+		if (desktopShell && action.kind === "press") {
+			if (!action.expectedUrl) throw new Error("ChatGPT Desktop native-shell key action requires an exact provider URL.");
+			return this.trustedDesktopShellPress(targetId, action.key, action.expectedUrl);
 		}
 		if (action.kind === "reload") {
 			await this.assertRuntimeUrl(targetId, action.expectedUrl);
@@ -259,6 +383,12 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		if (desktopShell && !action.expectedUrl) throw new Error("ChatGPT Desktop native-shell mutation requires an exact provider URL.");
 		if (desktopShell && action.kind === "click") {
 			return this.trustedDesktopShellClick(targetId, action.selector, action.expectedUrl!);
+		}
+		if (desktopShell && action.kind === "doubleClick") {
+			return this.trustedDesktopShellClick(targetId, action.selector, action.expectedUrl!, 2);
+		}
+		if (desktopShell && action.kind === "activate") {
+			return this.trustedDesktopShellActivate(targetId, action.selector, action.expectedUrl!);
 		}
 		const payload = JSON.stringify(desktopShell
 			? { ...action, expectedProviderUrl: action.expectedUrl, expectedUrl: undefined }
@@ -318,8 +448,8 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		})()`);
 	}
 
-	private async trustedDesktopShellClick(targetId: string, selector: string, expectedProviderUrl: string): Promise<unknown> {
-		const payload = JSON.stringify({ selector, expectedProviderUrl });
+	private async trustedDesktopShellClick(targetId: string, selector: string, expectedProviderUrl: string, clickCount = 1): Promise<unknown> {
+		const payload = JSON.stringify({ selector, expectedProviderUrl, clickCount });
 		const evidenceReader = readDesktopShellEvidenceInPage.toString();
 		const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
 		const point = await this.evaluate(targetId, `(() => {
@@ -333,64 +463,122 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 			}
 			const normalized = value => String(value || '').replace(/\\s+/g, ' ').trim();
 			const find = candidate => {
+				let matches;
 				if (candidate.startsWith('text=')) {
 					const name = normalized(candidate.slice(5));
-					return [...document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="menuitemradio"],a')]
-						.find(element => normalized(element.getAttribute('aria-label') || element.textContent) === name);
+					matches = [...document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="menuitemradio"],a')]
+						.filter(element => normalized(element.getAttribute('aria-label') || element.textContent) === name);
+				} else {
+					const role = /^role=([^[]+)\\[name=(.*)\\]$/.exec(candidate);
+					if (role) {
+						const candidates = role[1] === 'button' ? document.querySelectorAll('button,[role="button"]') : document.querySelectorAll('[role="' + role[1] + '"]');
+						matches = [...candidates].filter(element => normalized(element.getAttribute('aria-label') || element.textContent) === normalized(role[2]));
+					} else {
+						matches = [...document.querySelectorAll(candidate)];
+					}
 				}
-				const role = /^role=([^[]+)\\[name=(.*)\\]$/.exec(candidate);
-				if (role) {
-					const candidates = role[1] === 'button' ? document.querySelectorAll('button,[role="button"]') : document.querySelectorAll('[role="' + role[1] + '"]');
-					return [...candidates].find(element => normalized(element.getAttribute('aria-label') || element.textContent) === normalized(role[2]));
-				}
-				return document.querySelector(candidate);
+				if (matches.length > 1) throw new Error('Ambiguous ChatGPT Desktop click target: ' + candidate);
+				return matches[0];
 			};
 			const element = find(action.selector);
 			if (!element) throw new Error('No element found: ' + action.selector);
 			element.scrollIntoView({ block: 'center', inline: 'center' });
 			const rect = element.getBoundingClientRect();
 			if (rect.width <= 0 || rect.height <= 0) throw new Error('ChatGPT Desktop click target has no visible bounds.');
-			const state = { status: 'pending' };
-			const eventTypes = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+			const candidates = [
+				[0.5, 0.5], [0.2, 0.5], [0.8, 0.5],
+				[0.35, 0.35], [0.65, 0.35], [0.35, 0.65], [0.65, 0.65],
+			];
+			const inspectedPoints = candidates.map(([horizontal, vertical]) => {
+				const x = rect.left + rect.width * horizontal;
+				const y = rect.top + rect.height * vertical;
+				const hit = document.elementFromPoint(x, y);
+				const stack = document.elementsFromPoint(x, y);
+				return { x, y, hit, stack };
+			});
+			let trustedPoint = inspectedPoints.map(({ x, y, hit }) => (
+				hit && (hit === element || element.contains(hit)) ? { x, y } : undefined
+			)).find(Boolean);
+			let coveredTargets = [];
+			if (!trustedPoint) {
+				const role = element.getAttribute('role');
+				const allowedControl = ['BUTTON', 'A'].includes(element.tagName)
+					|| ['button', 'menuitem', 'menuitemradio', 'option'].includes(role || '');
+				const coveredOnlyByViewTrack = inspectedPoints.every(({ hit }) => hit
+					&& String(hit.className || '').split(/\s+/).some(name => name.startsWith('_ViewTrack_')));
+				const coveredOnlyByInertGraphics = inspectedPoints.every(({ hit }) => hit
+					&& ['svg', 'path', 'g'].includes(hit.tagName.toLowerCase())
+					&& !hit.getAttribute('role') && !hit.getAttribute('aria-label'));
+				const exactTargetInHitStacks = inspectedPoints.every(({ stack }) => stack.some(node => node === element || element.contains(node)));
+				if (allowedControl && coveredOnlyByViewTrack) {
+					element.click();
+					const afterProviderUrl = (${providerResolver})((${evidenceReader})());
+					if (!afterProviderUrl || canonical(afterProviderUrl) !== canonical(action.expectedProviderUrl)) {
+						throw new Error('expectedTarget exact ChatGPT conversation changed during the guarded native control action');
+					}
+					return { synthetic: true };
+				}
+				if (allowedControl && coveredOnlyByInertGraphics && exactTargetInHitStacks) {
+					trustedPoint = { x: inspectedPoints[0].x, y: inspectedPoints[0].y };
+					coveredTargets = inspectedPoints.map(({ hit }) => hit).filter(Boolean);
+				}
+			}
+			if (!trustedPoint) {
+				const describe = node => node ? [node.tagName, node.id, node.getAttribute('role'), node.getAttribute('aria-label'), node.getAttribute('data-testid'), node.className]
+					.map(value => normalized(value)).filter(Boolean).join(':') : 'none';
+				const covers = [...new Set(inspectedPoints.map(({ hit }) => describe(hit)))].join(', ');
+				throw new Error('ChatGPT Desktop click target ' + describe(element) + ' is covered at every trusted hit point by ' + covers + '.');
+			}
+			const describe = node => node ? [node.tagName, node.id, node.getAttribute('role'), node.getAttribute('aria-label'), node.getAttribute('data-testid'), node.className]
+				.map(value => normalized(value)).filter(Boolean).join(':') : 'none';
+			const state = { status: 'pending', blockedBy: '' };
+			const eventTypes = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', ...(action.clickCount === 2 ? ['dblclick'] : [])];
 			const guard = event => {
 				let allowed = false;
 				try {
 					const current = (${providerResolver})((${evidenceReader})());
 					allowed = Boolean(current)
 						&& canonical(current) === canonical(action.expectedProviderUrl)
-						&& (event.target === element || element.contains(event.target));
+						&& (event.target === element || element.contains(event.target)
+							|| coveredTargets.some(node => node === event.target || node.contains(event.target) || event.target.contains(node)));
 				} catch {}
 				if (!allowed) {
 					state.status = 'blocked';
+					state.blockedBy ||= describe(event.target);
 					event.preventDefault();
 					event.stopImmediatePropagation();
 					return;
 				}
-				if (event.type === 'click') state.status = 'allowed';
+				if (event.type === (action.clickCount === 2 ? 'dblclick' : 'click')) state.status = 'allowed';
 			};
 			for (const type of eventTypes) document.addEventListener(type, guard, true);
 			window[guardKey] = {
 				state,
 				cleanup: () => { for (const type of eventTypes) document.removeEventListener(type, guard, true); },
 			};
-			return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			return trustedPoint;
 		})()`);
+		if (isRecord(point) && point.synthetic === true) return { success: true };
 		if (!isRecord(point) || typeof point.x !== "number" || typeof point.y !== "number") {
 			throw new Error("ChatGPT Desktop returned an invalid trusted-click point.");
 		}
 		try {
 			await this.cdp(targetId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
-			await this.cdp(targetId, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1 });
-			await this.cdp(targetId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1 });
+			for (const count of clickCount === 2 ? [1, 2] : [1]) {
+				await this.cdp(targetId, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: count });
+				await this.cdp(targetId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: count });
+			}
 			const status = await this.evaluate(targetId, `(() => {
 				const key = '__gptControlTrustedClickGuard';
 				const pending = window[key];
 				if (!pending) return 'missing';
 				pending.cleanup();
 				delete window[key];
-				return pending.state.status;
+				return pending.state.status === 'blocked' && pending.state.blockedBy
+					? pending.state.status + ':' + pending.state.blockedBy
+					: pending.state.status;
 			})()`);
-			if (status !== "allowed") throw new Error(`ChatGPT Desktop trusted click was ${String(status)}.`);
+			if (status !== "allowed") throw new Error(`ChatGPT Desktop trusted click for ${selector} was ${String(status)}.`);
 			return { success: true };
 		} catch (error) {
 			await this.evaluate(targetId, `(() => {
@@ -403,14 +591,309 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		}
 	}
 
+	private async trustedDesktopShellActivate(targetId: string, selector: string, expectedProviderUrl: string): Promise<unknown> {
+		const payload = JSON.stringify({ selector, expectedProviderUrl });
+		const evidenceReader = readDesktopShellEvidenceInPage.toString();
+		const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
+		return this.evaluate(targetId, `(() => {
+			const action = ${payload};
+			const canonical = value => { const url = new URL(value); return url.origin + url.pathname.replace(/\\/$/, '') + url.search; };
+			const current = (${providerResolver})((${evidenceReader})());
+			if (!current || canonical(current) !== canonical(action.expectedProviderUrl)) {
+				throw new Error('expectedTarget exact ChatGPT conversation changed before native activation');
+			}
+			const normalized = value => String(value || '').replace(/\\s+/g, ' ').trim();
+			const role = /^role=([^[]+)\\[name=(.*)\\]$/.exec(action.selector);
+			let matches;
+			if (action.selector.startsWith('text=')) {
+				const name = normalized(action.selector.slice(5));
+				matches = [...document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="menuitemradio"],a')]
+					.filter(element => normalized(element.getAttribute('aria-label') || element.textContent) === name);
+			} else if (role) {
+				const candidates = role[1] === 'button' ? document.querySelectorAll('button,[role="button"]') : document.querySelectorAll('[role="' + role[1] + '"]');
+				matches = [...candidates].filter(element => normalized(element.getAttribute('aria-label') || element.textContent) === normalized(role[2]));
+			} else {
+				matches = [...document.querySelectorAll(action.selector)];
+			}
+			if (matches.length !== 1) throw new Error('ChatGPT Desktop activation requires one exact target: ' + action.selector);
+			const element = matches[0];
+			const controlRole = element.getAttribute('role');
+			if (!['BUTTON', 'A'].includes(element.tagName) && !['button', 'menuitem', 'menuitemradio', 'option'].includes(controlRole || '')) {
+				throw new Error('ChatGPT Desktop activation target is not an allowed control.');
+			}
+			const rect = element.getBoundingClientRect();
+			if (rect.width <= 0 || rect.height <= 0) throw new Error('ChatGPT Desktop activation target has no visible bounds.');
+			const x = rect.left + rect.width / 2;
+			const y = rect.top + rect.height / 2;
+			const stack = document.elementsFromPoint(x, y);
+			if (!stack.some(node => node === element || element.contains(node) || node.contains(element))) {
+				throw new Error('ChatGPT Desktop activation target is covered by an unrelated control.');
+			}
+			element.click();
+			return new Promise((resolve, reject) => setTimeout(() => {
+				try {
+					const after = (${providerResolver})((${evidenceReader})());
+					if (!after || canonical(after) !== canonical(action.expectedProviderUrl)) {
+						throw new Error('expectedTarget exact ChatGPT conversation changed during native activation');
+					}
+					const visibleAlerts = [...document.querySelectorAll('.alert-root,[role="alert"]')]
+						.filter(node => {
+							const rect = node.getBoundingClientRect();
+							const style = getComputedStyle(node);
+							return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+						})
+						.map(node => normalized(node.textContent))
+						.filter(Boolean);
+					resolve({ success: true, visibleAlerts: [...new Set(visibleAlerts)] });
+				} catch (error) {
+					reject(error);
+				}
+			}, 750));
+		})()`);
+	}
+
+	private async trustedDesktopShellPress(targetId: string, key: string, expectedProviderUrl: string): Promise<unknown> {
+		if (!new Set(["Escape", "ArrowLeft", "Enter"]).has(key)) {
+			throw new Error(`ChatGPT Desktop refused unsupported guarded key ${key}.`);
+		}
+		const payload = JSON.stringify({ key, expectedProviderUrl });
+		const evidenceReader = readDesktopShellEvidenceInPage.toString();
+		const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
+		const installed = await this.evaluate(targetId, `(() => {
+			const action = ${payload};
+			const guardKey = '__gptControlTrustedKeyGuard';
+			if (window[guardKey]) throw new Error('A trusted ChatGPT Desktop key is already pending.');
+			const canonical = value => { const url = new URL(value); return url.origin + url.pathname.replace(/\\/$/, '') + url.search; };
+			const current = (${providerResolver})((${evidenceReader})());
+			if (!current || canonical(current) !== canonical(action.expectedProviderUrl)) {
+				throw new Error('expectedTarget exact ChatGPT conversation changed before the key action');
+			}
+			if (action.key === 'Enter' && document.activeElement?.getAttribute('aria-label') !== 'Chat title') {
+				throw new Error('ChatGPT Desktop Enter is allowed only while the exact title input is focused.');
+			}
+			const state = { status: 'pending' };
+			const guard = event => {
+				let allowed = false;
+				try {
+					const provider = (${providerResolver})((${evidenceReader})());
+					allowed = Boolean(provider)
+						&& canonical(provider) === canonical(action.expectedProviderUrl)
+						&& event.key === action.key
+						&& (action.key !== 'Enter' || document.activeElement?.getAttribute('aria-label') === 'Chat title');
+				} catch {}
+				if (!allowed) {
+					state.status = 'blocked';
+					event.preventDefault();
+					event.stopImmediatePropagation();
+					return;
+				}
+				if (event.type === 'keyup') state.status = 'allowed';
+			};
+			document.addEventListener('keydown', guard, true);
+			document.addEventListener('keyup', guard, true);
+			window[guardKey] = {
+				state,
+				cleanup: () => {
+					document.removeEventListener('keydown', guard, true);
+					document.removeEventListener('keyup', guard, true);
+				},
+			};
+			return true;
+		})()`);
+		if (installed !== true) throw new Error("ChatGPT Desktop did not install the trusted key guard.");
+		try {
+			await this.cdp(targetId, "Input.dispatchKeyEvent", { type: "keyDown", key });
+			await this.cdp(targetId, "Input.dispatchKeyEvent", { type: "keyUp", key });
+			const status = await this.evaluate(targetId, `(() => {
+				const key = '__gptControlTrustedKeyGuard';
+				const pending = window[key];
+				if (!pending) return 'missing';
+				pending.cleanup();
+				delete window[key];
+				return pending.state.status;
+			})()`);
+			if (status !== "allowed") throw new Error(`ChatGPT Desktop trusted key was ${String(status)}.`);
+			return { success: true };
+		} catch (error) {
+			await this.evaluate(targetId, `(() => {
+				const key = '__gptControlTrustedKeyGuard';
+				const pending = window[key];
+				if (pending) pending.cleanup();
+				delete window[key];
+			})()`).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	private async uploadDesktopShellFiles(
+		targetId: string,
+		selector: string,
+		files: string[],
+		expectedProviderUrl: string,
+	): Promise<unknown> {
+		const marker = `upload-${randomUUID()}`;
+		const payload = JSON.stringify({ selector, marker, expectedProviderUrl });
+		const evidenceReader = readDesktopShellEvidenceInPage.toString();
+		const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
+		const guard = `
+			const canonical = value => { const url = new URL(value); return url.origin + url.pathname.replace(/\\/$/, '') + url.search; };
+			const current = (${providerResolver})((${evidenceReader})());
+			if (!current || canonical(current) !== canonical(action.expectedProviderUrl)) {
+				throw new Error('expectedTarget exact ChatGPT conversation changed before native upload');
+			}
+		`;
+		await this.evaluate(targetId, `(() => {
+			const action = ${payload};
+			${guard}
+			for (const old of document.querySelectorAll('[data-gpt-control-upload-target]')) old.removeAttribute('data-gpt-control-upload-target');
+			const matches = [...document.querySelectorAll(action.selector)]
+				.filter(element => element instanceof HTMLInputElement && element.type === 'file' && !element.disabled);
+			if (matches.length !== 1) throw new Error('ChatGPT Desktop requires one exact enabled file input.');
+			matches[0].setAttribute('data-gpt-control-upload-target', action.marker);
+			return { success: true };
+		})()`);
+		try {
+			await this.withCdpSession(targetId, async (request) => {
+				const document = await request("DOM.getDocument", { depth: 1, pierce: true }) as { root?: { nodeId?: unknown } };
+				const nodeId = document.root?.nodeId;
+				if (typeof nodeId !== "number") throw new Error("CDP returned no document node.");
+				const markedSelector = `[data-gpt-control-upload-target="${marker}"]`;
+				const query = await request("DOM.querySelector", { nodeId, selector: markedSelector }) as { nodeId?: unknown };
+				if (typeof query.nodeId !== "number" || query.nodeId <= 0) throw new Error("The marked ChatGPT Desktop file input disappeared.");
+				await this.evaluate(targetId, `(() => {
+					const action = ${payload};
+					${guard}
+					const marked = document.querySelector('[data-gpt-control-upload-target="' + action.marker + '"]');
+					if (!(marked instanceof HTMLInputElement) || marked.type !== 'file' || marked.disabled) {
+						throw new Error('The marked ChatGPT Desktop file input changed before upload.');
+					}
+					return { success: true };
+				})()`);
+				await request("DOM.setFileInputFiles", { nodeId: query.nodeId, files });
+			});
+			await this.evaluate(targetId, `(() => {
+				const action = ${payload};
+				${guard}
+				return { success: true };
+			})()`);
+			return { success: true };
+		} finally {
+			await this.evaluate(targetId, `document.querySelector('[data-gpt-control-upload-target="${marker}"]')?.removeAttribute('data-gpt-control-upload-target')`).catch(() => undefined);
+		}
+	}
+
+	private async fillDesktopShellComposer(
+		targetId: string,
+		selector: string,
+		text: string,
+		expectedProviderUrl: string,
+	): Promise<unknown> {
+		const marker = `fill-${randomUUID()}`;
+		const payload = JSON.stringify({ selector, marker, expectedProviderUrl });
+		const evidenceReader = readDesktopShellEvidenceInPage.toString();
+		const providerResolver = resolveDesktopShellProviderUrlInPage.toString();
+		const guard = `
+			const canonical = value => { const url = new URL(value); return url.origin + url.pathname.replace(/\\/$/, '') + url.search; };
+			const current = (${providerResolver})((${evidenceReader})());
+			if (!current || canonical(current) !== canonical(action.expectedProviderUrl)) {
+				throw new Error('expectedTarget exact ChatGPT conversation changed before native fill');
+			}
+		`;
+		const prepareExpression = `(() => {
+			const action = ${payload};
+			${guard}
+			for (const old of document.querySelectorAll('[data-gpt-control-fill-target]')) old.removeAttribute('data-gpt-control-fill-target');
+			const matches = [...document.querySelectorAll(action.selector)].filter(element => {
+				if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return !element.disabled;
+				return element instanceof HTMLElement && element.isContentEditable;
+			});
+			if (matches.length === 0) throw new Error('No element found: ' + action.selector);
+			if (matches.length > 1) throw new Error('ChatGPT Desktop requires one exact editable composer.');
+			const element = matches[0];
+			const rect = element.getBoundingClientRect();
+			if (rect.width <= 0 || rect.height <= 0) throw new Error('ChatGPT Desktop composer has no visible bounds.');
+			const candidates = [
+				[0.5, 0.5], [0.2, 0.5], [0.8, 0.5],
+				[0.2, 0.25], [0.5, 0.25], [0.8, 0.25],
+				[0.2, 0.75], [0.5, 0.75], [0.8, 0.75],
+			];
+			const hits = candidates.map(([horizontal, vertical]) => {
+				const hit = document.elementFromPoint(
+					rect.left + rect.width * horizontal,
+					rect.top + rect.height * vertical,
+				);
+				return hit;
+			});
+			const visible = hits.some(hit => hit && (hit === element || element.contains(hit) || hit.contains(element)));
+			if (!visible) {
+				const normalized = value => String(value || '').replace(/\s+/g, ' ').trim();
+				const describe = node => node ? [node.tagName, node.id, node.getAttribute('role'), node.getAttribute('aria-label'), node.getAttribute('data-testid'), node.className]
+					.map(value => normalized(value)).filter(Boolean).join(':') : 'none';
+				const covers = [...new Set(hits.map(hit => describe(hit)))].join(', ');
+				throw new Error('ChatGPT Desktop composer is covered at every trusted point by ' + covers + '.');
+			}
+			element.setAttribute('data-gpt-control-fill-target', action.marker);
+			element.focus();
+			if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+				const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+				Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, '');
+				element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+			} else {
+				const selection = getSelection();
+				selection.removeAllRanges();
+				const range = document.createRange();
+				range.selectNodeContents(element);
+				selection.addRange(range);
+				document.execCommand('delete', false);
+				if ((element.innerText || '').length > 0) {
+					element.replaceChildren();
+					element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+				}
+			}
+			return { success: true };
+		})()`;
+		const readbackExpression = `(() => {
+			const action = ${payload};
+			${guard}
+			const marked = document.querySelector('[data-gpt-control-fill-target="' + action.marker + '"]');
+			const candidates = marked ? [marked] : [...document.querySelectorAll(action.selector)];
+			if (candidates.length !== 1) throw new Error('The exact ChatGPT Desktop composer changed during fill.');
+			const element = candidates[0];
+			return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : element.innerText;
+		})()`;
+		try {
+			const observed = await this.withCdpSession(targetId, async (request) => {
+				const evaluate = async (expression: string): Promise<unknown> => {
+					const response = await request("Runtime.evaluate", {
+						expression, returnByValue: true, awaitPromise: true, userGesture: true,
+					});
+					if (!isRecord(response)) throw new Error("ChatGPT Desktop returned an invalid CDP evaluation response.");
+					if (isRecord(response.exceptionDetails)) {
+						const exception = isRecord(response.exceptionDetails.exception) ? response.exceptionDetails.exception : undefined;
+						throw new Error(String(exception?.description ?? response.exceptionDetails.text ?? "CDP evaluation failed."));
+					}
+					return isRecord(response.result) ? response.result.value : undefined;
+				};
+				await evaluate(prepareExpression);
+				await request("Input.insertText", { text });
+				return evaluate(readbackExpression);
+			});
+			const normalize = (value: string) => value.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+			if (typeof observed !== "string" || normalize(observed) !== normalize(text)) {
+				throw new Error("ChatGPT Desktop did not retain the exact prompt text. No prompt was sent.");
+			}
+			return { success: true };
+		} finally {
+			await this.evaluate(targetId, `document.querySelector('[data-gpt-control-fill-target="${marker}"]')?.removeAttribute('data-gpt-control-fill-target')`).catch(() => undefined);
+		}
+	}
+
 	async screenshot(targetId: string): Promise<string> {
 		const result = await this.cdp(targetId, "Page.captureScreenshot", { format: "png", fromSurface: true }) as { data?: unknown };
 		return requiredString(result.data, "CDP screenshot data");
 	}
 
 	async closeTarget(targetId: string): Promise<void> {
-		const target = (await this.targetDescriptors()).find((candidate) => candidate.id === targetId);
-		if (target && isDesktopShellRuntimeUrl(target.url)) return;
 		const response = await fetch(new URL(`/json/close/${encodeURIComponent(targetId)}`, this.endpoint), { method: "PUT" });
 		if (!response.ok && response.status !== 404) throw new Error(`ChatGPT Desktop could not close renderer ${targetId} (HTTP ${response.status}).`);
 	}
@@ -450,6 +933,15 @@ export class MacDesktopCdpEnvironment implements DesktopCdpEnvironment {
 		const target = (await this.targetDescriptors()).find((candidate) => candidate.id === targetId);
 		if (!target) throw new Error(`ChatGPT Desktop target ${targetId} is unavailable.`);
 		return cdpRequest(target.webSocketDebuggerUrl, method, params);
+	}
+
+	private async withCdpSession<T>(
+		targetId: string,
+		work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>,
+	): Promise<T> {
+		const target = (await this.targetDescriptors()).find((candidate) => candidate.id === targetId);
+		if (!target) throw new Error(`ChatGPT Desktop target ${targetId} is unavailable.`);
+		return runCdpSession(target.webSocketDebuggerUrl, work);
 	}
 
 	private async evaluate(targetId: string, expression: string): Promise<unknown> {
@@ -573,14 +1065,17 @@ export function resolveDesktopShellProviderUrl(evidence: DesktopShellEvidence): 
 }
 
 function resolveDesktopShellProviderUrlInPage(evidence: DesktopShellEvidence): string | undefined {
-	if (evidence.runtimeUrl !== "app://-/index.html"
-		|| !evidence.chatGptMode
-		|| !evidence.composerReady
-		|| !evidence.modelSelectorReady) return undefined;
-	const ids = [...new Set(evidence.conversationIds)];
-	if (ids.some((id) => !/^[A-Za-z0-9_-]{8,128}$/.test(id))) throw new Error("ChatGPT Desktop reported an invalid provider conversation id.");
+	const localPendingRuntime = /^https:\/\/chatgpt\.com\/c\/WEB:[A-Za-z0-9-]{8,128}\/?$/.test(evidence.runtimeUrl);
+	if (evidence.runtimeUrl !== "app://-/index.html" && !localPendingRuntime
+		|| !evidence.chatGptMode) return undefined;
+	const reportedIds = [...new Set(evidence.conversationIds)];
+	if (reportedIds.some((id) => !/^[A-Za-z0-9_-]{8,128}$/.test(id) && !/^WEB:[A-Za-z0-9-]{8,128}$/.test(id))) {
+		throw new Error("ChatGPT Desktop reported an invalid provider conversation id.");
+	}
+	const ids = reportedIds.filter((id) => !id.startsWith("WEB:"));
 	if (ids.length > 1) throw new Error("ChatGPT Desktop provider conversation identity is ambiguous.");
 	if (ids.length === 1) return `https://chatgpt.com/c/${ids[0]}`;
+	if (!evidence.composerReady || !evidence.modelSelectorReady) return undefined;
 	if (!evidence.conversationActionsPresent && evidence.turnCount === 0) return "https://chatgpt.com/";
 	return undefined;
 }
@@ -623,7 +1118,7 @@ function readDesktopShellEvidenceInPage(): DesktopShellEvidence {
 }
 
 function isDesktopShellRuntimeUrl(raw: string): boolean {
-	return raw === "app://-/index.html";
+	return raw === "app://-/index.html" || /^https:\/\/chatgpt\.com\/c\/WEB:[A-Za-z0-9-]{8,128}\/?$/.test(raw);
 }
 
 export function parseLoopbackEndpoint(raw: string): URL {
@@ -676,32 +1171,62 @@ function assertLoopbackWebSocket(socket: URL, port: string): void {
 }
 
 async function cdpRequest(url: string, method: string, params: Record<string, unknown>): Promise<unknown> {
-	return new Promise((resolve, reject) => {
-		const socket = new WebSocket(url);
-		const id = 1;
+	return runCdpSession(url, (request) => request(method, params));
+}
+
+async function runCdpSession<T>(
+	url: string,
+	work: (request: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>,
+): Promise<T> {
+	const socket = new WebSocket(url);
+	await new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
-			socket.close();
+			try { socket.close(); } catch {}
+			reject(new Error("CDP WebSocket connection timed out."));
+		}, 30_000);
+		const finish = (callback: () => void) => {
+			clearTimeout(timer);
+			callback();
+		};
+		socket.addEventListener("open", () => finish(resolve), { once: true });
+		socket.addEventListener("error", () => finish(() => reject(new Error("CDP WebSocket connection failed."))), { once: true });
+	});
+	let nextId = 1;
+	const request = (method: string, params: Record<string, unknown> = {}): Promise<unknown> => new Promise((resolve, reject) => {
+		const id = nextId++;
+		const timer = setTimeout(() => {
+			cleanup();
 			reject(new Error(`CDP ${method} timed out.`));
 		}, 30_000);
-		const finish = (work: () => void) => {
+		const cleanup = () => {
 			clearTimeout(timer);
-			try { socket.close(); } catch {}
-			work();
+			socket.removeEventListener("message", onMessage);
+			socket.removeEventListener("error", onError);
 		};
-		socket.addEventListener("open", () => socket.send(JSON.stringify({ id, method, params })));
-		socket.addEventListener("error", () => finish(() => reject(new Error(`CDP ${method} WebSocket failed.`))));
-		socket.addEventListener("message", (event) => {
+		const onError = () => {
+			cleanup();
+			reject(new Error(`CDP ${method} WebSocket failed.`));
+		};
+		const onMessage = (event: MessageEvent) => {
 			let message: unknown;
 			try { message = JSON.parse(String(event.data)); } catch { return; }
 			if (!isRecord(message) || message.id !== id) return;
+			cleanup();
 			if (isRecord(message.error)) {
-				const detail = String(message.error.message ?? `CDP ${method} failed.`);
-				finish(() => reject(new Error(detail)));
+				reject(new Error(String(message.error.message ?? `CDP ${method} failed.`)));
 				return;
 			}
-			finish(() => resolve(message.result));
-		});
+			resolve(message.result);
+		};
+		socket.addEventListener("message", onMessage);
+		socket.addEventListener("error", onError);
+		socket.send(JSON.stringify({ id, method, params }));
 	});
+	try {
+		return await work(request);
+	} finally {
+		try { socket.close(); } catch {}
+	}
 }
 
 interface LsofRecord { pid: number; names: string[] }

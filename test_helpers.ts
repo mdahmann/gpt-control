@@ -41,6 +41,8 @@ export interface FakeBridgeOptions {
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
 	responseForPrompt?: (prompt: string) => string | undefined;
 	rateLimitNotice?: boolean;
+	desktopPickerMarkup?: boolean;
+	desktopOrganizationMarkup?: boolean;
 }
 
 interface FakeTurn {
@@ -236,7 +238,7 @@ export class FakeChromeBridge {
 			tab.pendingAttachments.push(...files);
 			return ok({ success: true });
 		}
-		if (request.action === "click") return this.handleClick(tab.id, String(request.payload.selector));
+		if (request.action === "click" || request.action === "activate") return this.handleClick(tab.id, String(request.payload.selector));
 		if (request.action === "hover") return this.handleHover(tab.id, String(request.payload.selector));
 		if (request.action === "press") {
 			if (String(request.payload.key) === "ArrowLeft" && (tab.pickerStage === "model" || tab.pickerStage === "effort")) {
@@ -369,6 +371,14 @@ export class FakeChromeBridge {
 			tab.conversationMenu = "header";
 			return ok({ success: true });
 		}
+		if (selector === '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]') {
+			tab.conversationMenu = "header";
+			return ok({ success: true });
+		}
+		if (selector === '[aria-current="page"] button[aria-label="Chat actions"]') {
+			tab.conversationMenu = "sidebar";
+			return ok({ success: true });
+		}
 		if (selector.startsWith('a[href$="/c/')) {
 			tab.conversationMenu = "sidebar";
 			return ok({ success: true });
@@ -391,6 +401,15 @@ export class FakeChromeBridge {
 			tab.conversationMenu = "move";
 			return ok({ success: true });
 		}
+		if (selector === "role=menuitem[name=Project]") {
+			tab.conversationMenu = "move";
+			return ok({ success: true });
+		}
+		if (selector === `role=menuitem[name=Remove from ${tab.project}]`) {
+			tab.project = undefined;
+			tab.conversationMenu = undefined;
+			return ok({ success: true });
+		}
 		if (selector === "role=menuitem[name=Archive]") {
 			tab.archived = true;
 			tab.conversationMenu = undefined;
@@ -403,7 +422,7 @@ export class FakeChromeBridge {
 			tab.conversationMenu = undefined;
 			return ok({ success: true });
 		}
-		if (selector.includes("model-switcher") || selector.includes("model-selector") || selector.includes("composer-model") || selector.includes("radix-picker")) {
+		if (selector.includes("model-switcher") || selector.includes("model-selector") || selector.includes("composer-model") || selector.includes("radix-picker") || selector.includes("Select ChatGPT model")) {
 			tab.menuOpen = !tab.menuOpen;
 			tab.pickerStage = tab.menuOpen && this.options.currentEffortPicker ? "compact" : undefined;
 			return ok({ success: true });
@@ -429,6 +448,21 @@ export class FakeChromeBridge {
 		}
 		if (radio && tab.pickerStage === "effort") {
 			tab.model = radio[1];
+			tab.menuOpen = false;
+			tab.pickerStage = undefined;
+			return ok({ success: true });
+		}
+		const desktopOption = /^role=menuitem\[name=(.+)\]$/.exec(selector);
+		if (this.options.desktopPickerMarkup && desktopOption && tab.pickerStage === "model"
+			&& (this.options.availableModels ?? []).includes(desktopOption[1])) {
+			tab.underlyingModel = desktopOption[1];
+			tab.menuOpen = false;
+			tab.pickerStage = undefined;
+			return ok({ success: true });
+		}
+		if (this.options.desktopPickerMarkup && desktopOption && tab.pickerStage === "effort"
+			&& (this.options.availableEfforts ?? []).includes(desktopOption[1])) {
+			tab.model = desktopOption[1];
 			tab.menuOpen = false;
 			tab.pickerStage = undefined;
 			return ok({ success: true });
@@ -534,14 +568,28 @@ export class FakeChromeBridge {
 	private html(tab: FakeTab): string {
 		tab.htmlReads += 1;
 		const account = '<div data-testid="account-plan">Miles Pro</div>';
-		const projects = (this.options.availableProjects ?? []).map((name) => `<button aria-label="Open project options for ${escapeHtml(name)}"></button>`).join("");
+		const projectAction = this.options.desktopPickerMarkup ? "Project actions" : "Open project options";
+		const projects = (this.options.availableProjects ?? []).map((name) => `<button aria-label="${projectAction} for ${escapeHtml(name)}"></button>`).join("");
 		const identity = providerConversationIdentityForFake(tab.url);
-		const conversationLink = identity && !tab.archived
+		const nativeOrganization = this.options.desktopOrganizationMarkup === true;
+		const conversationLink = identity && !tab.archived && !nativeOrganization
 			? `<a href="/c/${escapeHtml(identity)}">${escapeHtml(tab.title)}<button aria-label="${tab.pinned ? "Unpin" : "Pin"} ${escapeHtml(tab.title)}"></button><button aria-label="Open conversation options for ${escapeHtml(tab.title)}"></button></a>`
 			: "";
-		const header = identity ? '<header><button data-testid="conversation-options-button" aria-label="More"></button></header>' : "";
-		const conversationActions = tab.conversationMenu === "header" || tab.conversationMenu === "sidebar"
-			? `<div role="menu"><div role="menuitem">${tab.pinned ? "Unpin chat" : "Pin chat"}</div><div role="menuitem">Rename</div><div role="menuitem">Archive</div><div role="menuitem">Move to project</div></div>`
+		const header = identity
+			? nativeOrganization
+				? `<button aria-label="Switch mode, current mode: Chat"></button><div data-testid="app-shell-header-context-menu-surface"><button>${escapeHtml(tab.title)}</button><button aria-label="ChatGPT conversation actions"></button></div><div aria-current="page"><span data-thread-title="true">${escapeHtml(tab.title)}</span><button aria-label="Chat actions"></button></div>`
+				: '<header><button data-testid="conversation-options-button" aria-label="More"></button></header>'
+			: "";
+		const headerActions = nativeOrganization
+			? `<div role="menu"><div role="menuitem">${tab.pinned ? "Unpin chat" : "Pin chat"}</div><div role="menuitem">${tab.project ? `Remove from ${escapeHtml(tab.project)}` : "Move to project"}</div><div role="menuitem">Open in quick chat</div></div>`
+			: `<div role="menu"><div role="menuitem">${tab.pinned ? "Unpin chat" : "Pin chat"}</div><div role="menuitem">Rename</div><div role="menuitem">Archive</div><div role="menuitem">Move to project</div></div>`;
+		const sidebarActions = nativeOrganization
+			? `<div role="menu"><div role="menuitem">${tab.pinned ? "Unpin" : "Pin"}</div><div role="menuitem">Rename</div><div role="menuitem">Archive</div><div role="menuitem">Project</div></div>`
+			: headerActions;
+		const conversationActions = tab.conversationMenu === "header"
+			? headerActions
+			: tab.conversationMenu === "sidebar"
+				? sidebarActions
 			: tab.conversationMenu === "move"
 				? `<div role="menu">${(this.options.availableProjects ?? []).map((name) => `<div role="menuitem">${escapeHtml(name)}</div>`).join("")}</div>`
 				: tab.conversationMenu === "rename" ? `<input aria-label="Chat title" value="${escapeHtml(tab.title)}">` : "";
@@ -552,19 +600,23 @@ export class FakeChromeBridge {
 		const composer = this.options.modelSelectorAbsent || modelSelectorDelayed || composerModelHidden
 			? '<form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>'
 			: this.options.currentEffortPicker
-				? `<form data-testid="composer"><button id="radix-picker" aria-haspopup="menu">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`
+				? this.options.desktopPickerMarkup
+					? `<form data-testid="composer"><button id="radix-picker" aria-label="Select ChatGPT model" aria-haspopup="menu" aria-expanded="${tab.menuOpen}" aria-controls="picker-root">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`
+					: `<form data-testid="composer"><button id="radix-picker" aria-haspopup="menu">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`
 				: `<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Model selector">${escapeHtml(tab.model)}</button><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>`;
-		const advancedRows = `<div data-testid="composer-model-picker-slider-advanced-view" data-active="true"><div id="picker-model" role="menuitem">Model ${escapeHtml(tab.underlyingModel)}</div><div id="picker-effort" role="menuitem">Effort ${escapeHtml(tab.model)}</div></div>`;
+		const advancedRows = this.options.desktopPickerMarkup
+			? `<div id="picker-model" role="menuitem" aria-label="Model ${escapeHtml(tab.underlyingModel)}" aria-controls="picker-model-menu">Model ${escapeHtml(tab.underlyingModel)}</div><div id="picker-effort" role="menuitem" aria-label="Effort ${escapeHtml(tab.model)}" aria-controls="picker-effort-menu">Effort ${escapeHtml(tab.model)}</div>`
+			: `<div data-testid="composer-model-picker-slider-advanced-view" data-active="true"><div id="picker-model" role="menuitem">Model ${escapeHtml(tab.underlyingModel)}</div><div id="picker-effort" role="menuitem">Effort ${escapeHtml(tab.model)}</div></div>`;
 		const radioOptions = (tab.pickerStage === "model" ? this.options.availableModels ?? [tab.underlyingModel] : this.options.availableEfforts ?? ["Instant", "Pro"])
-			.map((label) => `<div role="menuitemradio" aria-checked="${label === (tab.pickerStage === "model" ? tab.underlyingModel : tab.model) ? "true" : "false"}">${escapeHtml(label)}</div>`).join("");
+			.map((label) => `<div role="${this.options.desktopPickerMarkup ? "menuitem" : "menuitemradio"}" aria-checked="${label === (tab.pickerStage === "model" ? tab.underlyingModel : tab.model) ? "true" : "false"}">${escapeHtml(label)}</div>`).join("");
 		const retainedInactivePicker = this.options.retainedInactiveAdvancedView && !tab.menuOpen
 			? `<div data-testid="composer-model-picker-slider-advanced-view" data-active="false"><div id="stale-picker-model" role="menuitem">Model Stale hidden model</div><div id="stale-picker-effort" role="menuitem">Effort Stale hidden effort</div></div>`
 			: "";
 		const currentPicker = tab.menuOpen && this.options.currentEffortPicker
 			? tab.pickerStage === "model" || tab.pickerStage === "effort"
-				? `<div role="menu">${advancedRows}</div><div role="menu" aria-labelledby="${tab.pickerStage === "model" ? "picker-model" : "picker-effort"}">${radioOptions}</div>`
+				? `<div id="picker-root" role="menu" aria-labelledby="radix-picker">${advancedRows}</div><div id="${tab.pickerStage === "model" ? "picker-model-menu" : "picker-effort-menu"}" role="menu" aria-labelledby="${tab.pickerStage === "model" ? "picker-model" : "picker-effort"}">${radioOptions}</div>`
 				: tab.pickerStage === "advanced"
-					? `<div role="menu"><div role="menuitem" aria-label="Show compact options">Advanced</div>${advancedRows}</div>`
+					? `<div id="picker-root" role="menu" aria-labelledby="radix-picker"><div role="menuitem" aria-label="Show compact options">Advanced</div>${advancedRows}</div>`
 					: '<div role="menu"><div role="menuitem" aria-label="Show advanced options">Advanced</div><div data-testid="composer-model-picker-slider-advanced-view" data-active="false"></div></div>'
 			: "";
 		const menu = currentPicker || (tab.menuOpen && this.options.modelAvailable !== false

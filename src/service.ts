@@ -15,6 +15,8 @@ import {
 	waitForDriverReady,
 	type DriverCompletionOutcome,
 	type ExpectedDriverSession,
+	type ChatGptConversationCatalog,
+	type ChatGptConversationFindRequest,
 	type WebChatDriver,
 } from "./browser-driver";
 import {
@@ -26,6 +28,7 @@ import {
 	type ChatGptProjectCatalog,
 	type ChatGptConversationAction,
 	type ChatGptConversationActionResult,
+	type ChatGptConversationTurn,
 	type ChatPageObservation,
 } from "./chatgpt";
 import {
@@ -139,6 +142,27 @@ export interface AttachConversationRequest {
 	conversationUrl?: string;
 	providerConversationId?: string;
 	timeoutMs?: number;
+}
+
+export interface ConversationStatusResult {
+	conversationId: string;
+	providerConversationId?: string;
+	providerConversationUrl?: string;
+	title?: string;
+	pinned?: boolean;
+	project?: string;
+	projectId?: string;
+	state: "idle" | "generating" | "rate_limited" | "error" | "needs_user";
+	stateSummary: string;
+	assistantTurnCount: number;
+	requestedModel?: string;
+	observedModel?: string;
+	requestedEffort?: string;
+	observedEffort?: string;
+	latestTurnAt?: string;
+	visibleToolCards: Array<{ label: string; sha256: string }>;
+	rateLimitMessage?: string;
+	errorMessage?: string;
 }
 
 export interface ServiceDependencies {
@@ -309,6 +333,27 @@ export class GptControlService {
 		}));
 	}
 
+	async findConversations(request: ChatGptConversationFindRequest = {}): Promise<ChatGptConversationCatalog> {
+		const query = request.query?.replace(/\s+/g, " ").trim();
+		if (query !== undefined && (query.length < 1 || query.length > 256)) {
+			throw new Error("Conversation query must be 1-256 characters.");
+		}
+		const limit = request.limit ?? 20;
+		if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("Conversation search limit must be 1-50.");
+		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+		const route = selectRoute(capabilities, { transport: "browser" });
+		assertTransportAllowed(this.policy, route.kind);
+		if (!route.driver.findConversations) {
+			throw new Error(`Browser driver ${route.driver.id} does not support read-only ChatGPT conversation discovery.`);
+		}
+		return route.driver.findConversations({
+			...(query ? { query } : {}),
+			...(request.pinned !== undefined ? { pinned: request.pinned } : {}),
+			...(request.projectId ? { projectId: request.projectId } : {}),
+			limit,
+		});
+	}
+
 	async manageConversation(
 		conversationId: string,
 		action: ChatGptConversationAction,
@@ -338,6 +383,96 @@ export class GptControlService {
 				await this.store.updateConversation(conversationId, { providerProject: result.project });
 			}
 			return result;
+		});
+	}
+
+	async readConversation(
+		conversationId: string,
+		limit = 10,
+		mcpSessionId?: string,
+	): Promise<ChatGptConversationTurn[]> {
+		if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
+			if (conversation.closedAt) throw new Error(`Conversation ${conversationId} is closed.`);
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			const session = await assertExactDriverSession(driver, expected);
+			if (!driver.readConversation) throw new Error(`Browser driver ${driver.id} does not support conversation reads.`);
+			return driver.readConversation(session, limit);
+		});
+	}
+
+	async findAndAttachConversation(
+		request: ChatGptConversationFindRequest,
+		mcpSessionId?: string,
+	): Promise<{ match: ChatGptConversationCatalog["conversations"][number]; conversation: ConversationRecord }> {
+		const catalog = await this.findConversations(request);
+		if (catalog.conversations.length === 0) throw new Error("No ChatGPT conversation matched the requested search.");
+		if (catalog.conversations.length !== 1) {
+			throw new Error(`ChatGPT conversation search is ambiguous; ${catalog.conversations.length} conversations matched. Narrow the title or filters before attachment.`);
+		}
+		const match = catalog.conversations[0];
+		let conversation = await this.attachConversation({ providerConversationId: match.providerConversationId }, mcpSessionId);
+		conversation = await this.store.updateConversation(conversation.id, {
+			providerTitle: match.title,
+			providerPinned: match.pinned,
+			...(match.projectId ? { providerProject: match.projectId } : {}),
+		});
+		return { match, conversation };
+	}
+
+	async conversationStatus(
+		conversationId: string,
+		mcpSessionId?: string,
+	): Promise<ConversationStatusResult> {
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
+			if (conversation.closedAt) throw new Error(`Conversation ${conversationId} is closed.`);
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			const session = await assertExactDriverSession(driver, expected);
+			const observation = await driver.observe(session);
+			let metadata: ChatGptConversationCatalog["conversations"][number] | undefined;
+			if (driver.findConversations && conversation.providerConversationId) {
+				const catalog = await driver.findConversations({
+					...(conversation.providerTitle ? { query: conversation.providerTitle } : {}),
+					limit: 50,
+				});
+				metadata = catalog.conversations.find((entry) => entry.providerConversationId === conversation.providerConversationId);
+			}
+			const latestRun = (await this.store.listRuns({ limit: null }))
+				.filter((run) => run.conversationId === conversationId)
+				.sort((left, right) => right.receipt.startedAt.localeCompare(left.receipt.startedAt))[0];
+			const state: ConversationStatusResult["state"] = observation.rateLimited
+				? "rate_limited"
+				: observation.errorMessage ? "error"
+					: observation.answering || observation.thinking || observation.toolRunning ? "generating"
+						: observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
+			return {
+				conversationId,
+				providerConversationId: conversation.providerConversationId,
+				providerConversationUrl: conversation.providerConversationUrl,
+				title: metadata?.title ?? conversation.providerTitle,
+				pinned: metadata?.pinned ?? conversation.providerPinned,
+				project: conversation.providerProject,
+				projectId: metadata?.projectId,
+				state,
+				stateSummary: observation.stateSummary,
+				assistantTurnCount: observation.snapshot.count,
+				requestedModel: latestRun?.receipt.requestedModel,
+				observedModel: latestRun?.receipt.observedModel,
+				requestedEffort: latestRun?.receipt.requestedEffort,
+				observedEffort: latestRun?.receipt.observedEffort,
+				latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
+				visibleToolCards: observation.visibleToolCards,
+				rateLimitMessage: observation.rateLimitMessage,
+				errorMessage: observation.errorMessage,
+			};
 		});
 	}
 

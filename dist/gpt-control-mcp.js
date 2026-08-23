@@ -34126,38 +34126,133 @@ async function manageChatGptConversation(exec, launcher, tabId, action, signal, 
   const deadline = Date.now() + timeoutMs;
   if (action.action === "rename") {
     const title = normalizeManagementLabel(action.title, 128, "title");
-    const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
-    await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
-    await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
-    await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
-    await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
-    await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
-    await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
-    return { title, verifiedAt: nowIso() };
+    try {
+      const nativeTitleSelector = nativeHeaderTitleSelector(await readPageHtml(exec, launcher, tabId, signal));
+      if (nativeTitleSelector && expectedTarget) {
+        try {
+          await privateBridgeJson(exec, launcher, "doubleClick", {
+            tabId,
+            selector: nativeTitleSelector,
+            expectedTarget
+          }, signal);
+        } catch (error51) {
+          const interrupted = /trusted click.*(?:blocked|pending)/i.test(error51 instanceof Error ? error51.message : String(error51));
+          const editorReady = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[aria-label="Chat title"]').length === 1;
+          if (!interrupted || !editorReady)
+            throw error51;
+        }
+      } else {
+        const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
+        if (optionsSelector === '[aria-current="page"] button[aria-label="Chat actions"]') {
+          await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+        } else {
+          await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
+        }
+        await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
+      }
+      await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
+      await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
+      try {
+        await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
+      } catch (error51) {
+        const interrupted = /trusted key was blocked/i.test(error51 instanceof Error ? error51.message : String(error51));
+        const editorClosed = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[aria-label="Chat title"]').length === 0;
+        if (!interrupted || !editorClosed)
+          throw error51;
+      }
+      await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
+      return { title, verifiedAt: nowIso() };
+    } catch (error51) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
+      throw error51;
+    }
   }
-  await openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+  const nativeDesktop = isNativeDesktopShell(await readPageHtml(exec, launcher, tabId, signal));
   if (action.action === "move") {
     const project = normalizeManagementLabel(action.project, 128, "project");
-    await clickLiveMenuItem(exec, launcher, tabId, "Move to project", deadline, signal, expectedTarget);
-    const option = await waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal);
-    await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
-    await waitForProjectReadback(exec, launcher, tabId, identity.id, project, deadline, signal);
-    return { project, verifiedAt: nowIso() };
+    let lastError;
+    for (let attempt = 0;attempt < (nativeDesktop ? 2 : 1); attempt += 1) {
+      const moveDeadline = Date.now() + timeoutMs;
+      try {
+        if (nativeDesktop) {
+          await openNativeHeaderConversationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+        } else {
+          await openConversationOrganizationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+        }
+        await clickLiveMenuItem(exec, launcher, tabId, ["Move to project", "Project"], moveDeadline, signal, expectedTarget);
+        const option = await waitForProjectMenuOption(exec, launcher, tabId, project, moveDeadline, signal);
+        if (nativeDesktop && expectedTarget) {
+          if (attempt === 0) {
+            const activation = await privateBridgeJson(exec, launcher, "activate", { tabId, selector: option.selector, expectedTarget }, signal);
+            const alerts = Array.isArray(activation.visibleAlerts) ? activation.visibleAlerts.map(String) : [];
+            const refusal = alerts.find((message) => /could(?:n't| not) update the conversation(?:'s|s) project/i.test(message));
+            if (refusal)
+              throw new Error(`ChatGPT refused the project move: ${refusal}`);
+          } else {
+            await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+          }
+          await privateBridgeJson(exec, launcher, "reload", { tabId, expectedTarget }, signal);
+          await waitForSelectorInHtml(exec, launcher, tabId, '#prompt-textarea,div[contenteditable="true"][aria-label="Message ChatGPT"]', moveDeadline, signal);
+          await verifyNativeProjectMembership(exec, launcher, tabId, project, true, moveDeadline, signal, expectedTarget);
+        } else {
+          await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+          await waitForProjectReadback(exec, launcher, tabId, identity.id, project, moveDeadline, signal);
+        }
+        return { project, verifiedAt: nowIso() };
+      } catch (error51) {
+        lastError = error51;
+        await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+          return;
+        });
+      }
+    }
+    throw lastError;
   }
   if (action.action === "archive") {
+    if (nativeDesktop) {
+      await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      const nativeRemovalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+      if (nativeRemovalLabel) {
+        const project = nativeRemovalLabel.replace(/^Remove from\s+/i, "").trim();
+        await clickLiveMenuItem(exec, launcher, tabId, nativeRemovalLabel, deadline, signal, expectedTarget);
+        await verifyNativeProjectMembership(exec, launcher, tabId, project, false, deadline, signal, expectedTarget);
+      } else {
+        await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+          return;
+        });
+      }
+      await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+    } else {
+      await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      const removalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+      if (removalLabel) {
+        await clickLiveMenuItem(exec, launcher, tabId, removalLabel, deadline, signal, expectedTarget);
+        await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      }
+    }
     await clickLiveMenuItem(exec, launcher, tabId, "Archive", deadline, signal, expectedTarget);
     await waitForArchiveReadback(exec, launcher, tabId, identity.url, deadline, signal);
     return { archived: true, verifiedAt: nowIso() };
   }
+  await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
   const desired = action.action === "pin";
-  const already = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+  const openMenuState = conversationPinMenuState(await readPageHtml(exec, launcher, tabId, signal));
+  const already = openMenuState ?? isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
   if (already !== desired) {
-    await clickLiveMenuItem(exec, launcher, tabId, desired ? "Pin chat" : "Unpin chat", deadline, signal, expectedTarget);
+    await clickLiveMenuItem(exec, launcher, tabId, desired ? ["Pin chat", "Pin"] : ["Unpin chat", "Unpin"], deadline, signal, expectedTarget);
+    await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
   }
   for (;; ) {
-    const pinned = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
-    if (pinned === desired)
+    const html = await readPageHtml(exec, launcher, tabId, signal);
+    const pinned = conversationPinMenuState(html) ?? isConversationPinned(html, identity.id);
+    if (pinned === desired) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
       return { pinned, verifiedAt: nowIso() };
+    }
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
@@ -34381,6 +34476,25 @@ function approvedImageUrl(raw) {
     return;
   const host = url2.hostname.toLowerCase();
   return IMAGE_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url2 : undefined;
+}
+function extractConversationTurns(html, limit = 10) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+    throw new Error("Conversation read limit must be 1-20.");
+  const root = parse6(html);
+  const turns = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`).map((node) => {
+    const assistant = node.getAttribute("data-message-author-role") === "assistant" || (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
+    const content = assistant ? node.querySelector(ASSISTANT_CONTENT_SELECTOR) : USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
+    const text = (content?.structuredText ?? node.structuredText ?? "").replace(/[ \t]+\n/g, `
+`).replace(/\n{3,}/g, `
+
+`).trim();
+    return {
+      role: assistant ? "assistant" : "user",
+      text,
+      messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
+    };
+  }).filter((turn) => turn.text.length > 0);
+  return turns.slice(-limit);
 }
 function extractAssistantTurn(html) {
   const root = parse6(html);
@@ -34725,7 +34839,13 @@ async function pickerAction(exec, launcher, action, tabId, selector, signal, exp
 }
 function extractAdvancedPickerState(html, composerSelector) {
   const root = parse6(html);
-  const active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+  let active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+  if (!active) {
+    const composer = root.querySelector(composerSelector);
+    const menuId = composer?.getAttribute("aria-expanded") === "true" ? composer.getAttribute("aria-controls") : undefined;
+    if (menuId)
+      active = root.querySelector(`[id="${cssString(menuId)}"]`);
+  }
   if (!active)
     return;
   const rows = active.querySelectorAll('[role="menuitem"]');
@@ -34736,10 +34856,14 @@ function extractAdvancedPickerState(html, composerSelector) {
   return {
     currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
     currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
-    modelSelector: model ? exactNodeSelector(model) : undefined,
-    effortSelector: effort ? exactNodeSelector(effort) : undefined,
+    modelSelector: model ? pickerSubmenuOwnerSelector(model) : undefined,
+    effortSelector: effort ? pickerSubmenuOwnerSelector(effort) : undefined,
     composerSelector
   };
+}
+function pickerSubmenuOwnerSelector(node) {
+  const id = node.getAttribute("id");
+  return id ? `[id="${cssString(id)}"]` : exactNodeSelector(node);
 }
 function pickerRowValue(label, prefix) {
   const value = label.replace(new RegExp(`^${prefix}\\s*`, "i"), "").trim();
@@ -34750,7 +34874,8 @@ function extractPickerRadioOptions(html, ownerSelector) {
   const ownerId = ownerSelector ? /^\[id="((?:[^"\\]|\\.)+)"\]$/.exec(ownerSelector)?.[1] : undefined;
   return uniqueElements([
     ...root.querySelectorAll('[role="menuitemradio"]'),
-    ...root.querySelectorAll('[role="option"]')
+    ...root.querySelectorAll('[role="option"]'),
+    ...ownerId ? root.querySelectorAll('[role="menuitem"]') : []
   ]).filter((node) => {
     if (!ownerId)
       return true;
@@ -34769,7 +34894,7 @@ function extractPickerRadioOptions(html, ownerSelector) {
 }
 function extractChatGptProjects(html) {
   const root = parse6(html);
-  const names = root.querySelectorAll('button[aria-label^="Open project options for "]').map((node) => (node.getAttribute("aria-label") ?? "").replace(/^Open project options for\s+/i, "").trim()).filter(Boolean);
+  const names = root.querySelectorAll('button[aria-label^="Open project options for "],button[aria-label^="Project actions for "]').map((node) => (node.getAttribute("aria-label") ?? "").replace(/^(?:Open project options|Project actions) for\s+/i, "").trim()).filter(Boolean);
   return [...new Set(names)];
 }
 async function conversationSidebarOptionsSelector(exec, launcher, tabId, providerConversationId, deadline, signal) {
@@ -34780,13 +34905,19 @@ async function conversationSidebarOptionsSelector(exec, launcher, tabId, provide
       throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
     if (matches.length === 1)
       return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeMatches = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+    if (nativeMatches.length > 1)
+      throw new Error("ChatGPT native sidebar exposes duplicate controls for the exact conversation.");
+    if (nativeShell && nativeMatches.length === 1)
+      return '[aria-current="page"] button[aria-label="Chat actions"]';
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
   throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
 }
-async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
+async function openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
     const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
@@ -34794,7 +34925,30 @@ async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signa
     if (nativeSidebarButtons.length > 1)
       throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
     if (nativeSidebarButtons.length === 1) {
-      await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)))
+          throw error51;
+        if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+          if (Date.now() >= deadline)
+            throw error51;
+          await sleep(Math.min(pollIntervalMs(), 200));
+          continue;
+        }
+      }
+      return;
+    }
+    const nativeHeaderButtons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+    if (nativeHeaderButtons.length > 1)
+      throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+    if (nativeHeaderButtons.length === 1 && !nativeShell) {
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)) || !hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal)))
+          throw error51;
+      }
       return;
     }
     if (nativeShell) {
@@ -34817,16 +34971,71 @@ async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signa
   }
   throw new Error("ChatGPT conversation action control is unavailable.");
 }
-async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal, expectedTarget) {
+async function openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
-    const matches = root.querySelectorAll('[role="menuitem"]').filter((node) => nodeLabel(node).toLowerCase() === label.toLowerCase());
+    const buttons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+    if (buttons.length > 1)
+      throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+    if (buttons.length === 1) {
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)))
+          throw error51;
+        if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+          if (Date.now() >= deadline)
+            throw error51;
+          await sleep(Math.min(pollIntervalMs(), 200));
+          continue;
+        }
+      }
+      return;
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("ChatGPT native header conversation control is unavailable.");
+}
+function isNativeDesktopShell(html) {
+  return parse6(html).querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+}
+function nativeHeaderTitleSelector(html) {
+  const root = parse6(html);
+  if (root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length === 0)
+    return;
+  const currentTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+  if (currentTitles.length !== 1)
+    return;
+  const title = nodeLabel(currentTitles[0]);
+  if (!title)
+    return;
+  const matches = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button').filter((node) => nodeLabel(node) === title);
+  if (matches.length > 1)
+    throw new Error("ChatGPT native header title is ambiguous; rename refused.");
+  return matches.length === 1 ? "text=" + title : undefined;
+}
+function hasOpenConversationActionMenu(html) {
+  const known = new Set(["pin", "pin chat", "unpin", "unpin chat", "rename", "archive", "project", "move to project", "share", "delete chat"]);
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => normalizePickerLabel(nodeLabel(node))).filter((label) => known.has(label));
+  return new Set(labels).size >= 2;
+}
+async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal, expectedTarget) {
+  const labels = (Array.isArray(label) ? label : [label]).map((value) => value.toLowerCase());
+  const displayLabel = Array.isArray(label) ? label.join(" or ") : label;
+  let observed = [];
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const menuItems = root.querySelectorAll('[role="menuitem"]');
+    observed = [...new Set(menuItems.map((node) => nodeLabel(node)).filter(Boolean))];
+    const matches = menuItems.filter((node) => labels.includes(nodeLabel(node).toLowerCase()));
     if (matches.length > 1)
-      throw new Error(`ChatGPT menu action ${label} is ambiguous.`);
+      throw new Error(`ChatGPT menu action ${displayLabel} is ambiguous.`);
     if (matches.length === 1) {
       const selector = exactNodeSelector(matches[0]);
       if (!selector)
-        throw new Error(`ChatGPT menu action ${label} has no exact selector.`);
+        throw new Error(`ChatGPT menu action ${displayLabel} has no exact selector.`);
       await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
       return;
     }
@@ -34834,7 +35043,7 @@ async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal,
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT menu action ${label} is unavailable.`);
+  throw new Error(`ChatGPT menu action ${displayLabel} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 async function waitForSelectorInHtml(exec, launcher, tabId, selector, deadline, signal) {
   for (;; ) {
@@ -34864,24 +35073,37 @@ async function privateOrBridgeAction(exec, launcher, action, payload, signal, ex
   await bridgeJson(exec, launcher, ["press", String(payload.tabId), String(payload.key)], signal);
 }
 async function waitForConversationTitle(exec, launcher, tabId, providerConversationId, title, deadline, signal) {
+  let observedNativeTitles = [];
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
     const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
     if (links.length === 1 && nodeLabel(links[0]).includes(title))
       return;
+    const nativeTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+    observedNativeTitles = nativeTitles.map((node) => {
+      const marker = node.getAttribute("data-thread-title")?.trim();
+      return marker && marker.toLowerCase() !== "true" ? marker : nodeLabel(node);
+    }).filter(Boolean);
+    if (nativeTitles.length === 1) {
+      const observed = observedNativeTitles[0] ?? "";
+      if (normalizePickerLabel(observed) === normalizePickerLabel(title))
+        return;
+    }
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT rename read-back failed for ${title}.`);
+  throw new Error(`ChatGPT rename read-back failed for ${title} (observed: ${observedNativeTitles.join(", ") || "none"}).`);
 }
 async function waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal) {
+  let observed = [];
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
     const options = root.querySelectorAll('[role="menuitem"]').map((node) => ({
       label: projectOptionLabel(node),
       selector: exactNodeSelector(node) ?? ""
     })).filter((option) => option.label && option.selector);
+    observed = [...new Set(options.map((option) => option.label))];
     const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(project));
     if (matches.length > 1)
       throw new Error(`ChatGPT project ${project} is ambiguous.`);
@@ -34891,24 +35113,59 @@ async function waitForProjectMenuOption(exec, launcher, tabId, project, deadline
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT project ${project} is unavailable.`);
+  throw new Error(`ChatGPT project ${project} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 function projectOptionLabel(node) {
   const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const last = lines.at(-1) ?? nodeLabel(node);
   return last.replace(/^Default color.*?Folder\s+/i, "").trim();
 }
+async function verifyNativeProjectMembership(exec, launcher, tabId, project, expectedPresent, deadline, signal, expectedTarget) {
+  const expectedRemoval = normalizePickerLabel(`Remove from ${project}`);
+  let observed = [];
+  for (;; ) {
+    await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+    const labels = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[role="menuitem"]').map((node) => nodeLabel(node)).filter(Boolean);
+    observed = labels;
+    const removalLabels = labels.filter((label) => /^Remove from\s+\S/i.test(label));
+    if (removalLabels.length > 1)
+      throw new Error("ChatGPT project membership read-back is ambiguous.");
+    const exactPresent = removalLabels.some((label) => normalizePickerLabel(label) === expectedRemoval);
+    const genericMove = labels.some((label) => normalizePickerLabel(label) === "move to project");
+    if (expectedPresent && exactPresent || !expectedPresent && removalLabels.length === 0 && genericMove) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
+      return;
+    }
+    await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+      return;
+    });
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT project membership read-back failed for ${project} (expected: ${expectedPresent ? "present" : "absent"}; observed: ${observed.join(", ") || "none"}).`);
+}
 async function waitForProjectReadback(exec, launcher, tabId, providerConversationId, project, deadline, signal) {
+  let lastCurrent;
+  let observedMarkers = [];
+  let observedNotices = [];
   for (;; ) {
     const html = await readPageHtml(exec, launcher, tabId, signal);
     const root = parse6(html);
     const notices = [...root.querySelectorAll('[role="status"]'), ...root.querySelectorAll('[role="alert"]')];
+    observedNotices = notices.map((node) => nodeLabel(node)).filter(Boolean);
     if (notices.some((node) => /mov/i.test(nodeLabel(node)) && normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
       return;
     const current = await tabUrl(exec, launcher, tabId, signal);
+    lastCurrent = current;
     const inProjectConversation = current ? new RegExp(`/g/[^/]+/c/${providerConversationId}(?:[?#]|$)`).test(new URL(current).pathname) : false;
     const projectMarkers = root.querySelectorAll('[data-testid*="project"], [aria-label*="project"], [aria-label*="Project"]');
+    observedMarkers = projectMarkers.map((node) => nodeLabel(node)).filter(Boolean);
     if (inProjectConversation && projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
+      return;
+    if (projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)) === normalizePickerLabel(`Projects ${project}`)))
       return;
     if (root.querySelector(`[data-gpt-control-project="${cssString(project)}"]`))
       return;
@@ -34916,7 +35173,7 @@ async function waitForProjectReadback(exec, launcher, tabId, providerConversatio
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT move read-back failed for project ${project}.`);
+  throw new Error(`ChatGPT move read-back failed for project ${project} (url: ${lastCurrent ?? "unknown"}; notices: ${observedNotices.join(", ") || "none"}; markers: ${observedMarkers.join(", ") || "none"}).`);
 }
 async function waitForArchiveReadback(exec, launcher, tabId, exactUrl, deadline, signal) {
   for (;; ) {
@@ -34939,6 +35196,20 @@ function isConversationPinned(html, providerConversationId) {
   const root = parse6(html);
   const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
   return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "") || link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+}
+function conversationPinMenuState(html) {
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => normalizePickerLabel(nodeLabel(node)));
+  if (labels.includes("unpin") || labels.includes("unpin chat"))
+    return true;
+  if (labels.includes("pin") || labels.includes("pin chat"))
+    return false;
+  return;
+}
+function projectRemovalMenuLabel(html) {
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => nodeLabel(node)).filter((label) => /^Remove from\s+\S/i.test(label));
+  if (labels.length > 1)
+    throw new Error("ChatGPT project-removal action is ambiguous; archive refused.");
+  return labels[0];
 }
 function normalizeManagementLabel(value, maxLength, field) {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -35481,6 +35752,10 @@ class ChromeBridgeBrowserDriver {
     await this.assertActionTarget(session, signal);
     return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
+  async readConversation(session, limit, signal) {
+    await this.assertActionTarget(session, signal);
+    return extractConversationTurns(await readPageHtml(this.exec, this.launcher, numericPageId(session.pageId), signal), limit);
+  }
   async manageConversation(session, action, signal) {
     await this.assertActionTarget(session, signal);
     return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30000, exactActionTarget(session));
@@ -35589,6 +35864,23 @@ var ProjectCatalogSchema = exports_external.object({
   projects: exports_external.array(exports_external.object({ name: exports_external.string().min(1) }).strict()),
   discoveredAt: exports_external.string().min(1)
 }).strict();
+var ConversationCatalogSchema = exports_external.object({
+  conversations: exports_external.array(exports_external.object({
+    providerConversationId: exports_external.string().regex(/^[A-Za-z0-9_-]{8,128}$/),
+    providerConversationUrl: exports_external.string().url(),
+    title: exports_external.string().min(1).max(512),
+    pinned: exports_external.boolean(),
+    projectId: exports_external.string().min(1).max(256).optional(),
+    current: exports_external.boolean().optional(),
+    updatedAt: exports_external.string().min(1).optional()
+  }).strict()),
+  discoveredAt: exports_external.string().min(1)
+}).strict();
+var ConversationTurnsSchema = exports_external.array(exports_external.object({
+  role: exports_external.enum(["user", "assistant"]),
+  text: exports_external.string().min(1),
+  messageId: exports_external.string().min(1).optional()
+}).strict());
 var ConversationActionResultSchema = exports_external.object({
   pinned: exports_external.boolean().optional(),
   archived: exports_external.boolean().optional(),
@@ -35654,6 +35946,12 @@ class ExternalCommandBrowserDriver {
   }
   async discoverProjects(session, signal) {
     return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+  }
+  async findConversations(request, signal) {
+    return ConversationCatalogSchema.parse(await this.call("find_conversations", { ...request }, signal));
+  }
+  async readConversation(session, limit, signal) {
+    return ConversationTurnsSchema.parse(await this.call("read_conversation", { session, limit }, signal));
   }
   async manageConversation(session, action, signal) {
     return ConversationActionResultSchema.parse(await this.call("manage_conversation", { session, operation: action }, signal));
@@ -37317,6 +37615,27 @@ class GptControlService {
       }
     }));
   }
+  async findConversations(request = {}) {
+    const query = request.query?.replace(/\s+/g, " ").trim();
+    if (query !== undefined && (query.length < 1 || query.length > 256)) {
+      throw new Error("Conversation query must be 1-256 characters.");
+    }
+    const limit = request.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50)
+      throw new Error("Conversation search limit must be 1-50.");
+    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+    const route = selectRoute(capabilities, { transport: "browser" });
+    assertTransportAllowed(this.policy, route.kind);
+    if (!route.driver.findConversations) {
+      throw new Error(`Browser driver ${route.driver.id} does not support read-only ChatGPT conversation discovery.`);
+    }
+    return route.driver.findConversations({
+      ...query ? { query } : {},
+      ...request.pinned !== undefined ? { pinned: request.pinned } : {},
+      ...request.projectId ? { projectId: request.projectId } : {},
+      limit
+    });
+  }
   async manageConversation(conversationId, action, mcpSessionId) {
     return this.store.withConversationOwnershipLock(conversationId, async () => {
       const conversation = await this.store.getConversation(conversationId);
@@ -37343,6 +37662,82 @@ class GptControlService {
         await this.store.updateConversation(conversationId, { providerProject: result.project });
       }
       return result;
+    });
+  }
+  async readConversation(conversationId, limit = 10, mcpSessionId) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+      throw new Error("Conversation read limit must be 1-20.");
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
+      const conversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
+      if (conversation.closedAt)
+        throw new Error(`Conversation ${conversationId} is closed.`);
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      const session = await assertExactDriverSession(driver, expected);
+      if (!driver.readConversation)
+        throw new Error(`Browser driver ${driver.id} does not support conversation reads.`);
+      return driver.readConversation(session, limit);
+    });
+  }
+  async findAndAttachConversation(request, mcpSessionId) {
+    const catalog = await this.findConversations(request);
+    if (catalog.conversations.length === 0)
+      throw new Error("No ChatGPT conversation matched the requested search.");
+    if (catalog.conversations.length !== 1) {
+      throw new Error(`ChatGPT conversation search is ambiguous; ${catalog.conversations.length} conversations matched. Narrow the title or filters before attachment.`);
+    }
+    const match = catalog.conversations[0];
+    let conversation = await this.attachConversation({ providerConversationId: match.providerConversationId }, mcpSessionId);
+    conversation = await this.store.updateConversation(conversation.id, {
+      providerTitle: match.title,
+      providerPinned: match.pinned,
+      ...match.projectId ? { providerProject: match.projectId } : {}
+    });
+    return { match, conversation };
+  }
+  async conversationStatus(conversationId, mcpSessionId) {
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
+      const conversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
+      if (conversation.closedAt)
+        throw new Error(`Conversation ${conversationId} is closed.`);
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      const session = await assertExactDriverSession(driver, expected);
+      const observation = await driver.observe(session);
+      let metadata;
+      if (driver.findConversations && conversation.providerConversationId) {
+        const catalog = await driver.findConversations({
+          ...conversation.providerTitle ? { query: conversation.providerTitle } : {},
+          limit: 50
+        });
+        metadata = catalog.conversations.find((entry) => entry.providerConversationId === conversation.providerConversationId);
+      }
+      const latestRun = (await this.store.listRuns({ limit: null })).filter((run) => run.conversationId === conversationId).sort((left, right) => right.receipt.startedAt.localeCompare(left.receipt.startedAt))[0];
+      const state = observation.rateLimited ? "rate_limited" : observation.errorMessage ? "error" : observation.answering || observation.thinking || observation.toolRunning ? "generating" : observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
+      return {
+        conversationId,
+        providerConversationId: conversation.providerConversationId,
+        providerConversationUrl: conversation.providerConversationUrl,
+        title: metadata?.title ?? conversation.providerTitle,
+        pinned: metadata?.pinned ?? conversation.providerPinned,
+        project: conversation.providerProject,
+        projectId: metadata?.projectId,
+        state,
+        stateSummary: observation.stateSummary,
+        assistantTurnCount: observation.snapshot.count,
+        requestedModel: latestRun?.receipt.requestedModel,
+        observedModel: latestRun?.receipt.observedModel,
+        requestedEffort: latestRun?.receipt.requestedEffort,
+        observedEffort: latestRun?.receipt.observedEffort,
+        latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
+        visibleToolCards: observation.visibleToolCards,
+        rateLimitMessage: observation.rateLimitMessage,
+        errorMessage: observation.errorMessage
+      };
     });
   }
   async start(request, options = {}) {
@@ -40228,6 +40623,68 @@ function registerCoreTools(server, service, taskStore) {
       providerConversationUrl: conversation.providerConversationUrl,
       localAssistantTurnCount: conversation.browserAssistantTurnCount
     });
+  });
+  server.registerTool("gpt_conversation_find", {
+    description: "Search the authenticated ChatGPT Desktop sidebar without opening, sending, or changing a conversation. Returns exact provider conversation IDs for secure attachment.",
+    inputSchema: {
+      query: exports_external.string().min(1).max(256).optional(),
+      pinned: exports_external.boolean().optional(),
+      project_id: exports_external.string().min(1).max(256).optional(),
+      limit: exports_external.number().int().min(1).max(50).optional()
+    },
+    annotations: { readOnlyHint: true }
+  }, async (params) => {
+    const catalog = await service.findConversations({
+      query: params.query,
+      pinned: params.pinned,
+      projectId: params.project_id,
+      limit: params.limit
+    });
+    return toolPayload(`${catalog.conversations.length} ChatGPT conversation${catalog.conversations.length === 1 ? "" : "s"} matched.`, catalog);
+  });
+  server.registerTool("gpt_conversation_find_and_attach", {
+    description: "Search the authenticated ChatGPT Desktop sidebar, require exactly one match, and securely attach that exact conversation in a GPT-Control-owned background session.",
+    inputSchema: {
+      query: exports_external.string().min(1).max(256),
+      pinned: exports_external.boolean().optional(),
+      project_id: exports_external.string().min(1).max(256).optional()
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params, extra) => {
+    const { match, conversation } = await service.findAndAttachConversation({
+      query: params.query,
+      pinned: params.pinned,
+      projectId: params.project_id,
+      limit: 2
+    }, extra.sessionId);
+    return toolPayload(`Found and attached ${match.title}.`, {
+      match,
+      conversationId: conversation.id,
+      providerConversationId: conversation.providerConversationId,
+      providerConversationUrl: conversation.providerConversationUrl
+    });
+  });
+  server.registerTool("gpt_conversation_read", {
+    description: "Read the bounded newest visible user and assistant turns from one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+    inputSchema: {
+      conversation_id: exports_external.string(),
+      limit: exports_external.number().int().min(1).max(20).optional()
+    },
+    annotations: { readOnlyHint: true }
+  }, async (params, extra) => {
+    const turns = await service.readConversation(params.conversation_id, params.limit ?? 10, extra.sessionId);
+    return toolPayload(`${turns.length} visible ChatGPT turn${turns.length === 1 ? "" : "s"}.`, {
+      conversationId: params.conversation_id,
+      turns
+    });
+  });
+  server.registerTool("gpt_conversation_status", {
+    description: "Report passive live state and durable model receipts for one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+    inputSchema: { conversation_id: exports_external.string() },
+    annotations: { readOnlyHint: true }
+  }, async (params, extra) => {
+    const status = await service.conversationStatus(params.conversation_id, extra.sessionId);
+    return toolPayload(`ChatGPT conversation ${params.conversation_id} is ${status.state}.`, status);
   });
   server.registerTool("gpt_conversation_close", {
     description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",

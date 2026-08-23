@@ -70,7 +70,7 @@ describe("public extension contract", () => {
 		const names = tools.map((tool) => tool.name);
 		for (const expected of [
 			"gpt_consult", "gpt_chat", "gpt_image", "gpt_models", "gpt_projects", "gpt_worker_run", "gpt_worker_get", "gpt_worker_cancel", "gpt_worker_list",
-			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_attach", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
+			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_find", "gpt_conversation_find_and_attach", "gpt_conversation_attach", "gpt_conversation_read", "gpt_conversation_status", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
 			"gpt_conversation_manage",
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");

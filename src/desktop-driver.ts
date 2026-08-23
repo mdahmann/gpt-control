@@ -3,10 +3,18 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { ChromeBridgeBrowserDriver, type DriverSession, type WebChatDriver } from "./browser-driver";
+import {
+	ChromeBridgeBrowserDriver,
+	type ChatGptConversationCatalog,
+	type ChatGptConversationFindRequest,
+	type DriverSession,
+	type WebChatDriver,
+} from "./browser-driver";
 import {
 	CHATGPT_ORIGIN,
+	extractChatPageObservation,
 	providerConversationIdentity,
+	type ChatPageObservation,
 	type ChatGptConversationAction,
 	type ChatGptSelection,
 	type ExactBrowserActionTarget,
@@ -27,7 +35,7 @@ export interface DesktopCdpTarget {
 
 export type DesktopCdpAction =
 	| { kind: "fill"; selector: string; text: string; expectedUrl?: string }
-	| { kind: "click" | "hover"; selector: string; expectedUrl?: string }
+	| { kind: "click" | "doubleClick" | "hover" | "activate"; selector: string; expectedUrl?: string }
 	| { kind: "press"; key: string; expectedUrl?: string }
 	| { kind: "upload"; selector: string; files: string[]; expectedUrl?: string }
 	| { kind: "reload"; expectedUrl?: string };
@@ -44,6 +52,7 @@ export interface DesktopHostReceipt {
 export interface DesktopCdpEnvironment {
 	verifyHost(): Promise<DesktopHostReceipt>;
 	listTargets(): Promise<DesktopCdpTarget[]>;
+	findConversations(request: ChatGptConversationFindRequest): Promise<ChatGptConversationCatalog>;
 	createTarget(url: string): Promise<DesktopCdpTarget>;
 	navigateTarget(targetId: string, url: string): Promise<DesktopCdpTarget>;
 	readHtml(targetId: string): Promise<string>;
@@ -78,9 +87,11 @@ interface DesktopSessionState {
 	tabId: number;
 	targetId: string;
 	surface?: "web" | "desktop_shell";
+	createdTarget?: boolean;
 	url: string;
 	state: "working" | "needs_user" | "completed";
 	sendState: "prepared" | "attempted" | "submitted";
+	assistantBaseline?: number;
 	promptSha256?: string;
 	createdAt: string;
 }
@@ -108,6 +119,8 @@ export async function handleDesktopDriverRequest(
 		const driver: WebChatDriver = new ChromeBridgeBrowserDriver(bridge.exec, bridge.launcher);
 		const params = request.params;
 		switch (request.action) {
+			case "find_conversations":
+				return success(await options.environment.findConversations(requiredConversationFindRequest(params)));
 			case "create":
 				return success(await driver.create(requiredString(params.name, "name"), requiredString(params.url, "url")));
 			case "show":
@@ -124,6 +137,12 @@ export async function handleDesktopDriverRequest(
 				return success(await driver.discoverModels(requiredSession(params.session)));
 			case "discover_projects":
 				return success(await driver.discoverProjects(requiredSession(params.session)));
+			case "read_conversation": {
+				const limit = requiredSafeInteger(params.limit, "limit");
+				if (limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
+				if (!driver.readConversation) throw new Error(`Browser driver ${driver.id} does not support conversation reads.`);
+				return success(await driver.readConversation(requiredSession(params.session), limit));
+			}
 			case "manage_conversation":
 				return success(await driver.manageConversation(requiredSession(params.session), requiredConversationAction(params.operation)));
 			case "select_model":
@@ -133,8 +152,12 @@ export async function handleDesktopDriverRequest(
 			case "send":
 				await driver.send(requiredSession(params.session));
 				return success({});
-			case "observe":
-				return success(await driver.observe(requiredSession(params.session)));
+			case "observe": {
+				const session = requiredSession(params.session);
+				const observation = await driver.observe(session);
+				await bridge.confirmObservedCompletion(session.sessionId, observation);
+				return success(observation);
+			}
 			case "recover":
 				await driver.recover(requiredSession(params.session), requiredRecoveryAction(params.action));
 				return success({});
@@ -152,6 +175,19 @@ export async function handleDesktopDriverRequest(
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
+}
+
+function requiredConversationFindRequest(value: Record<string, unknown>): ChatGptConversationFindRequest {
+	const query = value.query === undefined ? undefined : requiredString(value.query, "query").replace(/\s+/g, " ").trim();
+	if (query !== undefined && (query.length < 1 || query.length > 256)) throw new Error("Conversation query must be 1-256 characters.");
+	const pinned = value.pinned === undefined ? undefined : requiredBoolean(value.pinned, "pinned");
+	const projectId = value.project_id === undefined ? undefined : requiredString(value.project_id, "project_id");
+	if (projectId !== undefined && (projectId.length > 256 || !/^[A-Za-z0-9_-]+$/.test(projectId))) {
+		throw new Error("Conversation project_id is invalid.");
+	}
+	const limit = value.limit === undefined ? 20 : requiredSafeInteger(value.limit, "limit");
+	if (limit < 1 || limit > 50) throw new Error("Conversation search limit must be 1-50.");
+	return { ...(query ? { query } : {}), ...(pinned !== undefined ? { pinned } : {}), ...(projectId ? { projectId } : {}), limit };
 }
 
 class DesktopCdpBridge {
@@ -209,13 +245,24 @@ class DesktopCdpBridge {
 		if (typeof request.action !== "string" || !isRecord(request.payload)) throw new Error("Invalid desktop private request.");
 		const payload = request.payload;
 		const tabId = requiredNumber(payload.tabId, "tabId");
-		const session = await this.sessionByTabId(tabId);
+		let session = await this.sessionByTabId(tabId);
+		if (request.action === "press" && payload.expectedTarget === undefined) {
+			await this.assertExactTarget(session);
+			session = await this.sessionByTabId(tabId);
+			return this.options.environment.act(session.targetId, {
+				kind: "press",
+				key: requiredString(payload.key, "key"),
+				expectedUrl: session.url,
+			});
+		}
 		const expectedTarget = requiredExpectedTarget(payload.expectedTarget);
 		await this.assertExactTarget(session, expectedTarget);
+		session = await this.sessionByTabId(tabId);
 		if (request.action === "ping") return { pong: true, expectedTargetEnforcement: "document-v1" };
 		if (request.action === "fill") {
 			const prompt = requiredString(payload.text, "text");
-			await this.preparePrompt(session.sessionId, prompt);
+			const assistantBaseline = extractChatPageObservation(await this.options.environment.readHtml(session.targetId)).snapshot.count;
+			await this.preparePrompt(session.sessionId, prompt, assistantBaseline);
 			return this.options.environment.act(session.targetId, {
 				kind: "fill",
 				selector: requiredString(payload.selector, "selector"),
@@ -231,7 +278,7 @@ class DesktopCdpBridge {
 				expectedUrl: expectedTarget.url,
 			});
 		}
-		if (request.action === "click" || request.action === "hover") {
+		if (request.action === "click" || request.action === "doubleClick" || request.action === "hover" || request.action === "activate") {
 			const selector = requiredString(payload.selector, "selector");
 			if (request.action === "click" && isSendSelector(selector)) {
 				if (!await this.options.environment.elementExists(session.targetId, selector, expectedTarget.url)) {
@@ -299,13 +346,15 @@ class DesktopCdpBridge {
 			const sessionId = requiredString(rest[0], "sessionId");
 			let targetId = "";
 			let surface: DesktopSessionState["surface"];
+			let createdTarget = false;
 			await withStateLock(this.options.stateRoot, async (state) => {
 				const session = requireSession(state, sessionId);
 				targetId = session.targetId;
 				surface = session.surface;
+				createdTarget = session.createdTarget === true;
 				delete state.sessions[sessionId];
 			});
-			if (targetId && surface !== "desktop_shell") await this.options.environment.closeTarget(targetId);
+			if (targetId && (surface !== "desktop_shell" || createdTarget)) await this.options.environment.closeTarget(targetId);
 			return { success: true };
 		}
 		throw new Error(`Unsupported desktop taskSession operation: ${operation}`);
@@ -341,7 +390,7 @@ class DesktopCdpBridge {
 					if (activeClaims > 0 && !this.options.allowCreateTarget) {
 						throw new Error("ChatGPT Desktop renderer capacity is exhausted; extra target creation is disabled.");
 					}
-					createdTarget = await this.options.environment.createTarget(url);
+					createdTarget = await this.options.environment.createTarget(providerConversationIdentity(url) ? CHATGPT_ORIGIN : url);
 					target = createdTarget;
 				}
 					navigated ??= await this.options.environment.navigateTarget(target.id, url);
@@ -352,6 +401,7 @@ class DesktopCdpBridge {
 					if (duplicate) throw new Error("Desktop renderer is already owned by another GPT-Control session.");
 					session.targetId = navigated.id;
 					session.surface = navigated.surface;
+					session.createdTarget = createdTarget?.id === navigated.id;
 					session.url = exactChatGptUrl(navigated.url);
 				});
 			} catch (error) {
@@ -397,9 +447,9 @@ class DesktopCdpBridge {
 				&& session.surface === "desktop_shell"
 				&& session.sendState === "attempted"
 				&& session.url === `${CHATGPT_ORIGIN}/`) {
-				const deadline = Date.now() + 5_000;
+				const deadline = Date.now() + 30_000;
 				while (Date.now() < deadline && !eligibleTarget(target)) {
-					await sleep(100);
+					await sleep(250);
 					targets = await this.options.environment.listTargets();
 					target = targets.find((candidate) => candidate.id === session.targetId);
 					if (!target) break;
@@ -466,12 +516,23 @@ class DesktopCdpBridge {
 		return this.options.environment.act(session.targetId, { ...action, expectedUrl: session.url });
 	}
 
-	private async preparePrompt(sessionId: string, prompt: string): Promise<void> {
+	async confirmObservedCompletion(sessionId: string, observation: ChatPageObservation): Promise<void> {
+		if (observation.answering || observation.thinking || observation.toolRunning) return;
+		await withStateLock(this.options.stateRoot, async (state) => {
+			const session = requireSession(state, sessionId);
+			if (session.sendState !== "attempted" || session.assistantBaseline === undefined) return;
+			if (observation.snapshot.count <= session.assistantBaseline || !observation.snapshot.text.trim()) return;
+			session.sendState = "submitted";
+		});
+	}
+
+	private async preparePrompt(sessionId: string, prompt: string, assistantBaseline: number): Promise<void> {
 		await withStateLock(this.options.stateRoot, async (state) => {
 			const session = requireSession(state, sessionId);
 			if (session.sendState === "attempted") throw new Error("The prior desktop send was already attempted and remains ambiguous; prompt replacement is refused.");
 			session.sendState = "prepared";
 			session.promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+			session.assistantBaseline = assistantBaseline;
 		});
 	}
 
@@ -609,10 +670,12 @@ function parseState(value: unknown): DesktopDriverState {
 			|| !Number.isInteger(candidate.tabId)
 			|| typeof candidate.targetId !== "string"
 			|| (candidate.surface !== undefined && candidate.surface !== "web" && candidate.surface !== "desktop_shell")
+			|| (candidate.createdTarget !== undefined && typeof candidate.createdTarget !== "boolean")
 			|| typeof candidate.url !== "string"
 			|| !new Set(["working", "needs_user", "completed"]).has(String(candidate.state))
 			|| !new Set(["prepared", "attempted", "submitted"]).has(String(candidate.sendState))
 			|| typeof candidate.createdAt !== "string"
+			|| (candidate.assistantBaseline !== undefined && (!Number.isSafeInteger(candidate.assistantBaseline) || (candidate.assistantBaseline as number) < 0))
 			|| (candidate.promptSha256 !== undefined && !/^[a-f0-9]{64}$/.test(String(candidate.promptSha256)))) {
 			throw new Error("Invalid durable ChatGPT Desktop session record.");
 		}
@@ -628,13 +691,22 @@ function requireSession(state: DesktopDriverState, sessionId: string): DesktopSe
 
 function eligibleTarget(target: DesktopCdpTarget): boolean {
 	if (target.type !== "page" && target.type !== "webview") return false;
-	try { return new URL(target.url).origin === CHATGPT_ORIGIN; } catch { return false; }
+	try {
+		const url = new URL(target.url);
+		if (url.origin !== CHATGPT_ORIGIN) return false;
+		const direct = /^\/c\/([^/]+)\/?$/.exec(url.pathname);
+		return !direct || /^[A-Za-z0-9_-]{8,128}$/.test(direct[1]);
+	} catch {
+		return false;
+	}
 }
 
 function exactChatGptUrl(raw: string): string {
 	let url: URL;
 	try { url = new URL(raw); } catch { throw new Error(`Invalid ChatGPT URL: ${raw}`); }
 	if (url.origin !== CHATGPT_ORIGIN || url.username || url.password || url.hash) throw new Error(`Refused URL outside ${CHATGPT_ORIGIN}.`);
+	const direct = /^\/c\/([^/]+)\/?$/.exec(url.pathname);
+	if (direct && !/^[A-Za-z0-9_-]{8,128}$/.test(direct[1])) throw new Error("Refused synthetic or invalid ChatGPT conversation URL.");
 	return url.toString();
 }
 
@@ -675,6 +747,16 @@ function requiredString(value: unknown, name: string): string {
 
 function requiredNumber(value: unknown, name: string): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Missing ${name}.`);
+	return value;
+}
+
+function requiredSafeInteger(value: unknown, name: string): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`${name} must be a safe integer.`);
+	return value;
+}
+
+function requiredBoolean(value: unknown, name: string): boolean {
+	if (typeof value !== "boolean") throw new Error(`${name} must be a boolean.`);
 	return value;
 }
 

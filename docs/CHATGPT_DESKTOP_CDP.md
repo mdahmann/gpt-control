@@ -40,6 +40,12 @@ node scripts/desktop-cdp-live-smoke.mjs
 The default diagnostic verifies the app, listener, endpoint, and target list.
 It does not create a conversation or send a message.
 
+Read-only sidebar discovery is also available through
+`gpt_conversation_find`. It extracts each exact provider conversation ID from
+the signed app's local rendered row identity. It does not select a row. After
+an exact attachment, `gpt_conversation_read` can return the newest 1–20 visible
+turns and `gpt_conversation_status` can report live state without sending.
+
 ## Explicit live acceptance
 
 The live harness sends one ordinary web-development question from a small
@@ -80,9 +86,26 @@ trusted event arrives. A conversation change or layout miss blocks the event.
 Direct `/c/<id>` attachment uses the exact native sidebar row and requires
 stable identity read-back before any management action.
 
-Native `reload`, keyboard `press`, and file `upload` remain disabled until they
-have an equivalent atomic identity guard. Chrome Bridge remains available for
-work that requires those actions.
+Native reload checks the provider conversation and schedules the reload inside
+the same page evaluation. Keyboard cleanup uses a capture-phase guard for
+`Escape`, `ArrowLeft`, and title-confirmation `Enter`. Upload marks one enabled
+file input, checks the conversation before and after the CDP file assignment,
+and refuses a missing or changed input.
+
+The live harness can exercise these paths in one disposable conversation:
+
+```sh
+GPT_CONTROL_DESKTOP_LIVE_MUTATION=1 \
+node scripts/desktop-cdp-live-smoke.mjs --live \
+  --discover-models --discover-projects \
+  --model "GPT-5.6 Sol" --effort High \
+  --upload ./path/to/a/non-sensitive-file.md \
+  --reload --pin --rename "Web Development Notes" \
+  --project "Projects"
+```
+
+Run cancellation separately with `--cancel`. The harness attempts to archive
+every conversation during cleanup, including a run that fails after submission.
 
 ## Alpha release gates
 
@@ -96,6 +119,10 @@ Do not make this the default driver until the signed-in app proves:
 - background operation without focus stealing;
 - distinct renderer ownership at concurrency 1, 2, 3, and 6.
 
-As of the current experiment, one background send/read/archive flow and two
-concurrent renderer identities have passed live. The 3- and 6-window acceptance
-levels remain release gates.
+As of the current experiment, live model and project discovery, model switching,
+upload, exact reload continuation, cancellation, pin, rename, project move,
+archive, and three concurrent renderer identities have passed. Project move and
+upload passed in separate disposable workflows; ChatGPT refused one combined
+uploaded-chat project move, and the driver surfaced that refusal. Six concurrent
+renderers remain a release gate because one renderer became ineligible and the
+driver failed closed.
