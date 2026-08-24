@@ -49,7 +49,7 @@ async function readyFake(options: ConstructorParameters<typeof FakeChromeBridge>
 }
 
 describe("observed Chrome failures", () => {
-	test("dismisses a visible ChatGPT rate-limit notice, cools down, and submits exactly once", async () => {
+	test("persists a visible ChatGPT rate limit and never dismisses or retries it", async () => {
 		const bridge = new FakeChromeBridge({
 			rateLimitNotice: true,
 			currentEffortPicker: true,
@@ -58,7 +58,7 @@ describe("observed Chrome failures", () => {
 			availableModels: ["GPT-5.6 Sol"],
 			availableEfforts: ["High", "Pro"],
 		});
-		const { service } = makeChromeService(scratch(), scratch(), bridge, {
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge, {
 			rateLimitBaseDelayMs: 1,
 			rateLimitMaxDelayMs: 4,
 		});
@@ -69,10 +69,33 @@ describe("observed Chrome failures", () => {
 			chatgptEffort: "Pro",
 			timeoutMs: 1000,
 		});
-		expect(result.run.status).toBe("completed");
-		expect(bridge.dismissedRateLimits).toHaveLength(1);
-		expect(bridge.submittedPrompts).toEqual(["recover after rate limit"]);
+		expect(result.run.status).toBe("needs_user");
+		expect(bridge.dismissedRateLimits).toEqual([]);
+		expect(bridge.submittedPrompts).toEqual([]);
 		expect(result.run.diagnostics).toMatchObject({ rateLimitEvents: 1 });
+		expect(await store.getProviderThrottle()).toMatchObject({
+			reason: "chatgpt_rate_limit",
+			manualResumeRequired: true,
+		});
+	});
+
+	test("pauses all sends when ChatGPT reports suspicious account activity", async () => {
+		const bridge = new FakeChromeBridge({ providerSafetyNotice: "suspicious_activity", composerAbsent: true });
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "chat", prompt: "do not send", timeoutMs: 1000 });
+		expect(result.run.status).toBe("needs_user");
+		expect(bridge.submittedPrompts).toEqual([]);
+		expect(await store.getProviderThrottle()).toMatchObject({
+			reason: "suspicious_activity",
+			manualResumeRequired: true,
+		});
+	});
+
+	test("classifies a visible human-verification challenge without scanning conversation text", () => {
+		const challenge = extractChatPageObservation('<main><div role="dialog" data-testid="captcha-challenge">Verify that you are human to continue.</div></main>');
+		expect(challenge.providerSafetyReason).toBe("human_verification");
+		const quoted = extractChatPageObservation('<main><div data-message-author-role="assistant"><p>Do not claim suspicious activity without evidence.</p></div></main>');
+		expect(quoted.providerSafetyReason).toBeUndefined();
 	});
 
 	test("waits through the chrome://newtab first-tab race before any origin-gated action", async () => {

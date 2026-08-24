@@ -480,6 +480,12 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		});
 	});
 
+	server.registerTool("gpt_provider_resume", {
+		description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+		inputSchema: { confirmation: z.literal("RESUME CHATGPT") },
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params) => toolPayload("GPT-Control provider safety state updated.", await service.resumeProviderSafety(params.confirmation)));
+
 	server.registerTool("gpt_diagnose", {
 		description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
 		inputSchema: {},

@@ -121,6 +121,8 @@ export interface ChatPageObservation {
 	continueAvailable: boolean;
 	rateLimited?: boolean;
 	rateLimitMessage?: string;
+	providerSafetyReason?: "suspicious_activity" | "human_verification";
+	providerSafetyMessage?: string;
 	errorMessage?: string;
 	stateSummary: string;
 }
@@ -129,6 +131,16 @@ export class ChatGptRateLimitError extends Error {
 	constructor(readonly notice: string) {
 		super(`ChatGPT is temporarily rate limited: ${notice}`);
 		this.name = "ChatGptRateLimitError";
+	}
+}
+
+export class ChatGptProviderSafetyError extends Error {
+	constructor(
+		readonly reason: "suspicious_activity" | "human_verification",
+		readonly notice: string,
+	) {
+		super(`ChatGPT requires human account review (${reason}): ${notice}`);
+		this.name = "ChatGptProviderSafetyError";
 	}
 }
 
@@ -1395,6 +1407,8 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		...root.querySelectorAll('[data-testid*="thinking"]'),
 		...root.querySelectorAll('[data-testid*="tool"]'),
 		...root.querySelectorAll('[data-testid*="error"]'),
+		...root.querySelectorAll('[data-testid*="captcha"]'),
+		...root.querySelectorAll('[data-testid*="challenge"]'),
 	]);
 	const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]'))
 		.map((node) => nodeLabel(node).replace(/\s+/g, " ").trim())
@@ -1402,6 +1416,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		.map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
 	const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
 	const rateLimitMessage = statusTexts.find(isRateLimitText);
+	const providerSafety = statusTexts.map(providerSafetyFromText).find(Boolean);
 	const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
 	const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
 	const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
@@ -1412,6 +1427,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		retryAvailable ? "retry" : undefined,
 		continueAvailable ? "continue" : undefined,
 		rateLimitMessage ? "rate_limited" : undefined,
+		providerSafety ? `provider_safety:${providerSafety.reason}` : undefined,
 		errorText ? `error:${errorText.slice(0, 160)}` : undefined,
 		`snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`,
 	].filter(Boolean);
@@ -1429,30 +1445,11 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		continueAvailable,
 		rateLimited: Boolean(rateLimitMessage),
 		rateLimitMessage,
+		providerSafetyReason: providerSafety?.reason,
+		providerSafetyMessage: providerSafety?.message,
 		errorMessage: errorText,
 		stateSummary: states.join(","),
 	};
-}
-
-export async function dismissChatGptRateLimitNotice(
-	exec: Exec,
-	launcher: Launcher,
-	tabId: number,
-	signal?: AbortSignal,
-	expectedTarget?: ExactBrowserActionTarget,
-): Promise<string | undefined> {
-	const initial = findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal));
-	if (!initial) return undefined;
-	if (!initial.dismissSelector) {
-		throw new ChatGptRateLimitError(`${initial.message} The notice has no safe dismiss control.`);
-	}
-	await pickerAction(exec, launcher, "click", tabId, initial.dismissSelector, signal, expectedTarget);
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		await sleep(Math.min(pollIntervalMs(), 200));
-		if (!findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal))) return initial.message;
-	}
-	throw new ChatGptRateLimitError(`${initial.message} The notice remained visible after dismissal.`);
 }
 
 export async function readAssistantSnapshot(
@@ -1730,10 +1727,11 @@ async function recoverSameConversation(
 }
 
 function requiresRecovery(observation: ChatPageObservation): boolean {
-	return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+	return Boolean(observation.providerSafetyReason || observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 
 function exactNeedsUserReason(observation: ChatPageObservation, prefix: string): string {
+	if (observation.providerSafetyReason) return `${prefix}: ChatGPT requires human account review (${observation.providerSafetyReason}): ${observation.providerSafetyMessage ?? "review required"}`;
 	if (observation.rateLimitMessage) return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
 	if (observation.errorMessage) return `${prefix}: ${observation.errorMessage}`;
 	if (observation.continueAvailable) return `${prefix}: ChatGPT requires Continue generating.`;
@@ -1792,11 +1790,15 @@ async function openAdvancedPicker(
 }
 
 function throwIfRateLimited(html: string): void {
+	const observation = extractChatPageObservation(html);
+	if (observation.providerSafetyReason && observation.providerSafetyMessage) {
+		throw new ChatGptProviderSafetyError(observation.providerSafetyReason, observation.providerSafetyMessage);
+	}
 	const notice = findRateLimitNotice(html);
 	if (notice) throw new ChatGptRateLimitError(notice.message);
 }
 
-function findRateLimitNotice(html: string): { message: string; dismissSelector?: string } | undefined {
+function findRateLimitNotice(html: string): { message: string } | undefined {
 	const root = parse(html);
 	const candidates = uniqueElements([
 		...root.querySelectorAll('[role="dialog"]'),
@@ -1806,16 +1808,27 @@ function findRateLimitNotice(html: string): { message: string; dismissSelector?:
 	]);
 	const notice = candidates.find((node) => isRateLimitText(nodeLabel(node)));
 	if (!notice) return undefined;
-	const dismiss = notice.querySelectorAll('button, [role="button"]')
-		.find((node) => /^(?:got it|dismiss|close)$/i.test(nodeLabel(node)));
 	return {
 		message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500),
-		dismissSelector: dismiss ? exactNodeSelector(dismiss) : undefined,
 	};
 }
 
 function isRateLimitText(text: string): boolean {
 	return /too many requests|rate limit(?:ed| reached)?|try again later|temporarily restricted/i.test(text);
+}
+
+function providerSafetyFromText(text: string): {
+	reason: "suspicious_activity" | "human_verification";
+	message: string;
+} | undefined {
+	const message = text.replace(/\s+/g, " ").trim().slice(0, 500);
+	if (/suspicious activity|unusual activity (?:has been )?detected|account activity (?:looks|appears) unusual/i.test(message)) {
+		return { reason: "suspicious_activity", message };
+	}
+	if (/verify (?:that )?you(?:'re| are) human|confirm (?:that )?you(?:'re| are) human|captcha|security challenge|human verification/i.test(message)) {
+		return { reason: "human_verification", message };
+	}
+	return undefined;
 }
 
 async function openPickerOptions(

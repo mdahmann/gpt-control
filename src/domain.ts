@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.5.0-alpha.7";
+export const PACKAGE_VERSION = "0.5.0-alpha.8";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -98,6 +98,9 @@ export interface RunDiagnostics {
 	lastRateLimitAt?: string;
 	providerCooldownUntil?: string;
 	providerConcurrencyLimit?: number;
+	providerSafetyReason?: "chatgpt_rate_limit" | "suspicious_activity" | "human_verification";
+	providerSafetyPausedAt?: string;
+	providerSafetyMessageSha256?: string;
 }
 
 export interface ReviewReceipt {

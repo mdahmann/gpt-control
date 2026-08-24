@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.7";
+var PACKAGE_VERSION = "0.5.0-alpha.8";
 
 // src/service.ts
 import { createHash as createHash6, randomUUID as randomUUID5 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.7";
+var PACKAGE_VERSION2 = "0.5.0-alpha.8";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -33794,6 +33794,17 @@ class ChatGptRateLimitError extends Error {
     super(`ChatGPT is temporarily rate limited: ${notice}`);
     this.notice = notice;
     this.name = "ChatGptRateLimitError";
+  }
+}
+
+class ChatGptProviderSafetyError extends Error {
+  reason;
+  notice;
+  constructor(reason, notice) {
+    super(`ChatGPT requires human account review (${reason}): ${notice}`);
+    this.reason = reason;
+    this.notice = notice;
+    this.name = "ChatGptProviderSafetyError";
   }
 }
 function canonicalPromptObservationText(value) {
@@ -34590,11 +34601,14 @@ ${proofMatch?.[0].trim() ?? ""}`);
     ...root.querySelectorAll('[aria-live="assertive"]'),
     ...root.querySelectorAll('[data-testid*="thinking"]'),
     ...root.querySelectorAll('[data-testid*="tool"]'),
-    ...root.querySelectorAll('[data-testid*="error"]')
+    ...root.querySelectorAll('[data-testid*="error"]'),
+    ...root.querySelectorAll('[data-testid*="captcha"]'),
+    ...root.querySelectorAll('[data-testid*="challenge"]')
   ]);
   const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]')).map((node) => nodeLabel(node).replace(/\s+/g, " ").trim()).filter((label) => label.length > 0 && label.length <= 256).map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
   const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
   const rateLimitMessage = statusTexts.find(isRateLimitText);
+  const providerSafety = statusTexts.map(providerSafetyFromText).find(Boolean);
   const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
   const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
   const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
@@ -34605,6 +34619,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
     retryAvailable ? "retry" : undefined,
     continueAvailable ? "continue" : undefined,
     rateLimitMessage ? "rate_limited" : undefined,
+    providerSafety ? `provider_safety:${providerSafety.reason}` : undefined,
     errorText ? `error:${errorText.slice(0, 160)}` : undefined,
     `snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`
   ].filter(Boolean);
@@ -34622,25 +34637,11 @@ ${proofMatch?.[0].trim() ?? ""}`);
     continueAvailable,
     rateLimited: Boolean(rateLimitMessage),
     rateLimitMessage,
+    providerSafetyReason: providerSafety?.reason,
+    providerSafetyMessage: providerSafety?.message,
     errorMessage: errorText,
     stateSummary: states.join(",")
   };
-}
-async function dismissChatGptRateLimitNotice(exec, launcher, tabId, signal, expectedTarget) {
-  const initial = findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal));
-  if (!initial)
-    return;
-  if (!initial.dismissSelector) {
-    throw new ChatGptRateLimitError(`${initial.message} The notice has no safe dismiss control.`);
-  }
-  await pickerAction(exec, launcher, "click", tabId, initial.dismissSelector, signal, expectedTarget);
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    await sleep(Math.min(pollIntervalMs(), 200));
-    if (!findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal)))
-      return initial.message;
-  }
-  throw new ChatGptRateLimitError(`${initial.message} The notice remained visible after dismissal.`);
 }
 async function readPageHtml(exec, launcher, tabId, signal) {
   const directory = join2(tmpdir2(), `gpt-control-html-${randomUUID2()}`);
@@ -34770,6 +34771,10 @@ async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expec
   throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
 }
 function throwIfRateLimited(html) {
+  const observation = extractChatPageObservation(html);
+  if (observation.providerSafetyReason && observation.providerSafetyMessage) {
+    throw new ChatGptProviderSafetyError(observation.providerSafetyReason, observation.providerSafetyMessage);
+  }
   const notice = findRateLimitNotice(html);
   if (notice)
     throw new ChatGptRateLimitError(notice.message);
@@ -34785,14 +34790,22 @@ function findRateLimitNotice(html) {
   const notice = candidates.find((node) => isRateLimitText(nodeLabel(node)));
   if (!notice)
     return;
-  const dismiss = notice.querySelectorAll('button, [role="button"]').find((node) => /^(?:got it|dismiss|close)$/i.test(nodeLabel(node)));
   return {
-    message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500),
-    dismissSelector: dismiss ? exactNodeSelector(dismiss) : undefined
+    message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500)
   };
 }
 function isRateLimitText(text) {
   return /too many requests|rate limit(?:ed| reached)?|try again later|temporarily restricted/i.test(text);
+}
+function providerSafetyFromText(text) {
+  const message = text.replace(/\s+/g, " ").trim().slice(0, 500);
+  if (/suspicious activity|unusual activity (?:has been )?detected|account activity (?:looks|appears) unusual/i.test(message)) {
+    return { reason: "suspicious_activity", message };
+  }
+  if (/verify (?:that )?you(?:'re| are) human|confirm (?:that )?you(?:'re| are) human|captcha|security challenge|human verification/i.test(message)) {
+    return { reason: "human_verification", message };
+  }
+  return;
 }
 async function openPickerOptions(exec, launcher, tabId, selector, deadline, signal, expectedTarget) {
   await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
@@ -35362,6 +35375,12 @@ async function waitForDriverReady(driver, expected, options = {}) {
         last = `owned page is still committing (${session.url})`;
       } else {
         const observation = await driver.observe(session, options.signal);
+        if (observation.providerSafetyReason) {
+          throw new ChatGptProviderSafetyError(observation.providerSafetyReason, observation.providerSafetyMessage ?? "ChatGPT requires human account review.");
+        }
+        if (observation.rateLimited) {
+          throw new ChatGptRateLimitError(observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+        }
         if (observation.composerReady)
           return { session, observation };
         last = `ChatGPT loaded at ${session.url}, but its composer is not ready (${observation.stateSummary})`;
@@ -35449,33 +35468,15 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
       }
     }
     let observation = await driver.observe(session, options.signal);
+    if (observation.providerSafetyReason) {
+      const message = observation.providerSafetyMessage ?? "ChatGPT requires human account review.";
+      await options.onProviderSafety?.(observation.providerSafetyReason, message);
+      return needsUser(`ChatGPT automation paused for human account review (${observation.providerSafetyReason}): ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
+    }
     if (observation.rateLimited) {
       const message = observation.rateLimitMessage ?? "ChatGPT reported too many requests.";
       await options.onRateLimit?.(message);
-      if (!driver.dismissRateLimitNotice) {
-        return needsUser(`ChatGPT is temporarily rate limited and this browser driver cannot dismiss the notice safely: ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
-      }
-      try {
-        await driver.dismissRateLimitNotice(session, options.signal);
-        recoveryAttempts.push({
-          at: nowIso(),
-          action: "dismiss_rate_limit",
-          reason: message,
-          outcome: "recovered"
-        });
-      } catch (error51) {
-        recoveryAttempts.push({
-          at: nowIso(),
-          action: "dismiss_rate_limit",
-          reason: message,
-          outcome: "failed",
-          detail: errorMessage(error51)
-        });
-        return needsUser(`ChatGPT rate-limit notice could not be dismissed safely: ${errorMessage(error51)}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
-      }
-      previous = undefined;
-      steady = 0;
-      continue;
+      return needsUser(`ChatGPT reported a rate limit. GPT-Control paused all new sends until a human explicitly resumes them: ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
     }
     let providerTurnIdentityPending = false;
     lastObservedUiState = observation.stateSummary;
@@ -35660,9 +35661,11 @@ function needsUser(reason, snapshot, providerConversationId, providerConversatio
   };
 }
 function requiresRecovery(observation) {
-  return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+  return Boolean(observation.providerSafetyReason || observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 function exactNeedsUserReason(observation, prefix) {
+  if (observation.providerSafetyReason)
+    return `${prefix}: ChatGPT requires human account review (${observation.providerSafetyReason}): ${observation.providerSafetyMessage ?? "review required"}`;
   if (observation.rateLimitMessage)
     return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
   if (observation.errorMessage)
@@ -35812,10 +35815,6 @@ class ChromeBridgeBrowserDriver {
     await this.assertSessionOwnership(session, signal);
     return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
-  async dismissRateLimitNotice(session, signal) {
-    await this.assertActionTarget(session, signal);
-    return dismissChatGptRateLimitNotice(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
-  }
   async recover(session, action, signal) {
     await this.assertActionTarget(session, signal);
     const pageId = numericPageId(session.pageId);
@@ -35885,6 +35884,8 @@ var ObservationSchema = exports_external.object({
   continueAvailable: exports_external.boolean(),
   rateLimited: exports_external.boolean().default(false),
   rateLimitMessage: exports_external.string().optional(),
+  providerSafetyReason: exports_external.enum(["suspicious_activity", "human_verification"]).optional(),
+  providerSafetyMessage: exports_external.string().optional(),
   errorMessage: exports_external.string().optional(),
   stateSummary: exports_external.string()
 }).strict();
@@ -36422,7 +36423,10 @@ var RunSchema = exports_external.object({
     rateLimitEvents: exports_external.number().int().nonnegative().optional(),
     lastRateLimitAt: exports_external.string().optional(),
     providerCooldownUntil: exports_external.string().optional(),
-    providerConcurrencyLimit: exports_external.number().int().positive().max(10).optional()
+    providerConcurrencyLimit: exports_external.number().int().positive().max(10).optional(),
+    providerSafetyReason: exports_external.enum(["chatgpt_rate_limit", "suspicious_activity", "human_verification"]).optional(),
+    providerSafetyPausedAt: exports_external.string().optional(),
+    providerSafetyMessageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional()
   }).optional(),
   receipt: ReceiptSchema,
   error: exports_external.string().optional(),
@@ -36448,7 +36452,7 @@ var IdempotencyRecordSchema = exports_external.object({
   conversationId: exports_external.string().regex(CONVERSATION_ID_PATTERN),
   createdAt: exports_external.string()
 });
-var ProviderThrottleSchema = exports_external.object({
+var LegacyProviderThrottleSchema = exports_external.object({
   version: exports_external.literal(1),
   reason: exports_external.literal("chatgpt_rate_limit"),
   firstSeenAt: exports_external.string(),
@@ -36458,6 +36462,18 @@ var ProviderThrottleSchema = exports_external.object({
   activeLimit: exports_external.number().int().positive().max(10),
   recoverySuccesses: exports_external.number().int().nonnegative(),
   messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
+});
+var ProviderThrottleSchema = exports_external.object({
+  version: exports_external.literal(2),
+  reason: exports_external.enum(["chatgpt_rate_limit", "suspicious_activity", "human_verification"]),
+  firstSeenAt: exports_external.string(),
+  lastSeenAt: exports_external.string(),
+  nextRetryAt: exports_external.string(),
+  consecutiveEvents: exports_external.number().int().positive(),
+  activeLimit: exports_external.literal(1),
+  recoverySuccesses: exports_external.number().int().nonnegative(),
+  messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/),
+  manualResumeRequired: exports_external.literal(true)
 });
 var MaintenanceReceiptSchema = exports_external.object({
   version: exports_external.literal(1),
@@ -36892,7 +36908,17 @@ class RunStore {
   async getProviderThrottle() {
     await this.init();
     try {
-      return ProviderThrottleSchema.parse(JSON.parse(await safeRead(this.providerThrottlePath())));
+      const raw = JSON.parse(await safeRead(this.providerThrottlePath()));
+      const current = ProviderThrottleSchema.safeParse(raw);
+      if (current.success)
+        return current.data;
+      const legacy = LegacyProviderThrottleSchema.parse(raw);
+      return {
+        ...legacy,
+        version: 2,
+        activeLimit: 1,
+        manualResumeRequired: true
+      };
     } catch (error51) {
       if (isMissing(error51))
         return;
@@ -36900,24 +36926,31 @@ class RunStore {
     }
   }
   async noteProviderRateLimit(options) {
+    return this.noteProviderSafetyPause({
+      reason: "chatgpt_rate_limit",
+      message: options.message,
+      baseDelayMs: options.baseDelayMs,
+      maxDelayMs: options.maxDelayMs
+    });
+  }
+  async noteProviderSafetyPause(options) {
     return this.withNamedLock("provider-throttle", async () => {
       const current = await this.getProviderThrottle();
       const now = Date.now();
       const timestamp = new Date(now).toISOString();
       const consecutiveEvents = (current?.consecutiveEvents ?? 0) + 1;
       const delayMs = Math.min(options.maxDelayMs, options.baseDelayMs * 2 ** Math.min(consecutiveEvents - 1, 16));
-      const firstLimit = Math.max(1, Math.floor(options.maxConcurrentWorkers / 2));
-      const activeLimit = current ? Math.max(1, Math.min(options.maxConcurrentWorkers, current.activeLimit - 1)) : firstLimit;
       const next = {
-        version: 1,
-        reason: "chatgpt_rate_limit",
+        version: 2,
+        reason: options.reason,
         firstSeenAt: current?.firstSeenAt ?? timestamp,
         lastSeenAt: timestamp,
         nextRetryAt: new Date(now + delayMs).toISOString(),
         consecutiveEvents,
-        activeLimit,
+        activeLimit: 1,
         recoverySuccesses: 0,
-        messageSha256: createHash3("sha256").update(options.message, "utf8").digest("hex")
+        messageSha256: createHash3("sha256").update(options.message, "utf8").digest("hex"),
+        manualResumeRequired: true
       };
       ProviderThrottleSchema.parse(next);
       await atomicWrite(this.providerThrottlePath(), next);
@@ -36925,37 +36958,20 @@ class RunStore {
     }, { timeoutMs: 30000 });
   }
   async noteProviderSuccess(maxConcurrentWorkers) {
+    return this.getProviderThrottle();
+  }
+  async clearProviderSafetyPause() {
     return this.withNamedLock("provider-throttle", async () => {
       const current = await this.getProviderThrottle();
-      if (!current || Date.now() < Date.parse(current.nextRetryAt))
-        return current;
-      if (current.activeLimit >= maxConcurrentWorkers) {
-        try {
-          await unlink(this.providerThrottlePath());
-        } catch (error51) {
-          if (!isMissing(error51))
-            throw error51;
-        }
-        return;
+      if (!current)
+        return false;
+      try {
+        await unlink(this.providerThrottlePath());
+      } catch (error51) {
+        if (!isMissing(error51))
+          throw error51;
       }
-      const activeLimit = Math.min(maxConcurrentWorkers, current.activeLimit + 1);
-      if (activeLimit >= maxConcurrentWorkers) {
-        try {
-          await unlink(this.providerThrottlePath());
-        } catch (error51) {
-          if (!isMissing(error51))
-            throw error51;
-        }
-        return;
-      }
-      const next = {
-        ...current,
-        activeLimit,
-        recoverySuccesses: current.recoverySuccesses + 1
-      };
-      ProviderThrottleSchema.parse(next);
-      await atomicWrite(this.providerThrottlePath(), next);
-      return next;
+      return true;
     }, { timeoutMs: 30000 });
   }
   async withIdempotencyLock(key, work) {
@@ -37431,6 +37447,7 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
   }
   const rateLimitBaseDelayMs = boundedInteger(overrides.rateLimitBaseDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS) ?? 30000, 1, 10 * 60000, "rateLimitBaseDelayMs");
   const rateLimitMaxDelayMs = boundedInteger(overrides.rateLimitMaxDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS) ?? 5 * 60000, rateLimitBaseDelayMs, 30 * 60000, "rateLimitMaxDelayMs");
+  const maxActiveGenerations = boundedInteger(overrides.maxActiveGenerations ?? overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_ACTIVE_GENERATIONS) ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 1, 1, 10, "maxActiveGenerations");
   const value = {
     workspaceRoot,
     storageRoot: storageRoot2,
@@ -37444,7 +37461,8 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 6, 1, 10, "maxConcurrentWorkers"),
+    maxActiveGenerations,
+    maxConcurrentWorkers: maxActiveGenerations,
     rateLimitBaseDelayMs,
     rateLimitMaxDelayMs,
     allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
@@ -37507,7 +37525,7 @@ function policyFingerprint(value) {
     maxAttachmentFiles: value.maxAttachmentFiles ?? null,
     maxAttachmentBytes: value.maxAttachmentBytes ?? null,
     maxPromptBytes: value.maxPromptBytes,
-    maxConcurrentWorkers: value.maxConcurrentWorkers,
+    maxActiveGenerations: value.maxActiveGenerations,
     allowActiveDiagnostics: value.allowActiveDiagnostics
   };
   return createHash5("sha256").update(JSON.stringify(stable)).digest("hex");
@@ -37596,6 +37614,15 @@ class RestartSuspension extends Error {
 class RetainedCreatedSessionError extends Error {
 }
 
+class ProviderSafetyPauseError extends Error {
+  reason;
+  constructor(reason, message) {
+    super(message);
+    this.reason = reason;
+    this.name = "ProviderSafetyPauseError";
+  }
+}
+
 class FairSemaphore {
   limit;
   active = 0;
@@ -37655,7 +37682,7 @@ class GptControlService {
   activeRuns = new Map;
   activeStopReconciliations = new Map;
   cancellationIntents = new Set;
-  workerSlots;
+  providerSlots;
   constructor(exec, store = new RunStore, policy, dependencies = {}) {
     this.exec = exec;
     this.store = store;
@@ -37665,7 +37692,7 @@ class GptControlService {
       outputRoot: join5(store.root, "generated")
     });
     this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
-    this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
+    this.providerSlots = new FairSemaphore(this.policy.maxActiveGenerations);
   }
   async listModels(options = {}) {
     const before = parseModelCatalogCache(await this.store.getCatalogCache("models"));
@@ -37878,7 +37905,7 @@ class GptControlService {
         metadata = catalog.conversations.find((entry) => entry.providerConversationId === conversation.providerConversationId);
       }
       const latestRun = (await this.store.listRuns({ limit: null })).filter((run) => run.conversationId === conversationId).sort((left, right) => right.receipt.startedAt.localeCompare(left.receipt.startedAt))[0];
-      const state = observation.rateLimited ? "rate_limited" : observation.errorMessage ? "error" : observation.answering || observation.thinking || observation.toolRunning ? "generating" : observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
+      const state = observation.providerSafetyReason ? "needs_user" : observation.rateLimited ? "rate_limited" : observation.errorMessage ? "error" : observation.answering || observation.thinking || observation.toolRunning ? "generating" : observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
       return {
         conversationId,
         providerConversationId: conversation.providerConversationId,
@@ -38216,7 +38243,17 @@ class GptControlService {
     });
   }
   async diagnose() {
-    return { ...passiveTransportDiscovery(), policy: publicPolicy(this.policy) };
+    return {
+      ...passiveTransportDiscovery(),
+      policy: publicPolicy(this.policy),
+      providerSafety: await this.store.getProviderThrottle()
+    };
+  }
+  async resumeProviderSafety(confirmation) {
+    if (confirmation !== "RESUME CHATGPT") {
+      throw new Error("Provider safety resume requires the exact confirmation RESUME CHATGPT after a human reviews the account.");
+    }
+    return { resumed: await this.store.clearProviderSafetyPause() };
   }
   async activeSmokeTest() {
     if (!this.policy.allowActiveDiagnostics)
@@ -38488,10 +38525,8 @@ class GptControlService {
     const promise3 = (async () => {
       const run = await this.store.getRun(runId);
       const work = () => this.store.withConversationLock(run.conversationId, () => this.executeRun(runId, controller.signal, recovery), { timeoutMs: Math.max(30000, (run.timeoutMs ?? 600000) + 60000) });
-      if (run.kind !== "subagent")
-        return work();
-      const admitted = await this.waitForGlobalWorkerTurn(runId, controller.signal);
-      return admitted ? this.workerSlots.run(work, controller.signal) : this.store.getRun(runId);
+      const admitted = await this.waitForGlobalProviderTurn(runId, controller.signal);
+      return admitted ? this.providerSlots.run(work, controller.signal) : this.store.getRun(runId);
     })().catch(async (error51) => {
       if (this.cancellationIntents.has(runId))
         return this.persistCancellation(runId);
@@ -38524,30 +38559,29 @@ class GptControlService {
     });
     return promise3;
   }
-  async waitForGlobalWorkerTurn(runId, signal) {
+  async waitForGlobalProviderTurn(runId, signal) {
     for (;; ) {
       if (signal.aborted)
-        throw signal.reason ?? new Error("Worker admission was cancelled.");
+        throw signal.reason ?? new Error("Provider admission was cancelled.");
       const current = await this.store.getRun(runId);
       if (TERMINAL2.has(current.status))
         return false;
       const throttle = await this.store.getProviderThrottle();
-      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-        const deadline2 = Date.parse(current.deadlineAt ?? "");
-        if (Number.isFinite(deadline2) && cooldownUntil >= deadline2) {
-          await this.store.updateRun(runId, {
-            status: "needs_user",
-            completedAt: nowIso(),
-            error: "ChatGPT rate-limit cooldown extends beyond this GPT Worker's bounded deadline. The assignment was not sent."
-          });
-          return false;
-        }
-        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
-        continue;
+      if (throttle?.manualResumeRequired) {
+        await this.store.updateRun(runId, {
+          status: "needs_user",
+          completedAt: nowIso(),
+          error: `ChatGPT sends are paused for human review (${throttle.reason}). The assignment was not sent. After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+          diagnostics: {
+            ...current.diagnostics ?? {},
+            providerSafetyReason: throttle.reason,
+            providerSafetyPausedAt: throttle.lastSeenAt
+          }
+        });
+        return false;
       }
-      const effectiveLimit = Math.min(this.policy.maxConcurrentWorkers, throttle?.activeLimit ?? this.policy.maxConcurrentWorkers);
-      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      const effectiveLimit = this.policy.maxActiveGenerations;
+      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted")).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
       const position = contenders.findIndex((run) => run.id === runId);
       if (position >= 0 && position < effectiveLimit)
         return true;
@@ -38556,7 +38590,7 @@ class GptControlService {
         await this.store.updateRun(runId, {
           status: "needs_user",
           completedAt: nowIso(),
-          error: "The GPT Worker exceeded its bounded global admission deadline before a trusted concurrency slot became available."
+          error: "The GPT-Control run exceeded its bounded global admission deadline before a trusted provider slot became available."
         });
         return false;
       }
@@ -38571,37 +38605,36 @@ class GptControlService {
         throw new Error("ChatGPT remained rate limited until the GPT Worker deadline. The assignment was not sent again.");
       }
       const throttle = await this.store.getProviderThrottle();
-      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
-        continue;
+      if (throttle?.manualResumeRequired) {
+        throw new ProviderSafetyPauseError(throttle.reason, `ChatGPT sends remain paused for human review (${throttle.reason}).`);
       }
       const session = await assertExactDriverSession(driver, expected, signal);
       const observation = await driver.observe(session, signal);
+      if (observation.providerSafetyReason) {
+        run = await this.recordProviderSafety(run, observation.providerSafetyReason, observation.providerSafetyMessage ?? "ChatGPT requires human account review.");
+        throw new ProviderSafetyPauseError(observation.providerSafetyReason, "ChatGPT requires human account review. No prompt was sent.");
+      }
       if (observation.rateLimited) {
-        run = await this.handleProviderRateLimit(driver, session, run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.", signal);
-        continue;
+        run = await this.recordProviderRateLimit(run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+        throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
       }
       try {
         return { run, session, value: await action(session) };
       } catch (error51) {
+        if (error51 instanceof ChatGptProviderSafetyError) {
+          run = await this.recordProviderSafety(run, error51.reason, error51.notice);
+          throw new ProviderSafetyPauseError(error51.reason, "ChatGPT requires human account review. No prompt was sent.");
+        }
         if (!(error51 instanceof ChatGptRateLimitError))
           throw error51;
-        run = await this.handleProviderRateLimit(driver, session, run, error51.notice, signal);
+        run = await this.recordProviderRateLimit(run, error51.notice);
+        throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
       }
     }
   }
-  async handleProviderRateLimit(driver, session, run, message, signal) {
-    const updated = await this.recordProviderRateLimit(run, message);
-    if (!driver.dismissRateLimitNotice) {
-      throw new Error(`ChatGPT is temporarily rate limited and the active browser driver cannot dismiss its notice safely: ${message}`);
-    }
-    await driver.dismissRateLimitNotice(session, signal);
-    return updated;
-  }
   async recordProviderRateLimit(run, message) {
     const throttle = await this.store.noteProviderRateLimit({
-      maxConcurrentWorkers: this.policy.maxConcurrentWorkers,
+      maxConcurrentWorkers: this.policy.maxActiveGenerations,
       baseDelayMs: this.policy.rateLimitBaseDelayMs,
       maxDelayMs: this.policy.rateLimitMaxDelayMs,
       message
@@ -38617,6 +38650,23 @@ class GptControlService {
       }
     });
     return updated;
+  }
+  async recordProviderSafety(run, reason, message) {
+    const pause = await this.store.noteProviderSafetyPause({
+      reason,
+      baseDelayMs: this.policy.rateLimitBaseDelayMs,
+      maxDelayMs: this.policy.rateLimitMaxDelayMs,
+      message
+    });
+    const current = await this.store.getRun(run.id);
+    return this.store.updateRun(run.id, {
+      diagnostics: {
+        ...current.diagnostics ?? {},
+        providerSafetyReason: reason,
+        providerSafetyPausedAt: pause.lastSeenAt,
+        providerSafetyMessageSha256: pause.messageSha256
+      }
+    });
   }
   async executeRun(runId, signal, recovery) {
     let run = await this.store.getRun(runId);
@@ -38692,7 +38742,7 @@ class GptControlService {
           completedAt
         }
       });
-      await this.store.noteProviderSuccess(this.policy.maxConcurrentWorkers);
+      await this.store.noteProviderSuccess(this.policy.maxActiveGenerations);
       return run;
     } catch (error51) {
       resetCapabilityCache();
@@ -38718,6 +38768,31 @@ class GptControlService {
           });
         }
         return cancelled;
+      }
+      let providerSafetyError = error51 instanceof ProviderSafetyPauseError ? error51 : undefined;
+      if (error51 instanceof ChatGptProviderSafetyError) {
+        current = await this.recordProviderSafety(current, error51.reason, error51.notice);
+        providerSafetyError = new ProviderSafetyPauseError(error51.reason, "ChatGPT requires human account review. No prompt was sent.");
+      } else if (error51 instanceof ChatGptRateLimitError) {
+        current = await this.recordProviderRateLimit(current, error51.notice);
+        providerSafetyError = new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
+      }
+      if (providerSafetyError) {
+        const terminal2 = await this.store.updateRun(run.id, {
+          status: "needs_user",
+          error: `${providerSafetyError.message} After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+          completedAt: nowIso(),
+          diagnostics: {
+            ...current.diagnostics ?? {},
+            providerSafetyReason: providerSafetyError.reason
+          }
+        });
+        if (terminal2.submissionState === "not_submitted") {
+          await this.closeUnsubmittedOwnedConversation(terminal2.conversationId).catch(() => {
+            return;
+          });
+        }
+        return terminal2;
       }
       const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
       const terminal = await this.store.updateRun(run.id, {
@@ -39012,6 +39087,9 @@ class GptControlService {
       },
       onRateLimit: async (message) => {
         run = await this.recordProviderRateLimit(run, message);
+      },
+      onProviderSafety: async (reason, message) => {
+        run = await this.recordProviderSafety(run, reason, message);
       }
     });
     if (outcome.terminalStatus === "needs_user") {
@@ -39171,6 +39249,9 @@ class GptControlService {
       },
       onRateLimit: async (message) => {
         run = await this.recordProviderRateLimit(run, message);
+      },
+      onProviderSafety: async (reason, message) => {
+        run = await this.recordProviderSafety(run, reason, message);
       }
     });
     if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
@@ -39535,6 +39616,7 @@ class GptControlService {
       error: reason,
       completedAt: nowIso(),
       diagnostics: {
+        ...current.diagnostics ?? {},
         terminalReason: reason,
         recoveryAttempts: result?.recoveryAttempts,
         localAssistantTurnCount: result?.localAssistantTurnCount,
@@ -39542,15 +39624,15 @@ class GptControlService {
         lastObservedUiState: result?.lastObservedUiState
       },
       receipt: {
-        ...run.receipt,
-        observedModel: result?.observedModel ?? run.receipt.observedModel,
-        observedEffort: result?.observedEffort ?? run.receipt.observedEffort,
-        model: result?.observedModel ?? run.receipt.model,
-        modelVerified: result?.modelVerified ?? run.receipt.modelVerified ?? false,
-        modelEvidenceKind: result?.modelEvidenceKind ?? run.receipt.modelEvidenceKind,
-        modelVerifiedAt: result?.modelVerifiedAt ?? run.receipt.modelVerifiedAt,
-        providerConversationId: result?.providerConversationId ?? run.receipt.providerConversationId,
-        providerConversationUrl: result?.providerConversationUrl ?? run.receipt.providerConversationUrl,
+        ...current.receipt,
+        observedModel: result?.observedModel ?? current.receipt.observedModel,
+        observedEffort: result?.observedEffort ?? current.receipt.observedEffort,
+        model: result?.observedModel ?? current.receipt.model,
+        modelVerified: result?.modelVerified ?? current.receipt.modelVerified ?? false,
+        modelEvidenceKind: result?.modelEvidenceKind ?? current.receipt.modelEvidenceKind,
+        modelVerifiedAt: result?.modelVerifiedAt ?? current.receipt.modelVerifiedAt,
+        providerConversationId: result?.providerConversationId ?? current.receipt.providerConversationId,
+        providerConversationUrl: result?.providerConversationUrl ?? current.receipt.providerConversationUrl,
         localAssistantTurnCount: result?.localAssistantTurnCount,
         recoveryAttempts: result?.recoveryAttempts,
         completedAt: nowIso()
@@ -39747,6 +39829,7 @@ function publicPolicy(policy) {
     maxAttachmentFiles: policy.maxAttachmentFiles,
     maxAttachmentBytes: policy.maxAttachmentBytes,
     maxPromptBytes: policy.maxPromptBytes,
+    maxActiveGenerations: policy.maxActiveGenerations,
     maxConcurrentWorkers: policy.maxConcurrentWorkers,
     activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
     providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
@@ -40950,6 +41033,11 @@ function registerCoreTools(server, service, taskStore) {
       ...result
     });
   });
+  server.registerTool("gpt_provider_resume", {
+    description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+    inputSchema: { confirmation: exports_external.literal("RESUME CHATGPT") },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params) => toolPayload("GPT-Control provider safety state updated.", await service.resumeProviderSafety(params.confirmation)));
   server.registerTool("gpt_diagnose", {
     description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
     inputSchema: {},

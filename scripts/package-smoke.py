@@ -19,7 +19,7 @@ def main() -> int:
     if not isinstance(payload, list) or len(payload) != 1:
         raise SystemExit(f"unexpected npm pack payload: {payload!r}")
     package = payload[0]
-    if package.get("filename") != "gpt-control-0.5.0-alpha.7.tgz":
+    if package.get("filename") != "gpt-control-0.5.0-alpha.8.tgz":
         raise SystemExit(f"unexpected package filename: {package.get('filename')}")
     paths = {entry["path"] for entry in package.get("files", [])}
     required = {

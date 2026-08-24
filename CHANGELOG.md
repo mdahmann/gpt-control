@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0-alpha.8] - 2026-08-24
+
+### Changed
+
+- Keep Chrome Bridge as the default transport; the native desktop pool remains
+  an explicit experimental opt-in.
+- Queue up to ten GPT Workers while defaulting to one active ChatGPT generation
+  across GPT Chat, GPT Worker, and GPT Sub-agent runs.
+- Pause all new sends when ChatGPT reports rate limiting, suspicious activity,
+  or human verification. GPT-Control does not dismiss or retry those notices;
+  a human must review the account and explicitly resume the local circuit.
+
 ## [0.5.0-alpha.7] - 2026-08-23
 
 ### Fixed

@@ -390,7 +390,7 @@ describe("desktop live-acceptance safety gate", () => {
 	});
 
 	test("rejects a wrong installed server version and a mismatched runtime bundle", () => {
-		expect(() => assertInstalledServerInfo({ serverInfo: { name: "gpt-control", version: "test" } })).toThrow("0.5.0-alpha.7");
+		expect(() => assertInstalledServerInfo({ serverInfo: { name: "gpt-control", version: "test" } })).toThrow("0.5.0-alpha.8");
 		expect(() => assertRuntimeBundleMatch("dist/gpt-control-mcp.js", "a".repeat(64), "b".repeat(64))).toThrow("trusted exact head");
 		expect(assertRuntimeBundleMatch("dist/gpt-control-mcp.js", "a".repeat(64), "a".repeat(64))).toBeUndefined();
 	});

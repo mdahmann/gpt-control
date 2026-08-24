@@ -50,16 +50,17 @@ describe("public extension contract", () => {
 		expect(plugin.interface.defaultPrompt.every((prompt) => prompt.length <= 128)).toBeTrue();
 	});
 
-	test("defaults to six workers and permits an operator ceiling through ten", () => {
+	test("defaults to one active generation and permits an operator ceiling through ten", () => {
 		const root = scratch();
 		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
-		expect(operatorPolicyFromEnv({}, common).maxConcurrentWorkers).toBe(6);
-		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "8" }, common).maxConcurrentWorkers).toBe(8);
+		expect(operatorPolicyFromEnv({}, common).maxActiveGenerations).toBe(1);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_ACTIVE_GENERATIONS: "5", GPT_CONTROL_MAX_WORKERS: "8" }, common).maxActiveGenerations).toBe(5);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "8" }, common).maxActiveGenerations).toBe(8);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "7", GPT_CONTROL_MAX_PRO_WORKERS: "4" }, common).maxConcurrentWorkers).toBe(7);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "6" }, common).maxConcurrentWorkers).toBe(6);
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "10" }, common).maxConcurrentWorkers).toBe(10);
-		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");
-		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_WORKERS: "11" }, common)).toThrow("maxConcurrentWorkers");
+		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxActiveGenerations");
+		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_ACTIVE_GENERATIONS: "11" }, common)).toThrow("maxActiveGenerations");
 	});
 
 	test("operator abandonment token rotation does not change execution policy identity", () => {
@@ -86,10 +87,11 @@ describe("public extension contract", () => {
 		for (const expected of [
 			"gpt_consult", "gpt_chat", "gpt_image", "gpt_models", "gpt_projects", "gpt_worker_run", "gpt_worker_get", "gpt_worker_cancel", "gpt_worker_list",
 			"gpt_run", "gpt_run_cancel", "gpt_run_abandon_pending", "gpt_conversation_find", "gpt_conversation_find_and_attach", "gpt_conversation_attach", "gpt_conversation_read", "gpt_conversation_status", "gpt_conversation_close", "gpt_diagnose", "gpt_diagnose_active",
-			"gpt_conversation_manage",
+			"gpt_conversation_manage", "gpt_provider_resume",
 		]) expect(names).toContain(expected);
 		expect(tools.find((tool) => tool.name === "gpt_diagnose")?.approval).toBe("read");
 		expect(tools.find((tool) => tool.name === "gpt_diagnose_active")?.approval).toBe("exec");
+		expect(tools.find((tool) => tool.name === "gpt_provider_resume")?.approval).toBe("write");
 		const models = tools.find((tool) => tool.name === "gpt_models")!;
 		const projects = tools.find((tool) => tool.name === "gpt_projects")!;
 		expect((models.parameters as { properties: Record<string, SchemaNode> }).properties).toHaveProperty("refresh");
@@ -156,6 +158,7 @@ describe("MCP plugin contract", () => {
 		expect(pluginMcp.mcpServers.gpt_control.command).toBe("node");
 		expect(pluginMcp.mcpServers.gpt_control.args).toEqual(["./dist/gpt-control-mcp.js"]);
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
+		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_MAX_ACTIVE_GENERATIONS");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_MAX_WORKERS");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("CODEX_THREAD_ID");
 		const root = scratch();

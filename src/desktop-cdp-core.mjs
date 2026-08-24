@@ -462,10 +462,12 @@ function rendererObservationFunction(selectors) {
   const controlLabels = controls.map(label).filter(Boolean);
   const statusNodes = [...new Set([
     ...document.querySelectorAll('[role="dialog"], [role="status"], [role="alert"], [aria-live="assertive"]'),
-    ...document.querySelectorAll('[data-testid*=thinking], [data-testid*=tool], [data-testid*=error]'),
+    ...document.querySelectorAll('[data-testid*=thinking], [data-testid*=tool], [data-testid*=error], [data-testid*=captcha], [data-testid*=challenge]'),
   ])].filter(visible);
   const statusTexts = statusNodes.map(label).filter((value) => value && value.length < 1000);
   const rateLimitMessage = statusTexts.find((value) => /too many requests|rate limit|usage limit|try again later|reached.*limit/i.test(value));
+  const suspiciousActivityMessage = statusTexts.find((value) => /suspicious activity|unusual activity (?:has been )?detected|account activity (?:looks|appears) unusual/i.test(value));
+  const humanVerificationMessage = statusTexts.find((value) => /verify (?:that )?you(?:'re| are) human|confirm (?:that )?you(?:'re| are) human|captcha|security challenge|human verification/i.test(value));
   const errorMessage = statusTexts.find((value) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|generation stopped|connection lost/i.test(value));
   const stopControl = controls.some((node) => /stop (?:answering|generating|response|streaming)|composer-stop/i.test(`${node.getAttribute("data-testid") ?? ""} ${label(node)}`));
   const currentModelNode = firstVisible(selectors.modelTrigger);
@@ -490,6 +492,8 @@ function rendererObservationFunction(selectors) {
     retryAvailable: controlLabels.some((value) => /^retry(?:\b|$)/i.test(value)),
     continueAvailable: controlLabels.some((value) => /continue generating|continue response|^continue$/i.test(value)),
     rateLimitMessage: rateLimitMessage ?? "",
+    providerSafetyReason: suspiciousActivityMessage ? "suspicious_activity" : humanVerificationMessage ? "human_verification" : "",
+    providerSafetyMessage: suspiciousActivityMessage ?? humanVerificationMessage ?? "",
     errorMessage: errorMessage ?? "",
     toolLabels,
     currentModel: label(currentModelNode),
@@ -549,6 +553,7 @@ export async function observeRenderer(session, selectors = DEFAULT_SELECTORS) {
     raw.retryAvailable ? "retry" : undefined,
     raw.continueAvailable ? "continue" : undefined,
     raw.rateLimitMessage ? "rate_limited" : undefined,
+    raw.providerSafetyReason ? `provider_safety:${raw.providerSafetyReason}` : undefined,
     raw.errorMessage ? `error:${String(raw.errorMessage).slice(0, 160)}` : undefined,
     `snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length ? "image" : "transient"}`,
   ].filter(Boolean);
@@ -568,6 +573,8 @@ export async function observeRenderer(session, selectors = DEFAULT_SELECTORS) {
       continueAvailable: Boolean(raw.continueAvailable),
       rateLimited: Boolean(raw.rateLimitMessage),
       ...(raw.rateLimitMessage ? { rateLimitMessage: String(raw.rateLimitMessage) } : {}),
+      ...(raw.providerSafetyReason ? { providerSafetyReason: String(raw.providerSafetyReason) } : {}),
+      ...(raw.providerSafetyMessage ? { providerSafetyMessage: String(raw.providerSafetyMessage) } : {}),
       ...(raw.errorMessage ? { errorMessage: String(raw.errorMessage) } : {}),
       stateSummary: states.join(","),
     },

@@ -563,6 +563,25 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 
 function registerDiagnostics(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
 	pi.registerTool({
+		name: "gpt_provider_resume",
+		label: "Resume GPT Sends",
+		description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({
+			confirmation: Type.String({ description: "Must be exactly RESUME CHATGPT." }),
+		}),
+		execute: async (_id, params) => {
+			try {
+				return textResult("GPT-Control provider safety state updated.", await service.resumeProviderSafety(String(params.confirmation)));
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "gpt_diagnose",
 		label: "GPT Diagnose",
 		description: "Passively report adapter discovery and trusted policy without executing any discovered program.",

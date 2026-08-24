@@ -20,6 +20,7 @@ export interface FakeBridgeOptions {
 	availableEfforts?: string[];
 	availableProjects?: string[];
 	modelSelectorAbsent?: boolean;
+	composerAbsent?: boolean;
 	modelSelectorDelayReads?: number;
 	modelAvailable?: boolean;
 	modelReadbackMismatch?: boolean;
@@ -41,6 +42,7 @@ export interface FakeBridgeOptions {
 	scenarioForPrompt?: (prompt: string) => FakeScenario;
 	responseForPrompt?: (prompt: string) => string | undefined;
 	rateLimitNotice?: boolean;
+	providerSafetyNotice?: "suspicious_activity" | "human_verification";
 	desktopPickerMarkup?: boolean;
 	desktopOrganizationMarkup?: boolean;
 }
@@ -597,7 +599,7 @@ export class FakeChromeBridge {
 		const composerModelHidden = this.options.hideComposerModelWhenSubmenuOpen
 			&& (tab.pickerStage === "model" || tab.pickerStage === "effort");
 		const modelSelectorDelayed = tab.htmlReads <= (this.options.modelSelectorDelayReads ?? 0);
-		const composer = this.options.modelSelectorAbsent || modelSelectorDelayed || composerModelHidden
+		const composer = this.options.composerAbsent ? "" : this.options.modelSelectorAbsent || modelSelectorDelayed || composerModelHidden
 			? '<form data-testid="composer"><div id="prompt-textarea" contenteditable="true"></div><button data-testid="send-button">Send</button></form>'
 			: this.options.currentEffortPicker
 				? this.options.desktopPickerMarkup
@@ -632,7 +634,12 @@ export class FakeChromeBridge {
 		const rateLimitNotice = tab.rateLimited
 			? '<div role="dialog"><div role="alert">Too many requests. Please try again later.</div><button role="button">Got it</button></div>'
 			: "";
-		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}${rateLimitNotice}</main>`;
+		const providerSafetyNotice = this.options.providerSafetyNotice === "suspicious_activity"
+			? '<div role="alert" data-testid="account-challenge">Suspicious activity has been detected. Please review your account.</div>'
+			: this.options.providerSafetyNotice === "human_verification"
+				? '<div role="dialog" data-testid="captcha-challenge">Verify that you are human to continue.</div>'
+				: "";
+		return `<main>${account}${projects}${conversationLink}${header}${turns}${composer}${retainedInactivePicker}${menu}${conversationActions}${organizationReadback}${rateLimitNotice}${providerSafetyNotice}</main>`;
 	}
 
 	private turnHtml(turn: FakeTurn, current: boolean): string {
