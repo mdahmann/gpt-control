@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0-alpha.7] - 2026-08-23
+
+### Fixed
+
+- Keep `interface.defaultPrompt` within Codex's three-entry limit so fresh
+  processes load GPT Chat, GPT Worker, and GPT Sub-agent starters without
+  `ignoring interface.defaultPrompt` warnings.
+
 ## [0.5.0-alpha.6] - 2026-08-23
 
 - Filter installed acceptance children through the production environment

@@ -14,7 +14,7 @@ const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LIVE_ACK = "I_UNDERSTAND_THIS_CREATES_CHATGPT_CONVERSATIONS";
 const STRESS_ACK = "I_UNDERSTAND_THIS_STARTS_MULTIPLE_CHATGPT_SESSIONS";
 const DEFAULT_COOLDOWN_HOURS = 24;
-const EXPECTED_VERSION = "0.5.0-alpha.6";
+const EXPECTED_VERSION = "0.5.0-alpha.7";
 const REQUIRED_LAUNCHERS = [
   "bin/gpt-control-mcp",
   "bin/gpt-control-desktop-pool-driver",

@@ -29320,7 +29320,7 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.5.0-alpha.6";
+var PACKAGE_VERSION = "0.5.0-alpha.7";
 
 // src/service.ts
 import { createHash as createHash6, randomUUID as randomUUID5 } from "node:crypto";
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.5.0-alpha.6";
+var PACKAGE_VERSION2 = "0.5.0-alpha.7";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;

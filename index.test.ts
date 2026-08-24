@@ -35,6 +35,21 @@ const Type: TypeBuilder = {
 };
 
 describe("public extension contract", () => {
+	test("keeps plugin starter prompts within the Codex three-entry limit", () => {
+		const plugin = JSON.parse(readFileSync(join(import.meta.dir, ".codex-plugin", "plugin.json"), "utf8")) as {
+			version: string;
+			interface: { defaultPrompt: string[] };
+		};
+		const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")) as { version: string };
+		expect(plugin.version).toBe(packageJson.version);
+		expect(plugin.interface.defaultPrompt).toEqual([
+			"Start a GPT Chat and send this exact message.",
+			"Start a GPT Worker for this bounded task with GPT-5.6 Sol at High effort.",
+			"Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete.",
+		]);
+		expect(plugin.interface.defaultPrompt.every((prompt) => prompt.length <= 128)).toBeTrue();
+	});
+
 	test("defaults to six workers and permits an operator ceiling through ten", () => {
 		const root = scratch();
 		const common = { workspaceRoot: root, storageRoot: join(root, "state") };

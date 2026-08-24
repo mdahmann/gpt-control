@@ -252,7 +252,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.6",
+				driverVersion: "0.5.0-alpha.7",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -1042,7 +1042,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.6");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.7");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {
