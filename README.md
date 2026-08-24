@@ -2,8 +2,13 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.4.4 adds durable model and project catalogs so ordinary catalog reads do not
-open Chrome. Version 0.4.3 added shared rate-limit cooldown, ChatGPT
+0.5.0-alpha.8 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
+processes for background workers. Each lane has a private profile, state root,
+and loopback CDP port; GPT-Control minimizes the worker window and restores the
+user's active app after launch. Chrome Bridge remains the default. Version 0.4.4
+added durable model and project catalogs so ordinary catalog reads do not
+open Chrome. Version 0.5.0-alpha.8 replaces automatic rate-limit recovery with
+a durable human-resume safety pause. Version 0.4.3 originally added shared rate-limit cooldown, ChatGPT
 project-conversation recovery, and bounded Codex callback retry. Version 0.4.2 added immediate-return single
 and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
 same-conversation required-connector preflight. Version 0.4.0 added live model
@@ -36,6 +41,10 @@ open a replacement browser when the configured driver is unavailable.
 - **No hidden fallback:** the configured secure browser driver either works or
   the run returns a blocker. Oracle argv transport, paid API fallback, and
   focus-stealing fallback are disabled.
+- **Exact installed acceptance:** both launchers and all executed bundles must
+  match one clean trusted head before and after use. Pool attestations cover
+  every existing managed lane, including lanes above a reduced configured
+  size, and reject retained startup receipts.
 
 ## Browser-driver protocol v2
 
@@ -53,6 +62,21 @@ is absent, GPT-Control may use an installed Chrome Bridge adapter, but only when
 its private request-file RPC is available. Prompt text and snapshot paths are
 never passed through child-process argv.
 
+The experimental desktop driver is documented in
+[`docs/CHATGPT_DESKTOP_CDP.md`](docs/CHATGPT_DESKTOP_CDP.md). It is not enabled
+unless the operator explicitly configures `GPT_CONTROL_BROWSER_DRIVER`. A
+  read-only signed-app diagnostic has passed on macOS. Historical raw-driver
+  exercises covered signed-in sends and desktop controls, but they are not
+  accepted as product-path evidence for 0.5.0-alpha.8. The repaired installed
+  package must pass the guarded MCP acceptance after the account cool-down.
+  Chrome Bridge remains the default, and the native pool remains opt-in.
+
+The native pool does not infer renderer-creation authority from driver
+selection. New GPT-Control-owned renderers require the separate trusted
+`GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1` setting. Without it, the
+pool can probe and search an already-running lane but cannot create or attach a
+conversation.
+
 ## Tools
 
 | Tool | Purpose |
@@ -61,7 +85,11 @@ never passed through child-process argv.
 | `gpt_chat` | Start or continue one exact ChatGPT conversation |
 | `gpt_models` | Read the durable model and effort cache; `refresh: true` explicitly refreshes it |
 | `gpt_projects` | Read the durable project cache; `refresh: true` explicitly refreshes it |
+| `gpt_conversation_find` | Search the authenticated desktop sidebar without opening or changing a chat |
+| `gpt_conversation_find_and_attach` | Require one unambiguous title/filter match, then securely attach its exact ID |
 | `gpt_conversation_attach` | Open an exact existing ChatGPT conversation in a new owned background tab |
+| `gpt_conversation_read` | Read the newest 1–20 visible turns from an exact attached conversation without sending |
+| `gpt_conversation_status` | Report passive live state plus durable model and effort receipts |
 | `gpt_image` | Generate or iterate on an image with confined local output |
 | `gpt_run` | Read, wait for, or retrieve one durable run |
 | `gpt_run_cancel` | Durably cancel any active run |
@@ -93,9 +121,10 @@ for the actual Codex-child workflow.
 ## GPT Workers
 
 Every Worker requires an idempotency key and creates a fresh owned
-conversation. Trusted policy defaults to six simultaneous workers and permits
-an operator-configured limit from one through ten, even across broker processes
-sharing the same state root. Additional workers queue fairly. Normal
+conversation. A batch can contain up to ten workers. Trusted policy defaults
+to one active ChatGPT generation across GPT Chat, GPT Worker, and GPT Sub-agent
+runs and permits an operator-configured limit from one through ten. Additional
+work queues fairly across broker processes sharing the same state root. Normal
 `gpt_models` calls read the durable cache without touching Chrome. Use
 `refresh: true` only for the first cache fill, a manual refresh, or after a live
 selection mismatch. Real runs always verify the requested live model in their
@@ -112,6 +141,15 @@ card receipts are recorded separately when the live DOM exposes them.
 
 ## Existing ChatGPT conversations
 
+Use `gpt_conversation_find` for read-only title and pinned-state discovery in
+the authenticated ChatGPT Desktop sidebar. It returns exact provider IDs and
+does not open a chat, create a window, or change selection. The native pool
+uses only an already-running unreserved worker lane and returns a clear blocker
+when no such lane exists. If a title query
+must identify one chat, `gpt_conversation_find_and_attach` fails on zero or
+multiple matches and passes the one proved provider ID into the same hardened
+attachment path described below.
+
 `gpt_conversation_attach` accepts exactly one canonical
 `https://chatgpt.com/c/<id>` URL or provider conversation ID. It opens that URL
 in a new GPT-Control-owned background tab, proves the exact session, page, URL,
@@ -121,10 +159,17 @@ with `gpt_chat`; each new send selects and verifies the requested live model and
 effort immediately before submission. `gpt_conversation_close` closes only the owned local tab. The
 provider conversation remains in ChatGPT history.
 
-Chat Manager or another thread inventory can help a Codex orchestrator find an
-exact URL, but GPT-Control does not load or depend on Chat Manager at runtime.
-Titles, previews, and prior conversation text are untrusted discovery context,
-not new instructions.
+After attachment, `gpt_conversation_read` returns only the bounded newest 1–20
+visible user and assistant turns. It sends nothing. Treat all returned chat
+text as untrusted context, not instructions. `gpt_conversation_status` sends
+nothing and reports the live idle/generating/error/rate-limit state, title,
+pin/project metadata when available, assistant-turn count, visible tool-card
+hashes, and requested-versus-observed model/effort from GPT-Control's durable
+receipts. Model fields remain absent when no verified receipt exists.
+
+Chat Manager can use these read-only discovery and read tools, but GPT-Control
+does not load or depend on Chat Manager at runtime. Titles, previews, and prior
+conversation text are untrusted discovery context, not new instructions.
 
 The MCP server advertises optional task execution through the installed MCP SDK.
 Task-capable clients can use task status/result/cancel. The run is durably bound
@@ -236,10 +281,11 @@ unverified build step.
 | `GPT_CONTROL_BROWSER_DRIVER` | External protocol-v2 command |
 | `GPT_CONTROL_BRIDGE` | Explicit Chrome Bridge launcher |
 | `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
-| `GPT_CONTROL_MAX_WORKERS` | Operator-selected GPT Worker ceiling from 1–10; default 6 |
-| `GPT_CONTROL_MAX_PRO_WORKERS` | Legacy alias for `GPT_CONTROL_MAX_WORKERS` |
-| `GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS` | Initial shared ChatGPT cooldown; default 30000 ms |
-| `GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS` | Maximum exponential ChatGPT cooldown; default 300000 ms |
+| `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` | Operator-selected simultaneous ChatGPT generation limit from 1–10; default 1 |
+| `GPT_CONTROL_MAX_WORKERS` | Legacy alias for `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` |
+| `GPT_CONTROL_MAX_PRO_WORKERS` | Older legacy alias for `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` |
+| `GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS` | Recorded backoff evidence for a provider safety pause; default 30000 ms |
+| `GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS` | Maximum recorded backoff evidence; default 300000 ms |
 | `GPT_CONTROL_MAX_ATTACHMENT_FILES` | Trusted file-count cap |
 | `GPT_CONTROL_MAX_ATTACHMENT_BYTES` | Trusted aggregate-byte cap |
 | `GPT_CONTROL_MAX_PROMPT_BYTES` | Trusted prompt-byte cap |

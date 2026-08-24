@@ -371,6 +371,66 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 	});
 
 	pi.registerTool({
+		name: "gpt_conversation_find",
+		label: "GPT Conversation Find",
+		description: "Search the authenticated ChatGPT Desktop sidebar without opening, sending, or changing a conversation. Returns exact provider conversation IDs for secure attachment.",
+		loadMode: "discoverable",
+		approval: "read",
+		strict: true,
+		parameters: Type.Object({
+			query: Type.Optional(Type.String()),
+			pinned: Type.Optional(Type.Boolean()),
+			project_id: Type.Optional(Type.String()),
+			limit: Type.Optional(Type.Integer()),
+		}),
+		execute: async (_id, params) => {
+			try {
+				const catalog = await service.findConversations({
+					query: typeof params.query === "string" ? params.query : undefined,
+					pinned: typeof params.pinned === "boolean" ? params.pinned : undefined,
+					projectId: typeof params.project_id === "string" ? params.project_id : undefined,
+					limit: typeof params.limit === "number" ? params.limit : undefined,
+				});
+				return textResult(`${catalog.conversations.length} ChatGPT conversation${catalog.conversations.length === 1 ? "" : "s"} matched.`, catalog);
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "gpt_conversation_find_and_attach",
+		label: "GPT Conversation Find and Attach",
+		description: "Search the authenticated ChatGPT Desktop sidebar, require exactly one match, and securely attach that exact conversation in a GPT-Control-owned background session.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({
+			query: Type.String(),
+			pinned: Type.Optional(Type.Boolean()),
+			project_id: Type.Optional(Type.String()),
+		}),
+		execute: async (_id, params) => {
+			try {
+				const { match, conversation } = await service.findAndAttachConversation({
+					query: String(params.query),
+					pinned: typeof params.pinned === "boolean" ? params.pinned : undefined,
+					projectId: typeof params.project_id === "string" ? params.project_id : undefined,
+					limit: 2,
+				});
+				return textResult(`Found and attached ${match.title}.`, {
+					match,
+					conversationId: conversation.id,
+					providerConversationId: conversation.providerConversationId,
+					providerConversationUrl: conversation.providerConversationUrl,
+				});
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "gpt_conversation_attach",
 		label: "GPT Conversation Attach",
 		description: "Attach an exact existing ChatGPT conversation in a new GPT-Control-owned background tab. This does not send a message or adopt a foreground tab.",
@@ -395,6 +455,51 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 					providerConversationUrl: value.providerConversationUrl,
 					localAssistantTurnCount: value.browserAssistantTurnCount,
 				});
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "gpt_conversation_read",
+		label: "GPT Conversation Read",
+		description: "Read the bounded newest visible user and assistant turns from one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		loadMode: "discoverable",
+		approval: "read",
+		strict: true,
+		parameters: Type.Object({
+			conversation_id: Type.String(),
+			limit: Type.Optional(Type.Integer()),
+		}),
+		execute: async (_id, params) => {
+			try {
+				const turns = await service.readConversation(
+					String(params.conversation_id),
+					typeof params.limit === "number" ? params.limit : 10,
+				);
+				return textResult(`${turns.length} visible ChatGPT turn${turns.length === 1 ? "" : "s"}.`, {
+					conversationId: params.conversation_id,
+					turns,
+				});
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "gpt_conversation_status",
+		label: "GPT Conversation Status",
+		description: "Report passive live state and durable model receipts for one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		loadMode: "discoverable",
+		approval: "read",
+		strict: true,
+		parameters: Type.Object({ conversation_id: Type.String() }),
+		execute: async (_id, params) => {
+			try {
+				const status = await service.conversationStatus(String(params.conversation_id));
+				return textResult(`ChatGPT conversation ${params.conversation_id} is ${status.state}.`, status);
 			} catch (error) {
 				return describeError(error);
 			}
@@ -457,6 +562,25 @@ function registerRunTools(pi: ExtensionAPI, Type: TypeBuilder, service: GptContr
 }
 
 function registerDiagnostics(pi: ExtensionAPI, Type: TypeBuilder, service: GptControlService): void {
+	pi.registerTool({
+		name: "gpt_provider_resume",
+		label: "Resume GPT Sends",
+		description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+		loadMode: "discoverable",
+		approval: "write",
+		strict: true,
+		parameters: Type.Object({
+			confirmation: Type.String({ description: "Must be exactly RESUME CHATGPT." }),
+		}),
+		execute: async (_id, params) => {
+			try {
+				return textResult("GPT-Control provider safety state updated.", await service.resumeProviderSafety(String(params.confirmation)));
+			} catch (error) {
+				return describeError(error);
+			}
+		},
+	});
+
 	pi.registerTool({
 		name: "gpt_diagnose",
 		label: "GPT Diagnose",

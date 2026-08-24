@@ -1,5 +1,109 @@
 # Changelog
 
+## [0.5.0-alpha.8] - 2026-08-24
+
+### Changed
+
+- Keep Chrome Bridge as the default transport; the native desktop pool remains
+  an explicit experimental opt-in.
+- Queue up to ten GPT Workers while defaulting to one active ChatGPT generation
+  across GPT Chat, GPT Worker, and GPT Sub-agent runs.
+- Pause all new sends when ChatGPT reports rate limiting, suspicious activity,
+  or human verification. GPT-Control does not dismiss or retry those notices;
+  a human must review the account and explicitly resume the local circuit.
+
+## [0.5.0-alpha.7] - 2026-08-23
+
+### Fixed
+
+- Keep `interface.defaultPrompt` within Codex's three-entry limit so fresh
+  processes load GPT Chat, GPT Worker, and GPT Sub-agent starters without
+  `ignoring interface.defaultPrompt` warnings.
+
+## [0.5.0-alpha.6] - 2026-08-23
+
+- Filter installed acceptance children through the production environment
+  allowlists and compare both executed launchers plus all runtime bundles with
+  one clean trusted exact head before and after execution.
+- Require strict typed active/offline pool receipts, exact provider ID-to-URL
+  binding, and full installed runtime-bundle evidence.
+- Make attestation cover every existing managed lane after pool-size changes and
+  reject all retained startup receipts.
+- Retain the launch child through bounded signal cleanup and close the exact
+  signed browser if its endpoint appears after interruption.
+- Journal catalog and attached-chat ownership before any show call when
+  lifecycle-lock release is unproved.
+- Add direct request-handler regressions for send versus close, create versus
+  discovery, and safe retry from a failed lane to a healthy lane.
+
+## [0.5.0-alpha.5] - 2026-08-23
+
+- Bind create cleanup to the complete caller-owned destination tuple and retain
+  successful session identity when lifecycle-lock release is not proved.
+- Serialize every exact lane action, including Send, close, and discovery,
+  through one fenced lifecycle lease. Read-only discovery no longer launches a
+  cold native worker.
+- Replace numeric-PID shutdown signals with exact verified CDP `Browser.close`
+  and fail closed when native-process cleanup cannot be proved.
+- Require explicit renderer-creation authority for the pool and retry another
+  healthy lane only after the failed lane is proved session-free and offline.
+- Move cleanup attestation behind the pool lock API and require distinct lane,
+  session, process, profile, port, browser, provider, model, and attachment
+  evidence from the installed-product acceptance runner.
+- Verify that installed launchers and runtime bundles stay inside the package,
+  match a clean trusted exact head, and report the exact alpha version.
+
+## [0.5.0-alpha.4] - 2026-08-23
+
+- Accept and durably record exact native desktop-pool lane receipts.
+- Fence allocation and per-lane lifecycle locks against replacement and ownerless recovery.
+- Reserve lanes before slow startup, use durable round-robin selection, and prove a profile is offline before launch.
+- Restrict shutdown signals to stable descendants of the verified signed worker process.
+- Verify minimized-window and restored-focus postconditions after desktop actions.
+- Hide unverified model and effort fields from passive conversation status.
+- Remove lossy generated-JavaScript whitespace normalization.
+- Keep live acceptance explicit, low-volume, and separate from deterministic verification.
+
+## [0.5.0-alpha.3] - 2026-08-23
+
+- Added an opt-in native ChatGPT/Codex worker pool with one separately signed
+  macOS app process, persistent profile, private state root, and loopback CDP
+  port per lane.
+- Added exact session-to-lane routing, a fair allocation lock, configurable
+  pool size from one through ten, and clean capacity blockers.
+- Minimized worker windows after launch, restored the previously active app
+  only when the worker still held focus, and stopped an empty lane after its
+  exact GPT-Control session closes.
+- Added an explicit one-time interactive bootstrap gate for fresh profiles,
+  exact process-tree shutdown, and offline release for crashed durable lanes.
+- Added package, bundle-reproducibility, protocol-envelope, and live concurrent
+  acceptance coverage for the pool driver.
+
+## [0.5.0-alpha.2] - 2026-08-23
+
+- Reserved every mutating desktop run a dedicated native window and persisted
+  its exact renderer receipt before waiting for readiness.
+- Added restart-safe provisional creation and close states, bounded local lock
+  recovery, exact target-absence proof, and multi-shell conversation search.
+- Added strict code-signature verification, one desktop environment namespace,
+  packaged runtime receipts, and valid protocol errors on exit status zero.
+- Kept user-owned ChatGPT windows passive and outside GPT-Control ownership.
+
+## [0.5.0-alpha.1] - 2026-08-22
+
+- Added an opt-in protocol-v2 adapter for the signed macOS ChatGPT desktop app
+  through an explicit loopback-only Electron CDP endpoint.
+- Added official bundle and Team ID checks, exact listener-process checks,
+  durable renderer ownership, exact-conversation restart rebinding, and
+  fail-closed renderer capacity handling.
+- Kept prompt text on private stdin and out of durable state. The adapter
+  records only a prompt hash and persists `sendState=attempted` before Send so
+  an ambiguous click cannot be replayed automatically.
+- Added read-only diagnostics and separately authorized live smoke tests for
+  one, two, three, and six distinct renderer identities.
+- Kept Chrome Bridge as the default. This desktop route remains experimental
+  until signed-in macOS acceptance is complete.
+
 ## [0.4.4] - 2026-08-22
 
 - Changed ordinary `gpt_models` and `gpt_projects` calls to read durable cache

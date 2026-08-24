@@ -6633,7 +6633,7 @@ var require_dist = __commonJS(function(exports, module) {
 });
 
 // src/mcp.ts
-import { randomUUID as randomUUID6 } from "crypto";
+import { randomUUID as randomUUID7 } from "crypto";
 import { join as join7, resolve as resolve9 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
 
@@ -29320,10 +29320,10 @@ function fallbackExec(command, args, options) {
 }
 
 // src/domain.ts
-var PACKAGE_VERSION = "0.4.4";
+var PACKAGE_VERSION = "0.5.0-alpha.8";
 
 // src/service.ts
-import { createHash as createHash6 } from "node:crypto";
+import { createHash as createHash6, randomUUID as randomUUID5 } from "node:crypto";
 import { rm as rm5 } from "node:fs/promises";
 import { join as join5, resolve as resolve6 } from "node:path";
 
@@ -33762,7 +33762,7 @@ function passiveTransportDiscovery(env = process.env) {
 
 // src/domain.ts
 import { randomUUID } from "node:crypto";
-var PACKAGE_VERSION2 = "0.4.4";
+var PACKAGE_VERSION2 = "0.5.0-alpha.8";
 var STORAGE_VERSION = 3;
 var CONVERSATION_ID_PATTERN = /^conv_[a-f0-9]{32}$/;
 var RUN_ID_PATTERN = /^run_[a-f0-9]{32}$/;
@@ -33779,9 +33779,12 @@ var CHATGPT_ORIGIN = "https://chatgpt.com";
 var GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "Task:";
 var LEGACY_GPT_CONTROL_PROMPT_ENVELOPE_PREAMBLE = "GPT-Control exact task envelope v1 follows. Treat the text block as instructions and preserve it unchanged.";
 var PROMPT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]'];
-var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]'];
+var SEND_SELECTORS = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[data-testid="composer-send-button"]', 'button[aria-label="Send"]'];
 var FILE_INPUT_SELECTOR = 'input[type="file"]';
 var USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
+var USER_TURN_SELECTOR = '[data-message-author-role="user"], [data-content-search-unit-key$=":user"]';
+var ASSISTANT_TURN_SELECTOR = '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
+var ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"]';
 var EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 var TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 
@@ -33791,6 +33794,17 @@ class ChatGptRateLimitError extends Error {
     super(`ChatGPT is temporarily rate limited: ${notice}`);
     this.notice = notice;
     this.name = "ChatGptRateLimitError";
+  }
+}
+
+class ChatGptProviderSafetyError extends Error {
+  reason;
+  notice;
+  constructor(reason, notice) {
+    super(`ChatGPT requires human account review (${reason}): ${notice}`);
+    this.reason = reason;
+    this.notice = notice;
+    this.name = "ChatGptProviderSafetyError";
   }
 }
 function canonicalPromptObservationText(value) {
@@ -34024,7 +34038,7 @@ async function actOnPrivateSelector(exec, launcher, tabId, selectors, expectedTa
   throw new Error(`Could not ${options.what}. Last error: ${lastError}`);
 }
 function countAssistantTurns(html) {
-  return parse6(html).querySelectorAll('[data-message-author-role="assistant"]').length;
+  return parse6(html).querySelectorAll(ASSISTANT_TURN_SELECTOR).length;
 }
 async function tabUrl(exec, launcher, tabId, signal) {
   const payload = await bridgeJson(exec, launcher, ["getTabs"], signal);
@@ -34123,38 +34137,133 @@ async function manageChatGptConversation(exec, launcher, tabId, action, signal, 
   const deadline = Date.now() + timeoutMs;
   if (action.action === "rename") {
     const title = normalizeManagementLabel(action.title, 128, "title");
-    const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
-    await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
-    await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
-    await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
-    await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
-    await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
-    await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
-    return { title, verifiedAt: nowIso() };
+    try {
+      const nativeTitleSelector = nativeHeaderTitleSelector(await readPageHtml(exec, launcher, tabId, signal));
+      if (nativeTitleSelector && expectedTarget) {
+        try {
+          await privateBridgeJson(exec, launcher, "doubleClick", {
+            tabId,
+            selector: nativeTitleSelector,
+            expectedTarget
+          }, signal);
+        } catch (error51) {
+          const interrupted = /trusted click.*(?:blocked|pending)/i.test(error51 instanceof Error ? error51.message : String(error51));
+          const editorReady = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[aria-label="Chat title"]').length === 1;
+          if (!interrupted || !editorReady)
+            throw error51;
+        }
+      } else {
+        const optionsSelector = await conversationSidebarOptionsSelector(exec, launcher, tabId, identity.id, deadline, signal);
+        if (optionsSelector === '[aria-current="page"] button[aria-label="Chat actions"]') {
+          await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+        } else {
+          await pickerAction(exec, launcher, "click", tabId, optionsSelector, signal, expectedTarget);
+        }
+        await clickLiveMenuItem(exec, launcher, tabId, "Rename", deadline, signal, expectedTarget);
+      }
+      await waitForSelectorInHtml(exec, launcher, tabId, '[aria-label="Chat title"]', deadline, signal);
+      await privateOrBridgeAction(exec, launcher, "fill", { tabId, selector: '[aria-label="Chat title"]', text: title }, signal, expectedTarget);
+      try {
+        await privateOrBridgeAction(exec, launcher, "press", { tabId, key: "Enter" }, signal, expectedTarget);
+      } catch (error51) {
+        const interrupted = /trusted key was blocked/i.test(error51 instanceof Error ? error51.message : String(error51));
+        const editorClosed = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[aria-label="Chat title"]').length === 0;
+        if (!interrupted || !editorClosed)
+          throw error51;
+      }
+      await waitForConversationTitle(exec, launcher, tabId, identity.id, title, deadline, signal);
+      return { title, verifiedAt: nowIso() };
+    } catch (error51) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
+      throw error51;
+    }
   }
-  await openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+  const nativeDesktop = isNativeDesktopShell(await readPageHtml(exec, launcher, tabId, signal));
   if (action.action === "move") {
     const project = normalizeManagementLabel(action.project, 128, "project");
-    await clickLiveMenuItem(exec, launcher, tabId, "Move to project", deadline, signal, expectedTarget);
-    const option = await waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal);
-    await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
-    await waitForProjectReadback(exec, launcher, tabId, identity.id, project, deadline, signal);
-    return { project, verifiedAt: nowIso() };
+    let lastError;
+    for (let attempt = 0;attempt < (nativeDesktop ? 2 : 1); attempt += 1) {
+      const moveDeadline = Date.now() + timeoutMs;
+      try {
+        if (nativeDesktop) {
+          await openNativeHeaderConversationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+        } else {
+          await openConversationOrganizationMenu(exec, launcher, tabId, moveDeadline, signal, expectedTarget);
+        }
+        await clickLiveMenuItem(exec, launcher, tabId, ["Move to project", "Project"], moveDeadline, signal, expectedTarget);
+        const option = await waitForProjectMenuOption(exec, launcher, tabId, project, moveDeadline, signal);
+        if (nativeDesktop && expectedTarget) {
+          if (attempt === 0) {
+            const activation = await privateBridgeJson(exec, launcher, "activate", { tabId, selector: option.selector, expectedTarget }, signal);
+            const alerts = Array.isArray(activation.visibleAlerts) ? activation.visibleAlerts.map(String) : [];
+            const refusal = alerts.find((message) => /could(?:n't| not) update the conversation(?:'s|s) project/i.test(message));
+            if (refusal)
+              throw new Error(`ChatGPT refused the project move: ${refusal}`);
+          } else {
+            await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+          }
+          await privateBridgeJson(exec, launcher, "reload", { tabId, expectedTarget }, signal);
+          await waitForSelectorInHtml(exec, launcher, tabId, '#prompt-textarea,div[contenteditable="true"][aria-label="Message ChatGPT"]', moveDeadline, signal);
+          await verifyNativeProjectMembership(exec, launcher, tabId, project, true, moveDeadline, signal, expectedTarget);
+        } else {
+          await pickerAction(exec, launcher, "click", tabId, option.selector, signal, expectedTarget);
+          await waitForProjectReadback(exec, launcher, tabId, identity.id, project, moveDeadline, signal);
+        }
+        return { project, verifiedAt: nowIso() };
+      } catch (error51) {
+        lastError = error51;
+        await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+          return;
+        });
+      }
+    }
+    throw lastError;
   }
   if (action.action === "archive") {
+    if (nativeDesktop) {
+      await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      const nativeRemovalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+      if (nativeRemovalLabel) {
+        const project = nativeRemovalLabel.replace(/^Remove from\s+/i, "").trim();
+        await clickLiveMenuItem(exec, launcher, tabId, nativeRemovalLabel, deadline, signal, expectedTarget);
+        await verifyNativeProjectMembership(exec, launcher, tabId, project, false, deadline, signal, expectedTarget);
+      } else {
+        await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+          return;
+        });
+      }
+      await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+    } else {
+      await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      const removalLabel = projectRemovalMenuLabel(await readPageHtml(exec, launcher, tabId, signal));
+      if (removalLabel) {
+        await clickLiveMenuItem(exec, launcher, tabId, removalLabel, deadline, signal, expectedTarget);
+        await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+      }
+    }
     await clickLiveMenuItem(exec, launcher, tabId, "Archive", deadline, signal, expectedTarget);
     await waitForArchiveReadback(exec, launcher, tabId, identity.url, deadline, signal);
     return { archived: true, verifiedAt: nowIso() };
   }
+  await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
   const desired = action.action === "pin";
-  const already = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
+  const openMenuState = conversationPinMenuState(await readPageHtml(exec, launcher, tabId, signal));
+  const already = openMenuState ?? isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
   if (already !== desired) {
-    await clickLiveMenuItem(exec, launcher, tabId, desired ? "Pin chat" : "Unpin chat", deadline, signal, expectedTarget);
+    await clickLiveMenuItem(exec, launcher, tabId, desired ? ["Pin chat", "Pin"] : ["Unpin chat", "Unpin"], deadline, signal, expectedTarget);
+    await openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
   }
   for (;; ) {
-    const pinned = isConversationPinned(await readPageHtml(exec, launcher, tabId, signal), identity.id);
-    if (pinned === desired)
+    const html = await readPageHtml(exec, launcher, tabId, signal);
+    const pinned = conversationPinMenuState(html) ?? isConversationPinned(html, identity.id);
+    if (pinned === desired) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
       return { pinned, verifiedAt: nowIso() };
+    }
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
@@ -34379,9 +34488,28 @@ function approvedImageUrl(raw) {
   const host = url2.hostname.toLowerCase();
   return IMAGE_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url2 : undefined;
 }
+function extractConversationTurns(html, limit = 10) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+    throw new Error("Conversation read limit must be 1-20.");
+  const root = parse6(html);
+  const turns = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`).map((node) => {
+    const assistant = node.getAttribute("data-message-author-role") === "assistant" || (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
+    const content = assistant ? node.querySelector(ASSISTANT_CONTENT_SELECTOR) : USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
+    const text = (content?.structuredText ?? node.structuredText ?? "").replace(/[ \t]+\n/g, `
+`).replace(/\n{3,}/g, `
+
+`).trim();
+    return {
+      role: assistant ? "assistant" : "user",
+      text,
+      messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
+    };
+  }).filter((turn) => turn.text.length > 0);
+  return turns.slice(-limit);
+}
 function extractAssistantTurn(html) {
   const root = parse6(html);
-  const turns = root.querySelectorAll('[data-message-author-role="assistant"]');
+  const turns = root.querySelectorAll(ASSISTANT_TURN_SELECTOR);
   const node = turns.length === 0 ? undefined : turns[turns.length - 1];
   if (!node)
     return { text: "", imageUrls: [], hasMarkdown: false };
@@ -34397,7 +34525,7 @@ function extractAssistantTurn(html) {
     seen.add(url2.href);
     imageUrls.push(url2.href);
   }
-  const content = node.querySelector(".markdown");
+  const content = node.querySelector(ASSISTANT_CONTENT_SELECTOR);
   const text = (content?.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
 
@@ -34406,15 +34534,15 @@ function extractAssistantTurn(html) {
     text,
     imageUrls,
     hasMarkdown: Boolean(content),
-    messageId: node.getAttribute("data-message-id") ?? undefined
+    messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
   };
 }
 function extractChatPageObservation(html) {
   const root = parse6(html);
   const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
-  const userTurns = root.querySelectorAll('[data-message-author-role="user"]');
+  const userTurns = root.querySelectorAll(USER_TURN_SELECTOR);
   const latestUser = userTurns.at(-1);
-  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? undefined;
+  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? latestUser?.getAttribute("data-content-search-unit-key") ?? undefined;
   const latestUserPromptNode = latestUser ? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean) : undefined;
   const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
@@ -34473,11 +34601,14 @@ ${proofMatch?.[0].trim() ?? ""}`);
     ...root.querySelectorAll('[aria-live="assertive"]'),
     ...root.querySelectorAll('[data-testid*="thinking"]'),
     ...root.querySelectorAll('[data-testid*="tool"]'),
-    ...root.querySelectorAll('[data-testid*="error"]')
+    ...root.querySelectorAll('[data-testid*="error"]'),
+    ...root.querySelectorAll('[data-testid*="captcha"]'),
+    ...root.querySelectorAll('[data-testid*="challenge"]')
   ]);
   const visibleToolCards = uniqueElements(root.querySelectorAll('[data-testid*="tool"]')).map((node) => nodeLabel(node).replace(/\s+/g, " ").trim()).filter((label) => label.length > 0 && label.length <= 256).map((label) => ({ label, sha256: createHash("sha256").update(label).digest("hex") }));
   const statusTexts = statusNodes.map(nodeLabel).filter((text) => text.length > 0 && text.length < 1000);
   const rateLimitMessage = statusTexts.find(isRateLimitText);
+  const providerSafety = statusTexts.map(providerSafetyFromText).find(Boolean);
   const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
   const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
   const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
@@ -34488,6 +34619,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
     retryAvailable ? "retry" : undefined,
     continueAvailable ? "continue" : undefined,
     rateLimitMessage ? "rate_limited" : undefined,
+    providerSafety ? `provider_safety:${providerSafety.reason}` : undefined,
     errorText ? `error:${errorText.slice(0, 160)}` : undefined,
     `snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`
   ].filter(Boolean);
@@ -34505,25 +34637,11 @@ ${proofMatch?.[0].trim() ?? ""}`);
     continueAvailable,
     rateLimited: Boolean(rateLimitMessage),
     rateLimitMessage,
+    providerSafetyReason: providerSafety?.reason,
+    providerSafetyMessage: providerSafety?.message,
     errorMessage: errorText,
     stateSummary: states.join(",")
   };
-}
-async function dismissChatGptRateLimitNotice(exec, launcher, tabId, signal, expectedTarget) {
-  const initial = findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal));
-  if (!initial)
-    return;
-  if (!initial.dismissSelector) {
-    throw new ChatGptRateLimitError(`${initial.message} The notice has no safe dismiss control.`);
-  }
-  await pickerAction(exec, launcher, "click", tabId, initial.dismissSelector, signal, expectedTarget);
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    await sleep(Math.min(pollIntervalMs(), 200));
-    if (!findRateLimitNotice(await readPageHtml(exec, launcher, tabId, signal)))
-      return initial.message;
-  }
-  throw new ChatGptRateLimitError(`${initial.message} The notice remained visible after dismissal.`);
 }
 async function readPageHtml(exec, launcher, tabId, signal) {
   const directory = join2(tmpdir2(), `gpt-control-html-${randomUUID2()}`);
@@ -34653,6 +34771,10 @@ async function openAdvancedPicker(exec, launcher, tabId, deadline, signal, expec
   throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
 }
 function throwIfRateLimited(html) {
+  const observation = extractChatPageObservation(html);
+  if (observation.providerSafetyReason && observation.providerSafetyMessage) {
+    throw new ChatGptProviderSafetyError(observation.providerSafetyReason, observation.providerSafetyMessage);
+  }
   const notice = findRateLimitNotice(html);
   if (notice)
     throw new ChatGptRateLimitError(notice.message);
@@ -34668,14 +34790,22 @@ function findRateLimitNotice(html) {
   const notice = candidates.find((node) => isRateLimitText(nodeLabel(node)));
   if (!notice)
     return;
-  const dismiss = notice.querySelectorAll('button, [role="button"]').find((node) => /^(?:got it|dismiss|close)$/i.test(nodeLabel(node)));
   return {
-    message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500),
-    dismissSelector: dismiss ? exactNodeSelector(dismiss) : undefined
+    message: nodeLabel(notice).replace(/\s+/g, " ").trim().slice(0, 500)
   };
 }
 function isRateLimitText(text) {
   return /too many requests|rate limit(?:ed| reached)?|try again later|temporarily restricted/i.test(text);
+}
+function providerSafetyFromText(text) {
+  const message = text.replace(/\s+/g, " ").trim().slice(0, 500);
+  if (/suspicious activity|unusual activity (?:has been )?detected|account activity (?:looks|appears) unusual/i.test(message)) {
+    return { reason: "suspicious_activity", message };
+  }
+  if (/verify (?:that )?you(?:'re| are) human|confirm (?:that )?you(?:'re| are) human|captcha|security challenge|human verification/i.test(message)) {
+    return { reason: "human_verification", message };
+  }
+  return;
 }
 async function openPickerOptions(exec, launcher, tabId, selector, deadline, signal, expectedTarget) {
   await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
@@ -34722,7 +34852,13 @@ async function pickerAction(exec, launcher, action, tabId, selector, signal, exp
 }
 function extractAdvancedPickerState(html, composerSelector) {
   const root = parse6(html);
-  const active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+  let active = root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-active="true"]');
+  if (!active) {
+    const composer = root.querySelector(composerSelector);
+    const menuId = composer?.getAttribute("aria-expanded") === "true" ? composer.getAttribute("aria-controls") : undefined;
+    if (menuId)
+      active = root.querySelector(`[id="${cssString(menuId)}"]`);
+  }
   if (!active)
     return;
   const rows = active.querySelectorAll('[role="menuitem"]');
@@ -34733,10 +34869,14 @@ function extractAdvancedPickerState(html, composerSelector) {
   return {
     currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
     currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
-    modelSelector: model ? exactNodeSelector(model) : undefined,
-    effortSelector: effort ? exactNodeSelector(effort) : undefined,
+    modelSelector: model ? pickerSubmenuOwnerSelector(model) : undefined,
+    effortSelector: effort ? pickerSubmenuOwnerSelector(effort) : undefined,
     composerSelector
   };
+}
+function pickerSubmenuOwnerSelector(node) {
+  const id = node.getAttribute("id");
+  return id ? `[id="${cssString(id)}"]` : exactNodeSelector(node);
 }
 function pickerRowValue(label, prefix) {
   const value = label.replace(new RegExp(`^${prefix}\\s*`, "i"), "").trim();
@@ -34747,7 +34887,8 @@ function extractPickerRadioOptions(html, ownerSelector) {
   const ownerId = ownerSelector ? /^\[id="((?:[^"\\]|\\.)+)"\]$/.exec(ownerSelector)?.[1] : undefined;
   return uniqueElements([
     ...root.querySelectorAll('[role="menuitemradio"]'),
-    ...root.querySelectorAll('[role="option"]')
+    ...root.querySelectorAll('[role="option"]'),
+    ...ownerId ? root.querySelectorAll('[role="menuitem"]') : []
   ]).filter((node) => {
     if (!ownerId)
       return true;
@@ -34766,7 +34907,7 @@ function extractPickerRadioOptions(html, ownerSelector) {
 }
 function extractChatGptProjects(html) {
   const root = parse6(html);
-  const names = root.querySelectorAll('button[aria-label^="Open project options for "]').map((node) => (node.getAttribute("aria-label") ?? "").replace(/^Open project options for\s+/i, "").trim()).filter(Boolean);
+  const names = root.querySelectorAll('button[aria-label^="Open project options for "],button[aria-label^="Project actions for "]').map((node) => (node.getAttribute("aria-label") ?? "").replace(/^(?:Open project options|Project actions) for\s+/i, "").trim()).filter(Boolean);
   return [...new Set(names)];
 }
 async function conversationSidebarOptionsSelector(exec, launcher, tabId, providerConversationId, deadline, signal) {
@@ -34777,20 +34918,64 @@ async function conversationSidebarOptionsSelector(exec, launcher, tabId, provide
       throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
     if (matches.length === 1)
       return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeMatches = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+    if (nativeMatches.length > 1)
+      throw new Error("ChatGPT native sidebar exposes duplicate controls for the exact conversation.");
+    if (nativeShell && nativeMatches.length === 1)
+      return '[aria-current="page"] button[aria-label="Chat actions"]';
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
   throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
 }
-async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
+async function openConversationOrganizationMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
-    const buttons = root.querySelectorAll('[data-testid="conversation-options-button"]');
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeSidebarButtons = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
+    if (nativeSidebarButtons.length > 1)
+      throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
+    if (nativeSidebarButtons.length === 1) {
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)))
+          throw error51;
+        if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+          if (Date.now() >= deadline)
+            throw error51;
+          await sleep(Math.min(pollIntervalMs(), 200));
+          continue;
+        }
+      }
+      return;
+    }
+    const nativeHeaderButtons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+    if (nativeHeaderButtons.length > 1)
+      throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+    if (nativeHeaderButtons.length === 1 && !nativeShell) {
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)) || !hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal)))
+          throw error51;
+      }
+      return;
+    }
+    if (nativeShell) {
+      if (Date.now() >= deadline)
+        break;
+      await sleep(Math.min(pollIntervalMs(), 200));
+      continue;
+    }
+    const buttons = root.querySelectorAll('[data-testid="conversation-options-button"],[aria-label="ChatGPT conversation actions"]');
     if (buttons.length > 1)
       throw new Error("ChatGPT conversation action control is ambiguous.");
     if (buttons.length === 1) {
-      await pickerAction(exec, launcher, "click", tabId, '[data-testid="conversation-options-button"]', signal, expectedTarget);
+      const selector = buttons[0].getAttribute("data-testid") === "conversation-options-button" ? '[data-testid="conversation-options-button"]' : '[aria-label="ChatGPT conversation actions"]';
+      await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
       return;
     }
     if (Date.now() >= deadline)
@@ -34799,16 +34984,71 @@ async function openConversationHeaderMenu(exec, launcher, tabId, deadline, signa
   }
   throw new Error("ChatGPT conversation action control is unavailable.");
 }
-async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal, expectedTarget) {
+async function openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget) {
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
-    const matches = root.querySelectorAll('[role="menuitem"]').filter((node) => nodeLabel(node).toLowerCase() === label.toLowerCase());
+    const buttons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
+    if (buttons.length > 1)
+      throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+    if (buttons.length === 1) {
+      try {
+        await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+      } catch (error51) {
+        if (!/trusted click.*blocked/i.test(error51 instanceof Error ? error51.message : String(error51)))
+          throw error51;
+        if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
+          if (Date.now() >= deadline)
+            throw error51;
+          await sleep(Math.min(pollIntervalMs(), 200));
+          continue;
+        }
+      }
+      return;
+    }
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error("ChatGPT native header conversation control is unavailable.");
+}
+function isNativeDesktopShell(html) {
+  return parse6(html).querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+}
+function nativeHeaderTitleSelector(html) {
+  const root = parse6(html);
+  if (root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length === 0)
+    return;
+  const currentTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+  if (currentTitles.length !== 1)
+    return;
+  const title = nodeLabel(currentTitles[0]);
+  if (!title)
+    return;
+  const matches = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button').filter((node) => nodeLabel(node) === title);
+  if (matches.length > 1)
+    throw new Error("ChatGPT native header title is ambiguous; rename refused.");
+  return matches.length === 1 ? "text=" + title : undefined;
+}
+function hasOpenConversationActionMenu(html) {
+  const known = new Set(["pin", "pin chat", "unpin", "unpin chat", "rename", "archive", "project", "move to project", "share", "delete chat"]);
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => normalizePickerLabel(nodeLabel(node))).filter((label) => known.has(label));
+  return new Set(labels).size >= 2;
+}
+async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal, expectedTarget) {
+  const labels = (Array.isArray(label) ? label : [label]).map((value) => value.toLowerCase());
+  const displayLabel = Array.isArray(label) ? label.join(" or ") : label;
+  let observed = [];
+  for (;; ) {
+    const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
+    const menuItems = root.querySelectorAll('[role="menuitem"]');
+    observed = [...new Set(menuItems.map((node) => nodeLabel(node)).filter(Boolean))];
+    const matches = menuItems.filter((node) => labels.includes(nodeLabel(node).toLowerCase()));
     if (matches.length > 1)
-      throw new Error(`ChatGPT menu action ${label} is ambiguous.`);
+      throw new Error(`ChatGPT menu action ${displayLabel} is ambiguous.`);
     if (matches.length === 1) {
       const selector = exactNodeSelector(matches[0]);
       if (!selector)
-        throw new Error(`ChatGPT menu action ${label} has no exact selector.`);
+        throw new Error(`ChatGPT menu action ${displayLabel} has no exact selector.`);
       await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
       return;
     }
@@ -34816,7 +35056,7 @@ async function clickLiveMenuItem(exec, launcher, tabId, label, deadline, signal,
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT menu action ${label} is unavailable.`);
+  throw new Error(`ChatGPT menu action ${displayLabel} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 async function waitForSelectorInHtml(exec, launcher, tabId, selector, deadline, signal) {
   for (;; ) {
@@ -34846,24 +35086,37 @@ async function privateOrBridgeAction(exec, launcher, action, payload, signal, ex
   await bridgeJson(exec, launcher, ["press", String(payload.tabId), String(payload.key)], signal);
 }
 async function waitForConversationTitle(exec, launcher, tabId, providerConversationId, title, deadline, signal) {
+  let observedNativeTitles = [];
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
     const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
     if (links.length === 1 && nodeLabel(links[0]).includes(title))
       return;
+    const nativeTitles = root.querySelectorAll('[aria-current="page"] [data-thread-title]');
+    observedNativeTitles = nativeTitles.map((node) => {
+      const marker = node.getAttribute("data-thread-title")?.trim();
+      return marker && marker.toLowerCase() !== "true" ? marker : nodeLabel(node);
+    }).filter(Boolean);
+    if (nativeTitles.length === 1) {
+      const observed = observedNativeTitles[0] ?? "";
+      if (normalizePickerLabel(observed) === normalizePickerLabel(title))
+        return;
+    }
     if (Date.now() >= deadline)
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT rename read-back failed for ${title}.`);
+  throw new Error(`ChatGPT rename read-back failed for ${title} (observed: ${observedNativeTitles.join(", ") || "none"}).`);
 }
 async function waitForProjectMenuOption(exec, launcher, tabId, project, deadline, signal) {
+  let observed = [];
   for (;; ) {
     const root = parse6(await readPageHtml(exec, launcher, tabId, signal));
     const options = root.querySelectorAll('[role="menuitem"]').map((node) => ({
       label: projectOptionLabel(node),
       selector: exactNodeSelector(node) ?? ""
     })).filter((option) => option.label && option.selector);
+    observed = [...new Set(options.map((option) => option.label))];
     const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(project));
     if (matches.length > 1)
       throw new Error(`ChatGPT project ${project} is ambiguous.`);
@@ -34873,24 +35126,59 @@ async function waitForProjectMenuOption(exec, launcher, tabId, project, deadline
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT project ${project} is unavailable.`);
+  throw new Error(`ChatGPT project ${project} is unavailable (observed: ${observed.join(", ") || "none"}).`);
 }
 function projectOptionLabel(node) {
   const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const last = lines.at(-1) ?? nodeLabel(node);
   return last.replace(/^Default color.*?Folder\s+/i, "").trim();
 }
+async function verifyNativeProjectMembership(exec, launcher, tabId, project, expectedPresent, deadline, signal, expectedTarget) {
+  const expectedRemoval = normalizePickerLabel(`Remove from ${project}`);
+  let observed = [];
+  for (;; ) {
+    await openNativeHeaderConversationMenu(exec, launcher, tabId, deadline, signal, expectedTarget);
+    const labels = parse6(await readPageHtml(exec, launcher, tabId, signal)).querySelectorAll('[role="menuitem"]').map((node) => nodeLabel(node)).filter(Boolean);
+    observed = labels;
+    const removalLabels = labels.filter((label) => /^Remove from\s+\S/i.test(label));
+    if (removalLabels.length > 1)
+      throw new Error("ChatGPT project membership read-back is ambiguous.");
+    const exactPresent = removalLabels.some((label) => normalizePickerLabel(label) === expectedRemoval);
+    const genericMove = labels.some((label) => normalizePickerLabel(label) === "move to project");
+    if (expectedPresent && exactPresent || !expectedPresent && removalLabels.length === 0 && genericMove) {
+      await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+        return;
+      });
+      return;
+    }
+    await dismissPickerLayer(exec, launcher, tabId, signal, expectedTarget).catch(() => {
+      return;
+    });
+    if (Date.now() >= deadline)
+      break;
+    await sleep(Math.min(pollIntervalMs(), 200));
+  }
+  throw new Error(`ChatGPT project membership read-back failed for ${project} (expected: ${expectedPresent ? "present" : "absent"}; observed: ${observed.join(", ") || "none"}).`);
+}
 async function waitForProjectReadback(exec, launcher, tabId, providerConversationId, project, deadline, signal) {
+  let lastCurrent;
+  let observedMarkers = [];
+  let observedNotices = [];
   for (;; ) {
     const html = await readPageHtml(exec, launcher, tabId, signal);
     const root = parse6(html);
     const notices = [...root.querySelectorAll('[role="status"]'), ...root.querySelectorAll('[role="alert"]')];
+    observedNotices = notices.map((node) => nodeLabel(node)).filter(Boolean);
     if (notices.some((node) => /mov/i.test(nodeLabel(node)) && normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
       return;
     const current = await tabUrl(exec, launcher, tabId, signal);
+    lastCurrent = current;
     const inProjectConversation = current ? new RegExp(`/g/[^/]+/c/${providerConversationId}(?:[?#]|$)`).test(new URL(current).pathname) : false;
     const projectMarkers = root.querySelectorAll('[data-testid*="project"], [aria-label*="project"], [aria-label*="Project"]');
+    observedMarkers = projectMarkers.map((node) => nodeLabel(node)).filter(Boolean);
     if (inProjectConversation && projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)).includes(normalizePickerLabel(project))))
+      return;
+    if (projectMarkers.some((node) => normalizePickerLabel(nodeLabel(node)) === normalizePickerLabel(`Projects ${project}`)))
       return;
     if (root.querySelector(`[data-gpt-control-project="${cssString(project)}"]`))
       return;
@@ -34898,15 +35186,18 @@ async function waitForProjectReadback(exec, launcher, tabId, providerConversatio
       break;
     await sleep(Math.min(pollIntervalMs(), 200));
   }
-  throw new Error(`ChatGPT move read-back failed for project ${project}.`);
+  throw new Error(`ChatGPT move read-back failed for project ${project} (url: ${lastCurrent ?? "unknown"}; notices: ${observedNotices.join(", ") || "none"}; markers: ${observedMarkers.join(", ") || "none"}).`);
 }
 async function waitForArchiveReadback(exec, launcher, tabId, exactUrl, deadline, signal) {
   for (;; ) {
     const current = await tabUrl(exec, launcher, tabId, signal);
     const html = await readPageHtml(exec, launcher, tabId, signal);
+    const root = parse6(html);
     const identity = providerConversationIdentity(exactUrl);
-    const stillListed = identity ? parse6(html).querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
-    if (current && new URL(current).toString() !== exactUrl && !stillListed)
+    const stillListed = identity ? root.querySelectorAll(`a[href$="/c/${cssString(identity.id)}"]`).length > 0 : true;
+    const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
+    const nativeCurrentListed = root.querySelectorAll('[aria-current="page"] [data-thread-title]').length > 0;
+    if (nativeShell ? !nativeCurrentListed : Boolean(current && new URL(current).toString() !== exactUrl && !stillListed))
       return;
     if (Date.now() >= deadline)
       break;
@@ -34918,6 +35209,20 @@ function isConversationPinned(html, providerConversationId) {
   const root = parse6(html);
   const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
   return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "") || link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+}
+function conversationPinMenuState(html) {
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => normalizePickerLabel(nodeLabel(node)));
+  if (labels.includes("unpin") || labels.includes("unpin chat"))
+    return true;
+  if (labels.includes("pin") || labels.includes("pin chat"))
+    return false;
+  return;
+}
+function projectRemovalMenuLabel(html) {
+  const labels = parse6(html).querySelectorAll('[role="menuitem"]').map((node) => nodeLabel(node)).filter((label) => /^Remove from\s+\S/i.test(label));
+  if (labels.length > 1)
+    throw new Error("ChatGPT project-removal action is ambiguous; archive refused.");
+  return labels[0];
 }
 function normalizeManagementLabel(value, maxLength, field) {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -35017,6 +35322,32 @@ function sleep(ms) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
+// scripts/driver-env.mjs
+var BASE_ENV_KEYS = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ"
+]);
+function copyAllowedEnvironment(env, allow) {
+  const output = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string" && (BASE_ENV_KEYS.has(key) || allow(key)))
+      output[key] = value;
+  }
+  return output;
+}
+function sanitizeBrowserDriverEnv(env) {
+  return copyAllowedEnvironment(env, (key) => key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_"));
+}
+
 // src/browser-driver.ts
 var BROWSER_DRIVER_PROTOCOL_VERSION = 2;
 async function assertExactDriverSession(driver, expected, signal) {
@@ -35044,6 +35375,12 @@ async function waitForDriverReady(driver, expected, options = {}) {
         last = `owned page is still committing (${session.url})`;
       } else {
         const observation = await driver.observe(session, options.signal);
+        if (observation.providerSafetyReason) {
+          throw new ChatGptProviderSafetyError(observation.providerSafetyReason, observation.providerSafetyMessage ?? "ChatGPT requires human account review.");
+        }
+        if (observation.rateLimited) {
+          throw new ChatGptRateLimitError(observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+        }
         if (observation.composerReady)
           return { session, observation };
         last = `ChatGPT loaded at ${session.url}, but its composer is not ready (${observation.stateSummary})`;
@@ -35131,33 +35468,15 @@ async function waitForCompletedDriverTurn(driver, expected, options) {
       }
     }
     let observation = await driver.observe(session, options.signal);
+    if (observation.providerSafetyReason) {
+      const message = observation.providerSafetyMessage ?? "ChatGPT requires human account review.";
+      await options.onProviderSafety?.(observation.providerSafetyReason, message);
+      return needsUser(`ChatGPT automation paused for human account review (${observation.providerSafetyReason}): ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
+    }
     if (observation.rateLimited) {
       const message = observation.rateLimitMessage ?? "ChatGPT reported too many requests.";
       await options.onRateLimit?.(message);
-      if (!driver.dismissRateLimitNotice) {
-        return needsUser(`ChatGPT is temporarily rate limited and this browser driver cannot dismiss the notice safely: ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
-      }
-      try {
-        await driver.dismissRateLimitNotice(session, options.signal);
-        recoveryAttempts.push({
-          at: nowIso(),
-          action: "dismiss_rate_limit",
-          reason: message,
-          outcome: "recovered"
-        });
-      } catch (error51) {
-        recoveryAttempts.push({
-          at: nowIso(),
-          action: "dismiss_rate_limit",
-          reason: message,
-          outcome: "failed",
-          detail: errorMessage(error51)
-        });
-        return needsUser(`ChatGPT rate-limit notice could not be dismissed safely: ${errorMessage(error51)}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
-      }
-      previous = undefined;
-      steady = 0;
-      continue;
+      return needsUser(`ChatGPT reported a rate limit. GPT-Control paused all new sends until a human explicitly resumes them: ${message}`, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary);
     }
     let providerTurnIdentityPending = false;
     lastObservedUiState = observation.stateSummary;
@@ -35342,9 +35661,11 @@ function needsUser(reason, snapshot, providerConversationId, providerConversatio
   };
 }
 function requiresRecovery(observation) {
-  return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+  return Boolean(observation.providerSafetyReason || observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 function exactNeedsUserReason(observation, prefix) {
+  if (observation.providerSafetyReason)
+    return `${prefix}: ChatGPT requires human account review (${observation.providerSafetyReason}): ${observation.providerSafetyMessage ?? "review required"}`;
   if (observation.rateLimitMessage)
     return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
   if (observation.errorMessage)
@@ -35404,6 +35725,16 @@ class ChromeBridgeBrowserDriver {
     }
     return current;
   }
+  async assertSessionOwnership(session, signal) {
+    const owned = await showSession(this.exec, this.launcher, session.sessionId, signal);
+    const pageId = tabIdFromSession(owned);
+    if (pageId === undefined || String(pageId) !== String(session.pageId)) {
+      throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; observation refused.`);
+    }
+    if (typeof owned.name !== "string" || owned.name !== session.name) {
+      throw new Error(`Refused observation on renamed or foreign browser session ${session.sessionId}.`);
+    }
+  }
   async probe(signal) {
     const result = await probeBridge(this.exec, this.launcher, signal);
     const secureInput = Boolean(this.launcher.privateRpc);
@@ -35460,6 +35791,10 @@ class ChromeBridgeBrowserDriver {
     await this.assertActionTarget(session, signal);
     return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
   }
+  async readConversation(session, limit, signal) {
+    await this.assertActionTarget(session, signal);
+    return extractConversationTurns(await readPageHtml(this.exec, this.launcher, numericPageId(session.pageId), signal), limit);
+  }
   async manageConversation(session, action, signal) {
     await this.assertActionTarget(session, signal);
     return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30000, exactActionTarget(session));
@@ -35477,11 +35812,8 @@ class ChromeBridgeBrowserDriver {
     await clickSend(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
   }
   async observe(session, signal) {
+    await this.assertSessionOwnership(session, signal);
     return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
-  }
-  async dismissRateLimitNotice(session, signal) {
-    await this.assertActionTarget(session, signal);
-    return dismissChatGptRateLimitNotice(this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session));
   }
   async recover(session, action, signal) {
     await this.assertActionTarget(session, signal);
@@ -35515,11 +35847,19 @@ function exactActionTarget(session) {
 }
 var DriverIdSchema = exports_external.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
 var SessionSchema = exports_external.object({
-  sessionId: exports_external.string().min(1),
+  sessionId: exports_external.string().min(1).max(512),
+  pageId: exports_external.union([exports_external.string(), exports_external.number()]),
+  name: exports_external.string(),
+  url: exports_external.string(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional()
+}).strict();
+var ProvisionalSessionSchema = exports_external.object({
+  sessionId: exports_external.string().min(1).max(512),
   pageId: exports_external.union([exports_external.string(), exports_external.number()]),
   name: exports_external.string(),
   url: exports_external.string()
-}).strict();
+}).passthrough();
 var SnapshotSchema = exports_external.object({
   count: exports_external.number().int().nonnegative(),
   text: exports_external.string(),
@@ -35544,6 +35884,8 @@ var ObservationSchema = exports_external.object({
   continueAvailable: exports_external.boolean(),
   rateLimited: exports_external.boolean().default(false),
   rateLimitMessage: exports_external.string().optional(),
+  providerSafetyReason: exports_external.enum(["suspicious_activity", "human_verification"]).optional(),
+  providerSafetyMessage: exports_external.string().optional(),
   errorMessage: exports_external.string().optional(),
   stateSummary: exports_external.string()
 }).strict();
@@ -35568,6 +35910,23 @@ var ProjectCatalogSchema = exports_external.object({
   projects: exports_external.array(exports_external.object({ name: exports_external.string().min(1) }).strict()),
   discoveredAt: exports_external.string().min(1)
 }).strict();
+var ConversationCatalogSchema = exports_external.object({
+  conversations: exports_external.array(exports_external.object({
+    providerConversationId: exports_external.string().regex(/^[A-Za-z0-9_-]{8,128}$/),
+    providerConversationUrl: exports_external.string().url(),
+    title: exports_external.string().min(1).max(512),
+    pinned: exports_external.boolean(),
+    projectId: exports_external.string().min(1).max(256).optional(),
+    current: exports_external.boolean().optional(),
+    updatedAt: exports_external.string().min(1).optional()
+  }).strict()),
+  discoveredAt: exports_external.string().min(1)
+}).strict();
+var ConversationTurnsSchema = exports_external.array(exports_external.object({
+  role: exports_external.enum(["user", "assistant"]),
+  text: exports_external.string().min(1),
+  messageId: exports_external.string().min(1).optional()
+}).strict());
 var ConversationActionResultSchema = exports_external.object({
   pinned: exports_external.boolean().optional(),
   archived: exports_external.boolean().optional(),
@@ -35580,7 +35939,26 @@ var ProbeSchema = exports_external.object({
   driver: DriverIdSchema,
   secureInput: exports_external.boolean(),
   protocolVersion: exports_external.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
-  reason: exports_external.string().optional()
+  reason: exports_external.string().optional(),
+  driverVersion: exports_external.string().min(1).max(128).optional(),
+  stateWriterVersion: exports_external.number().int().positive().optional(),
+  host: exports_external.object({
+    appPath: exports_external.string().min(1),
+    bundleId: exports_external.string().min(1).max(256),
+    teamId: exports_external.string().min(1).max(64),
+    listenerPid: exports_external.number().int().positive(),
+    endpoint: exports_external.string().url(),
+    browserVersion: exports_external.string().min(1).max(512),
+    browserInstanceId: exports_external.string().min(8).max(256)
+  }).strict().optional(),
+  runtimeExecutable: exports_external.string().min(1).optional(),
+  runtimeBundlePath: exports_external.string().min(1).optional(),
+  runtimeBundleSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
+  pool: exports_external.object({
+    size: exports_external.number().int().min(1).max(10),
+    startPort: exports_external.number().int().min(1024).max(65535),
+    rootSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).strict();
 var EnvelopeSchema = exports_external.object({
   version: exports_external.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
@@ -35588,6 +35966,15 @@ var EnvelopeSchema = exports_external.object({
   result: exports_external.unknown().optional(),
   error: exports_external.string().optional()
 }).strict();
+function sameCreateDestination(observed, requested) {
+  try {
+    const left = new URL(observed);
+    const right = new URL(requested);
+    return left.origin === right.origin && left.pathname.replace(/\/$/, "") === right.pathname.replace(/\/$/, "") && left.search === right.search && !left.hash && !right.hash;
+  } catch {
+    return false;
+  }
+}
 
 class ExternalCommandBrowserDriver {
   command;
@@ -35614,7 +36001,25 @@ class ExternalCommandBrowserDriver {
     return result;
   }
   async create(name, url2, signal) {
-    return SessionSchema.parse(await this.call("create", { name, url: url2 }, signal));
+    const raw = await this.call("create", { name, url: url2 }, signal);
+    const parsed = SessionSchema.safeParse(raw);
+    if (parsed.success)
+      return parsed.data;
+    const provisional = ProvisionalSessionSchema.safeParse(raw);
+    if (!provisional.success || provisional.data.name !== name || !sameCreateDestination(provisional.data.url, url2))
+      throw parsed.error;
+    try {
+      const rebound = ProvisionalSessionSchema.safeParse(await this.call("show", {
+        sessionId: provisional.data.sessionId
+      }));
+      if (!rebound.success || rebound.data.sessionId !== provisional.data.sessionId || rebound.data.pageId !== provisional.data.pageId || rebound.data.name !== name || !sameCreateDestination(rebound.data.url, url2)) {
+        throw new Error("Malformed create receipt did not rebind to the complete caller-owned destination tuple.");
+      }
+      await this.close(provisional.data.sessionId);
+    } catch (cleanupError) {
+      throw new Error(`Browser driver create receipt failed validation and cleanup was not proved for session ${provisional.data.sessionId}: ${errorMessage(cleanupError)}`, { cause: parsed.error });
+    }
+    throw parsed.error;
   }
   async show(sessionId, signal) {
     return SessionSchema.parse(await this.call("show", { sessionId }, signal));
@@ -35633,6 +36038,12 @@ class ExternalCommandBrowserDriver {
   }
   async discoverProjects(session, signal) {
     return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+  }
+  async findConversations(request, signal) {
+    return ConversationCatalogSchema.parse(await this.call("find_conversations", { ...request }, signal));
+  }
+  async readConversation(session, limit, signal) {
+    return ConversationTurnsSchema.parse(await this.call("read_conversation", { session, limit }, signal));
   }
   async manageConversation(session, action, signal) {
     return ConversationActionResultSchema.parse(await this.call("manage_conversation", { session, operation: action }, signal));
@@ -35689,7 +36100,7 @@ async function invokeJsonCommand(command, args, request, signal) {
       child = spawn(command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         signal,
-        env: sanitizedDriverEnv(process.env)
+        env: sanitizeBrowserDriverEnv(process.env)
       });
     } catch (error51) {
       reject(error51);
@@ -35726,29 +36137,19 @@ async function invokeJsonCommand(command, args, request, signal) {
         return reject(new Error("Browser driver response exceeded 16 MiB."));
       const output = Buffer.concat(stdout).toString("utf8").trim();
       if (code !== 0)
-        return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code}.`));
+        return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code} without a valid protocol envelope.`));
       if (output === "")
         return reject(new Error("Browser driver returned no JSON."));
       try {
         resolve3(JSON.parse(output));
       } catch {
-        reject(new Error(`Browser driver returned invalid JSON: ${output.slice(0, 400)}`));
+        const digest = createHash2("sha256").update(output, "utf8").digest("hex");
+        reject(new Error(`Browser driver returned invalid JSON (${Buffer.byteLength(output, "utf8")} bytes, sha256=${digest}).`));
       }
     }));
     child.stdin.end(`${request}
 `);
   });
-}
-function sanitizedDriverEnv(env) {
-  const safe = new Set(["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
-  const output = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined)
-      continue;
-    if (safe.has(key) || key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_"))
-      output[key] = value;
-  }
-  return output;
 }
 function offlineProbe(driver, reason) {
   return { ready: false, driver, secureInput: false, protocolVersion: BROWSER_DRIVER_PROTOCOL_VERSION, reason };
@@ -35939,6 +36340,8 @@ var ReceiptSchema = exports_external.object({
   providerConversationUrl: exports_external.string().optional(),
   providerRunId: exports_external.string().optional(),
   localBrowserSessionId: exports_external.string().optional(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional(),
   localAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   recoveryAttempts: exports_external.array(RecoverySchema).optional()
 });
@@ -35952,6 +36355,8 @@ var ConversationSchema = exports_external.object({
   browserSessionId: exports_external.string().optional(),
   browserSessionName: exports_external.string().optional(),
   browserPageId: exports_external.union([exports_external.string(), exports_external.number()]).optional(),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved").optional(),
   browserAssistantTurnCount: exports_external.number().int().nonnegative().optional(),
   providerPinned: exports_external.boolean().optional(),
   providerTitle: exports_external.string().optional(),
@@ -36018,7 +36423,10 @@ var RunSchema = exports_external.object({
     rateLimitEvents: exports_external.number().int().nonnegative().optional(),
     lastRateLimitAt: exports_external.string().optional(),
     providerCooldownUntil: exports_external.string().optional(),
-    providerConcurrencyLimit: exports_external.number().int().positive().max(10).optional()
+    providerConcurrencyLimit: exports_external.number().int().positive().max(10).optional(),
+    providerSafetyReason: exports_external.enum(["chatgpt_rate_limit", "suspicious_activity", "human_verification"]).optional(),
+    providerSafetyPausedAt: exports_external.string().optional(),
+    providerSafetyMessageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional()
   }).optional(),
   receipt: ReceiptSchema,
   error: exports_external.string().optional(),
@@ -36044,7 +36452,7 @@ var IdempotencyRecordSchema = exports_external.object({
   conversationId: exports_external.string().regex(CONVERSATION_ID_PATTERN),
   createdAt: exports_external.string()
 });
-var ProviderThrottleSchema = exports_external.object({
+var LegacyProviderThrottleSchema = exports_external.object({
   version: exports_external.literal(1),
   reason: exports_external.literal("chatgpt_rate_limit"),
   firstSeenAt: exports_external.string(),
@@ -36054,6 +36462,33 @@ var ProviderThrottleSchema = exports_external.object({
   activeLimit: exports_external.number().int().positive().max(10),
   recoverySuccesses: exports_external.number().int().nonnegative(),
   messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/)
+});
+var ProviderThrottleSchema = exports_external.object({
+  version: exports_external.literal(2),
+  reason: exports_external.enum(["chatgpt_rate_limit", "suspicious_activity", "human_verification"]),
+  firstSeenAt: exports_external.string(),
+  lastSeenAt: exports_external.string(),
+  nextRetryAt: exports_external.string(),
+  consecutiveEvents: exports_external.number().int().positive(),
+  activeLimit: exports_external.literal(1),
+  recoverySuccesses: exports_external.number().int().nonnegative(),
+  messageSha256: exports_external.string().regex(/^[a-f0-9]{64}$/),
+  manualResumeRequired: exports_external.literal(true)
+});
+var MaintenanceReceiptSchema = exports_external.object({
+  version: exports_external.literal(1),
+  id: exports_external.string().regex(/^maint_[a-f0-9]{32}$/),
+  kind: exports_external.enum(["model_catalog", "project_catalog"]),
+  browserDriverId: exports_external.string().min(1).max(128),
+  browserSessionId: exports_external.string().min(1).max(512),
+  browserPageId: exports_external.union([exports_external.string(), exports_external.number()]),
+  browserSessionName: exports_external.string().min(1).max(512),
+  browserUrl: exports_external.string().min(1).max(2048),
+  desktopPoolLane: exports_external.number().int().min(1).max(10).optional(),
+  desktopPoolLeaseState: exports_external.literal("release_unproved"),
+  status: exports_external.enum(["retained", "closed"]),
+  createdAt: exports_external.string(),
+  updatedAt: exports_external.string()
 });
 var TERMINAL = new Set(["completed", "failed", "cancelled", "needs_user"]);
 var TRANSITIONS = {
@@ -36170,6 +36605,11 @@ class RunStore {
   catalogPath(kind) {
     return confinedPath(this.root, "catalogs", `${kind}.json`);
   }
+  maintenancePath(id) {
+    if (!/^maint_[a-f0-9]{32}$/.test(id))
+      throw new Error("Invalid maintenance receipt id.");
+    return confinedPath(this.root, "maintenance", `${id}.json`);
+  }
   async init() {
     if (!this.legacyStateChecked) {
       await assertNoLegacySchemaV2State(this.root);
@@ -36182,8 +36622,18 @@ class RunStore {
       secureDirectory(confinedPath(this.root, "locks")),
       secureDirectory(confinedPath(this.root, "requests")),
       secureDirectory(confinedPath(this.root, "idempotency")),
-      secureDirectory(confinedPath(this.root, "catalogs"))
+      secureDirectory(confinedPath(this.root, "catalogs")),
+      secureDirectory(confinedPath(this.root, "maintenance"))
     ]);
+  }
+  async putMaintenanceReceipt(record3) {
+    await this.init();
+    MaintenanceReceiptSchema.parse(record3);
+    await atomicWrite(this.maintenancePath(record3.id), record3);
+  }
+  async getMaintenanceReceipt(id) {
+    await this.init();
+    return MaintenanceReceiptSchema.parse(JSON.parse(await safeRead(this.maintenancePath(id))));
   }
   async getCatalogCache(kind) {
     await this.init();
@@ -36458,7 +36908,17 @@ class RunStore {
   async getProviderThrottle() {
     await this.init();
     try {
-      return ProviderThrottleSchema.parse(JSON.parse(await safeRead(this.providerThrottlePath())));
+      const raw = JSON.parse(await safeRead(this.providerThrottlePath()));
+      const current = ProviderThrottleSchema.safeParse(raw);
+      if (current.success)
+        return current.data;
+      const legacy = LegacyProviderThrottleSchema.parse(raw);
+      return {
+        ...legacy,
+        version: 2,
+        activeLimit: 1,
+        manualResumeRequired: true
+      };
     } catch (error51) {
       if (isMissing(error51))
         return;
@@ -36466,24 +36926,31 @@ class RunStore {
     }
   }
   async noteProviderRateLimit(options) {
+    return this.noteProviderSafetyPause({
+      reason: "chatgpt_rate_limit",
+      message: options.message,
+      baseDelayMs: options.baseDelayMs,
+      maxDelayMs: options.maxDelayMs
+    });
+  }
+  async noteProviderSafetyPause(options) {
     return this.withNamedLock("provider-throttle", async () => {
       const current = await this.getProviderThrottle();
       const now = Date.now();
       const timestamp = new Date(now).toISOString();
       const consecutiveEvents = (current?.consecutiveEvents ?? 0) + 1;
       const delayMs = Math.min(options.maxDelayMs, options.baseDelayMs * 2 ** Math.min(consecutiveEvents - 1, 16));
-      const firstLimit = Math.max(1, Math.floor(options.maxConcurrentWorkers / 2));
-      const activeLimit = current ? Math.max(1, Math.min(options.maxConcurrentWorkers, current.activeLimit - 1)) : firstLimit;
       const next = {
-        version: 1,
-        reason: "chatgpt_rate_limit",
+        version: 2,
+        reason: options.reason,
         firstSeenAt: current?.firstSeenAt ?? timestamp,
         lastSeenAt: timestamp,
         nextRetryAt: new Date(now + delayMs).toISOString(),
         consecutiveEvents,
-        activeLimit,
+        activeLimit: 1,
         recoverySuccesses: 0,
-        messageSha256: createHash3("sha256").update(options.message, "utf8").digest("hex")
+        messageSha256: createHash3("sha256").update(options.message, "utf8").digest("hex"),
+        manualResumeRequired: true
       };
       ProviderThrottleSchema.parse(next);
       await atomicWrite(this.providerThrottlePath(), next);
@@ -36491,37 +36958,20 @@ class RunStore {
     }, { timeoutMs: 30000 });
   }
   async noteProviderSuccess(maxConcurrentWorkers) {
+    return this.getProviderThrottle();
+  }
+  async clearProviderSafetyPause() {
     return this.withNamedLock("provider-throttle", async () => {
       const current = await this.getProviderThrottle();
-      if (!current || Date.now() < Date.parse(current.nextRetryAt))
-        return current;
-      if (current.activeLimit >= maxConcurrentWorkers) {
-        try {
-          await unlink(this.providerThrottlePath());
-        } catch (error51) {
-          if (!isMissing(error51))
-            throw error51;
-        }
-        return;
+      if (!current)
+        return false;
+      try {
+        await unlink(this.providerThrottlePath());
+      } catch (error51) {
+        if (!isMissing(error51))
+          throw error51;
       }
-      const activeLimit = Math.min(maxConcurrentWorkers, current.activeLimit + 1);
-      if (activeLimit >= maxConcurrentWorkers) {
-        try {
-          await unlink(this.providerThrottlePath());
-        } catch (error51) {
-          if (!isMissing(error51))
-            throw error51;
-        }
-        return;
-      }
-      const next = {
-        ...current,
-        activeLimit,
-        recoverySuccesses: current.recoverySuccesses + 1
-      };
-      ProviderThrottleSchema.parse(next);
-      await atomicWrite(this.providerThrottlePath(), next);
-      return next;
+      return true;
     }, { timeoutMs: 30000 });
   }
   async withIdempotencyLock(key, work) {
@@ -36997,6 +37447,7 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
   }
   const rateLimitBaseDelayMs = boundedInteger(overrides.rateLimitBaseDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_BASE_DELAY_MS) ?? 30000, 1, 10 * 60000, "rateLimitBaseDelayMs");
   const rateLimitMaxDelayMs = boundedInteger(overrides.rateLimitMaxDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS) ?? 5 * 60000, rateLimitBaseDelayMs, 30 * 60000, "rateLimitMaxDelayMs");
+  const maxActiveGenerations = boundedInteger(overrides.maxActiveGenerations ?? overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_ACTIVE_GENERATIONS) ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 1, 1, 10, "maxActiveGenerations");
   const value = {
     workspaceRoot,
     storageRoot: storageRoot2,
@@ -37010,7 +37461,8 @@ function operatorPolicyFromEnv(env = process.env, overrides = {}) {
     maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
     maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
     maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-    maxConcurrentWorkers: boundedInteger(overrides.maxConcurrentWorkers ?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS) ?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS) ?? 6, 1, 10, "maxConcurrentWorkers"),
+    maxActiveGenerations,
+    maxConcurrentWorkers: maxActiveGenerations,
     rateLimitBaseDelayMs,
     rateLimitMaxDelayMs,
     allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
@@ -37073,7 +37525,7 @@ function policyFingerprint(value) {
     maxAttachmentFiles: value.maxAttachmentFiles ?? null,
     maxAttachmentBytes: value.maxAttachmentBytes ?? null,
     maxPromptBytes: value.maxPromptBytes,
-    maxConcurrentWorkers: value.maxConcurrentWorkers,
+    maxActiveGenerations: value.maxActiveGenerations,
     allowActiveDiagnostics: value.allowActiveDiagnostics
   };
   return createHash5("sha256").update(JSON.stringify(stable)).digest("hex");
@@ -37159,6 +37611,18 @@ class RestartSuspension extends Error {
   }
 }
 
+class RetainedCreatedSessionError extends Error {
+}
+
+class ProviderSafetyPauseError extends Error {
+  reason;
+  constructor(reason, message) {
+    super(message);
+    this.reason = reason;
+    this.name = "ProviderSafetyPauseError";
+  }
+}
+
 class FairSemaphore {
   limit;
   active = 0;
@@ -37218,7 +37682,7 @@ class GptControlService {
   activeRuns = new Map;
   activeStopReconciliations = new Map;
   cancellationIntents = new Set;
-  workerSlots;
+  providerSlots;
   constructor(exec, store = new RunStore, policy, dependencies = {}) {
     this.exec = exec;
     this.store = store;
@@ -37228,7 +37692,7 @@ class GptControlService {
       outputRoot: join5(store.root, "generated")
     });
     this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
-    this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
+    this.providerSlots = new FairSemaphore(this.policy.maxActiveGenerations);
   }
   async listModels(options = {}) {
     const before = parseModelCatalogCache(await this.store.getCatalogCache("models"));
@@ -37242,9 +37706,7 @@ class GptControlService {
       const route = selectRoute(capabilities, { transport: "browser" });
       assertTransportAllowed(this.policy, route.kind);
       const name = `gpt-control:catalog:${opaqueId("task")}`;
-      const session = await route.driver.create(name, CHATGPT_ORIGIN);
-      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-      try {
+      return this.withMaintenanceSession("model_catalog", route.driver, name, async (session, expected) => {
         const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
         const catalog = await route.driver.discoverModels(ready.session);
         const record3 = {
@@ -37256,11 +37718,7 @@ class GptControlService {
         };
         await this.store.putCatalogCache("models", record3);
         return modelCatalogResult(record3, "refreshed");
-      } finally {
-        await route.driver.close(session.sessionId).catch(() => {
-          return;
-        });
-      }
+      });
     }));
   }
   async listProjects(options = {}) {
@@ -37275,9 +37733,7 @@ class GptControlService {
       const route = selectRoute(capabilities, { transport: "browser" });
       assertTransportAllowed(this.policy, route.kind);
       const name = `gpt-control:projects:${opaqueId("task")}`;
-      const session = await route.driver.create(name, CHATGPT_ORIGIN);
-      const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
-      try {
+      return this.withMaintenanceSession("project_catalog", route.driver, name, async (session, expected) => {
         const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60000 });
         const catalog = await route.driver.discoverProjects(ready.session);
         const record3 = {
@@ -37289,12 +37745,84 @@ class GptControlService {
         };
         await this.store.putCatalogCache("projects", record3);
         return projectCatalogResult(record3, "refreshed");
-      } finally {
-        await route.driver.close(session.sessionId).catch(() => {
-          return;
-        });
-      }
+      });
     }));
+  }
+  async withMaintenanceSession(kind, driver, name, work) {
+    const session = await driver.create(name, CHATGPT_ORIGIN);
+    const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
+    let retainedHandled = false;
+    try {
+      await this.validateCreatedSession(driver, session, expected, async () => {
+        const timestamp = nowIso();
+        const receipt = {
+          version: 1,
+          id: `maint_${randomUUID5().replaceAll("-", "")}`,
+          kind,
+          browserDriverId: driver.id,
+          browserSessionId: session.sessionId,
+          browserPageId: session.pageId,
+          browserSessionName: session.name,
+          browserUrl: session.url,
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: "release_unproved",
+          status: "retained",
+          createdAt: timestamp,
+          updatedAt: timestamp
+        };
+        await this.store.putMaintenanceReceipt(receipt);
+        return {
+          label: receipt.id,
+          markClosed: async () => this.store.putMaintenanceReceipt({ ...receipt, status: "closed", updatedAt: nowIso() })
+        };
+      });
+      return await work(session, expected);
+    } catch (error51) {
+      if (error51 instanceof RetainedCreatedSessionError)
+        retainedHandled = true;
+      throw error51;
+    } finally {
+      if (!retainedHandled)
+        await driver.close(session.sessionId);
+    }
+  }
+  async validateCreatedSession(driver, session, expected, retain) {
+    if (session.desktopPoolLeaseState !== "release_unproved") {
+      if (session.name !== expected.name)
+        throw new Error("Browser driver returned a session with the wrong ownership name.");
+      await assertExactDriverSession(driver, expected);
+      return;
+    }
+    const durable = await retain();
+    const validationError = session.name !== expected.name ? " Browser driver returned a session with the wrong ownership name." : "";
+    try {
+      await driver.close(session.sessionId);
+      await durable.markClosed();
+    } catch (cleanupError) {
+      throw new RetainedCreatedSessionError(`Desktop session creation succeeded, but lifecycle-lock release and cleanup were not proved; durable ownership receipt ${durable.label} was retained.${validationError} Cleanup error: ${errorMessage2(cleanupError)}`);
+    }
+    throw new RetainedCreatedSessionError(`Desktop session creation succeeded, but lifecycle-lock release was not proved; cleanup was proved in durable ownership receipt ${durable.label}.${validationError}`);
+  }
+  async findConversations(request = {}) {
+    const query = request.query?.replace(/\s+/g, " ").trim();
+    if (query !== undefined && (query.length < 1 || query.length > 256)) {
+      throw new Error("Conversation query must be 1-256 characters.");
+    }
+    const limit = request.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50)
+      throw new Error("Conversation search limit must be 1-50.");
+    const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+    const route = selectRoute(capabilities, { transport: "browser" });
+    assertTransportAllowed(this.policy, route.kind);
+    if (!route.driver.findConversations) {
+      throw new Error(`Browser driver ${route.driver.id} does not support read-only ChatGPT conversation discovery.`);
+    }
+    return route.driver.findConversations({
+      ...query ? { query } : {},
+      ...request.pinned !== undefined ? { pinned: request.pinned } : {},
+      ...request.projectId ? { projectId: request.projectId } : {},
+      limit
+    });
   }
   async manageConversation(conversationId, action, mcpSessionId) {
     return this.store.withConversationOwnershipLock(conversationId, async () => {
@@ -37322,6 +37850,84 @@ class GptControlService {
         await this.store.updateConversation(conversationId, { providerProject: result.project });
       }
       return result;
+    });
+  }
+  async readConversation(conversationId, limit = 10, mcpSessionId) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+      throw new Error("Conversation read limit must be 1-20.");
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
+      const conversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
+      if (conversation.closedAt)
+        throw new Error(`Conversation ${conversationId} is closed.`);
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      const session = await assertExactDriverSession(driver, expected);
+      if (!driver.readConversation)
+        throw new Error(`Browser driver ${driver.id} does not support conversation reads.`);
+      return driver.readConversation(session, limit);
+    });
+  }
+  async findAndAttachConversation(request, mcpSessionId) {
+    const catalog = await this.findConversations(request);
+    if (catalog.conversations.length === 0)
+      throw new Error("No ChatGPT conversation matched the requested search.");
+    if (catalog.conversations.length !== 1) {
+      throw new Error(`ChatGPT conversation search is ambiguous; ${catalog.conversations.length} conversations matched. Narrow the title or filters before attachment.`);
+    }
+    const match = catalog.conversations[0];
+    let conversation = await this.attachConversation({ providerConversationId: match.providerConversationId }, mcpSessionId);
+    conversation = await this.store.updateConversation(conversation.id, {
+      providerTitle: match.title,
+      providerPinned: match.pinned,
+      ...match.projectId ? { providerProject: match.projectId } : {}
+    });
+    return { match, conversation };
+  }
+  async conversationStatus(conversationId, mcpSessionId) {
+    return this.store.withConversationOwnershipLock(conversationId, async () => {
+      const conversation = await this.store.getConversation(conversationId);
+      if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+        throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+      }
+      if (conversation.closedAt)
+        throw new Error(`Conversation ${conversationId} is closed.`);
+      const { driver, expected } = await this.resolveOwnedDriver(conversation);
+      const session = await assertExactDriverSession(driver, expected);
+      const observation = await driver.observe(session);
+      let metadata;
+      if (driver.findConversations && conversation.providerConversationId) {
+        const catalog = await driver.findConversations({
+          ...conversation.providerTitle ? { query: conversation.providerTitle } : {},
+          limit: 50
+        });
+        metadata = catalog.conversations.find((entry) => entry.providerConversationId === conversation.providerConversationId);
+      }
+      const latestRun = (await this.store.listRuns({ limit: null })).filter((run) => run.conversationId === conversationId).sort((left, right) => right.receipt.startedAt.localeCompare(left.receipt.startedAt))[0];
+      const state = observation.providerSafetyReason ? "needs_user" : observation.rateLimited ? "rate_limited" : observation.errorMessage ? "error" : observation.answering || observation.thinking || observation.toolRunning ? "generating" : observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
+      return {
+        conversationId,
+        providerConversationId: conversation.providerConversationId,
+        providerConversationUrl: conversation.providerConversationUrl,
+        title: metadata?.title ?? conversation.providerTitle,
+        pinned: metadata?.pinned ?? conversation.providerPinned,
+        project: conversation.providerProject,
+        projectId: metadata?.projectId,
+        state,
+        stateSummary: observation.stateSummary,
+        assistantTurnCount: observation.snapshot.count,
+        ...latestRun?.receipt.modelVerified === true && latestRun.receipt.modelEvidenceKind === "composer_selector" && latestRun.receipt.observedModel ? {
+          requestedModel: latestRun.receipt.requestedModel,
+          observedModel: latestRun.receipt.observedModel,
+          requestedEffort: latestRun.receipt.requestedEffort,
+          observedEffort: latestRun.receipt.observedEffort
+        } : {},
+        latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
+        visibleToolCards: observation.visibleToolCards,
+        rateLimitMessage: observation.rateLimitMessage,
+        errorMessage: observation.errorMessage
+      };
     });
   }
   async start(request, options = {}) {
@@ -37566,9 +38172,34 @@ class GptControlService {
       const expected = { sessionId: session.sessionId, pageId: session.pageId, name };
       let persisted = false;
       try {
-        if (session.name !== name)
-          throw new Error("Browser driver returned an attached session with the wrong ownership name.");
-        await assertExactDriverSession(route.driver, expected);
+        await this.validateCreatedSession(route.driver, session, expected, async () => {
+          const retained = {
+            version: STORAGE_VERSION,
+            id,
+            provider: "browser",
+            providerConversationId: identity.id,
+            providerConversationUrl: identity.url,
+            browserDriverId: route.driver.id,
+            browserSessionId: session.sessionId,
+            browserSessionName: session.name,
+            browserPageId: session.pageId,
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: "release_unproved",
+            workspaceRoot: this.policy.workspaceRoot,
+            policyFingerprint: this.policy.fingerprint,
+            mcpSessionId,
+            createdAt: timestamp,
+            updatedAt: timestamp
+          };
+          await this.store.putConversation(retained);
+          persisted = true;
+          return {
+            label: id,
+            markClosed: async () => {
+              await this.store.updateConversation(id, { closedAt: nowIso() });
+            }
+          };
+        });
         const conversation = {
           version: STORAGE_VERSION,
           id,
@@ -37579,6 +38210,7 @@ class GptControlService {
           browserSessionId: session.sessionId,
           browserSessionName: name,
           browserPageId: session.pageId,
+          desktopPoolLane: session.desktopPoolLane,
           workspaceRoot: this.policy.workspaceRoot,
           policyFingerprint: this.policy.fingerprint,
           mcpSessionId,
@@ -37596,6 +38228,8 @@ class GptControlService {
           browserAssistantTurnCount: ready.observation.snapshot.count
         });
       } catch (error51) {
+        if (error51 instanceof RetainedCreatedSessionError)
+          throw error51;
         try {
           await assertExactDriverSession(route.driver, expected);
           await route.driver.close(expected.sessionId);
@@ -37609,7 +38243,17 @@ class GptControlService {
     });
   }
   async diagnose() {
-    return { ...passiveTransportDiscovery(), policy: publicPolicy(this.policy) };
+    return {
+      ...passiveTransportDiscovery(),
+      policy: publicPolicy(this.policy),
+      providerSafety: await this.store.getProviderThrottle()
+    };
+  }
+  async resumeProviderSafety(confirmation) {
+    if (confirmation !== "RESUME CHATGPT") {
+      throw new Error("Provider safety resume requires the exact confirmation RESUME CHATGPT after a human reviews the account.");
+    }
+    return { resumed: await this.store.clearProviderSafetyPause() };
   }
   async activeSmokeTest() {
     if (!this.policy.allowActiveDiagnostics)
@@ -37881,10 +38525,8 @@ class GptControlService {
     const promise3 = (async () => {
       const run = await this.store.getRun(runId);
       const work = () => this.store.withConversationLock(run.conversationId, () => this.executeRun(runId, controller.signal, recovery), { timeoutMs: Math.max(30000, (run.timeoutMs ?? 600000) + 60000) });
-      if (run.kind !== "subagent")
-        return work();
-      const admitted = await this.waitForGlobalWorkerTurn(runId, controller.signal);
-      return admitted ? this.workerSlots.run(work, controller.signal) : this.store.getRun(runId);
+      const admitted = await this.waitForGlobalProviderTurn(runId, controller.signal);
+      return admitted ? this.providerSlots.run(work, controller.signal) : this.store.getRun(runId);
     })().catch(async (error51) => {
       if (this.cancellationIntents.has(runId))
         return this.persistCancellation(runId);
@@ -37917,30 +38559,29 @@ class GptControlService {
     });
     return promise3;
   }
-  async waitForGlobalWorkerTurn(runId, signal) {
+  async waitForGlobalProviderTurn(runId, signal) {
     for (;; ) {
       if (signal.aborted)
-        throw signal.reason ?? new Error("Worker admission was cancelled.");
+        throw signal.reason ?? new Error("Provider admission was cancelled.");
       const current = await this.store.getRun(runId);
       if (TERMINAL2.has(current.status))
         return false;
       const throttle = await this.store.getProviderThrottle();
-      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-        const deadline2 = Date.parse(current.deadlineAt ?? "");
-        if (Number.isFinite(deadline2) && cooldownUntil >= deadline2) {
-          await this.store.updateRun(runId, {
-            status: "needs_user",
-            completedAt: nowIso(),
-            error: "ChatGPT rate-limit cooldown extends beyond this GPT Worker's bounded deadline. The assignment was not sent."
-          });
-          return false;
-        }
-        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
-        continue;
+      if (throttle?.manualResumeRequired) {
+        await this.store.updateRun(runId, {
+          status: "needs_user",
+          completedAt: nowIso(),
+          error: `ChatGPT sends are paused for human review (${throttle.reason}). The assignment was not sent. After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+          diagnostics: {
+            ...current.diagnostics ?? {},
+            providerSafetyReason: throttle.reason,
+            providerSafetyPausedAt: throttle.lastSeenAt
+          }
+        });
+        return false;
       }
-      const effectiveLimit = Math.min(this.policy.maxConcurrentWorkers, throttle?.activeLimit ?? this.policy.maxConcurrentWorkers);
-      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.kind === "subagent" && (run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted"))).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      const effectiveLimit = this.policy.maxActiveGenerations;
+      const contenders = (await this.store.listRuns({ limit: null })).filter((run) => run.providerTurnPending === true || run.executionReady && (run.status === "queued" || run.status === "running") || run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled") && (run.submissionState === "submitting" || run.submissionState === "submitted")).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
       const position = contenders.findIndex((run) => run.id === runId);
       if (position >= 0 && position < effectiveLimit)
         return true;
@@ -37949,7 +38590,7 @@ class GptControlService {
         await this.store.updateRun(runId, {
           status: "needs_user",
           completedAt: nowIso(),
-          error: "The GPT Worker exceeded its bounded global admission deadline before a trusted concurrency slot became available."
+          error: "The GPT-Control run exceeded its bounded global admission deadline before a trusted provider slot became available."
         });
         return false;
       }
@@ -37964,37 +38605,36 @@ class GptControlService {
         throw new Error("ChatGPT remained rate limited until the GPT Worker deadline. The assignment was not sent again.");
       }
       const throttle = await this.store.getProviderThrottle();
-      const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-      if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-        await abortableSleep2(Math.min(250, cooldownUntil - Date.now()), signal);
-        continue;
+      if (throttle?.manualResumeRequired) {
+        throw new ProviderSafetyPauseError(throttle.reason, `ChatGPT sends remain paused for human review (${throttle.reason}).`);
       }
       const session = await assertExactDriverSession(driver, expected, signal);
       const observation = await driver.observe(session, signal);
+      if (observation.providerSafetyReason) {
+        run = await this.recordProviderSafety(run, observation.providerSafetyReason, observation.providerSafetyMessage ?? "ChatGPT requires human account review.");
+        throw new ProviderSafetyPauseError(observation.providerSafetyReason, "ChatGPT requires human account review. No prompt was sent.");
+      }
       if (observation.rateLimited) {
-        run = await this.handleProviderRateLimit(driver, session, run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.", signal);
-        continue;
+        run = await this.recordProviderRateLimit(run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+        throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
       }
       try {
         return { run, session, value: await action(session) };
       } catch (error51) {
+        if (error51 instanceof ChatGptProviderSafetyError) {
+          run = await this.recordProviderSafety(run, error51.reason, error51.notice);
+          throw new ProviderSafetyPauseError(error51.reason, "ChatGPT requires human account review. No prompt was sent.");
+        }
         if (!(error51 instanceof ChatGptRateLimitError))
           throw error51;
-        run = await this.handleProviderRateLimit(driver, session, run, error51.notice, signal);
+        run = await this.recordProviderRateLimit(run, error51.notice);
+        throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
       }
     }
   }
-  async handleProviderRateLimit(driver, session, run, message, signal) {
-    const updated = await this.recordProviderRateLimit(run, message);
-    if (!driver.dismissRateLimitNotice) {
-      throw new Error(`ChatGPT is temporarily rate limited and the active browser driver cannot dismiss its notice safely: ${message}`);
-    }
-    await driver.dismissRateLimitNotice(session, signal);
-    return updated;
-  }
   async recordProviderRateLimit(run, message) {
     const throttle = await this.store.noteProviderRateLimit({
-      maxConcurrentWorkers: this.policy.maxConcurrentWorkers,
+      maxConcurrentWorkers: this.policy.maxActiveGenerations,
       baseDelayMs: this.policy.rateLimitBaseDelayMs,
       maxDelayMs: this.policy.rateLimitMaxDelayMs,
       message
@@ -38010,6 +38650,23 @@ class GptControlService {
       }
     });
     return updated;
+  }
+  async recordProviderSafety(run, reason, message) {
+    const pause = await this.store.noteProviderSafetyPause({
+      reason,
+      baseDelayMs: this.policy.rateLimitBaseDelayMs,
+      maxDelayMs: this.policy.rateLimitMaxDelayMs,
+      message
+    });
+    const current = await this.store.getRun(run.id);
+    return this.store.updateRun(run.id, {
+      diagnostics: {
+        ...current.diagnostics ?? {},
+        providerSafetyReason: reason,
+        providerSafetyPausedAt: pause.lastSeenAt,
+        providerSafetyMessageSha256: pause.messageSha256
+      }
+    });
   }
   async executeRun(runId, signal, recovery) {
     let run = await this.store.getRun(runId);
@@ -38085,7 +38742,7 @@ class GptControlService {
           completedAt
         }
       });
-      await this.store.noteProviderSuccess(this.policy.maxConcurrentWorkers);
+      await this.store.noteProviderSuccess(this.policy.maxActiveGenerations);
       return run;
     } catch (error51) {
       resetCapabilityCache();
@@ -38111,6 +38768,31 @@ class GptControlService {
           });
         }
         return cancelled;
+      }
+      let providerSafetyError = error51 instanceof ProviderSafetyPauseError ? error51 : undefined;
+      if (error51 instanceof ChatGptProviderSafetyError) {
+        current = await this.recordProviderSafety(current, error51.reason, error51.notice);
+        providerSafetyError = new ProviderSafetyPauseError(error51.reason, "ChatGPT requires human account review. No prompt was sent.");
+      } else if (error51 instanceof ChatGptRateLimitError) {
+        current = await this.recordProviderRateLimit(current, error51.notice);
+        providerSafetyError = new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
+      }
+      if (providerSafetyError) {
+        const terminal2 = await this.store.updateRun(run.id, {
+          status: "needs_user",
+          error: `${providerSafetyError.message} After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+          completedAt: nowIso(),
+          diagnostics: {
+            ...current.diagnostics ?? {},
+            providerSafetyReason: providerSafetyError.reason
+          }
+        });
+        if (terminal2.submissionState === "not_submitted") {
+          await this.closeUnsubmittedOwnedConversation(terminal2.conversationId).catch(() => {
+            return;
+          });
+        }
+        return terminal2;
       }
       const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
       const terminal = await this.store.updateRun(run.id, {
@@ -38405,6 +39087,9 @@ class GptControlService {
       },
       onRateLimit: async (message) => {
         run = await this.recordProviderRateLimit(run, message);
+      },
+      onProviderSafety: async (reason, message) => {
+        run = await this.recordProviderSafety(run, reason, message);
       }
     });
     if (outcome.terminalStatus === "needs_user") {
@@ -38564,6 +39249,9 @@ class GptControlService {
       },
       onRateLimit: async (message) => {
         run = await this.recordProviderRateLimit(run, message);
+      },
+      onProviderSafety: async (reason, message) => {
+        run = await this.recordProviderSafety(run, reason, message);
       }
     });
     if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
@@ -38618,12 +39306,24 @@ class GptControlService {
       if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
         throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
       }
-      if (run.receipt.browserDriverId !== owned.driver.id || run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+      const lanes = [conversation.desktopPoolLane, run.receipt.desktopPoolLane, owned.session.desktopPoolLane].filter((lane) => lane !== undefined);
+      if (new Set(lanes).size > 1)
+        throw new Error("Desktop-pool lane identity conflicts across durable recovery receipts.");
+      const desktopPoolLane = lanes[0];
+      if (conversation.desktopPoolLane !== desktopPoolLane || conversation.desktopPoolLeaseState !== undefined) {
+        conversation = await this.store.updateConversation(conversation.id, {
+          desktopPoolLane,
+          desktopPoolLeaseState: undefined
+        });
+      }
+      if (run.receipt.browserDriverId !== owned.driver.id || run.receipt.localBrowserSessionId !== owned.expected.sessionId || run.receipt.desktopPoolLane !== desktopPoolLane || run.receipt.desktopPoolLeaseState !== undefined) {
         run = await this.store.updateRun(run.id, {
           receipt: {
             ...run.receipt,
             browserDriverId: owned.driver.id,
-            localBrowserSessionId: owned.expected.sessionId
+            localBrowserSessionId: owned.expected.sessionId,
+            desktopPoolLane,
+            desktopPoolLeaseState: undefined
           }
         });
       }
@@ -38659,19 +39359,45 @@ class GptControlService {
     };
     let persisted = false;
     try {
-      if (session.name !== name)
-        throw new Error("Browser driver returned a session with the wrong ownership name.");
-      await assertExactDriverSession(available.driver, expected, signal);
+      await this.validateCreatedSession(available.driver, session, expected, async () => {
+        conversation = await this.store.updateConversation(conversation.id, {
+          browserSessionId: session.sessionId,
+          browserSessionName: session.name,
+          browserPageId: session.pageId,
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: "release_unproved"
+        });
+        persisted = true;
+        run = await this.store.updateRun(run.id, {
+          receipt: {
+            ...run.receipt,
+            browserDriverId: available.driver.id,
+            localBrowserSessionId: session.sessionId,
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: "release_unproved"
+          }
+        });
+        return {
+          label: `${conversation.id}/${run.id}`,
+          markClosed: async () => {
+            await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
+          }
+        };
+      });
       conversation = await this.store.updateConversation(conversation.id, {
         browserSessionId: session.sessionId,
-        browserPageId: session.pageId
+        browserPageId: session.pageId,
+        desktopPoolLane: session.desktopPoolLane,
+        desktopPoolLeaseState: session.desktopPoolLeaseState
       });
       persisted = true;
       run = await this.store.updateRun(run.id, {
         receipt: {
           ...run.receipt,
           browserDriverId: available.driver.id,
-          localBrowserSessionId: session.sessionId
+          localBrowserSessionId: session.sessionId,
+          desktopPoolLane: session.desktopPoolLane,
+          desktopPoolLeaseState: session.desktopPoolLeaseState
         }
       });
       if (TERMINAL2.has(run.status)) {
@@ -38682,6 +39408,8 @@ class GptControlService {
       }
       return { conversation, run, driver: available.driver, expected };
     } catch (error51) {
+      if (error51 instanceof RetainedCreatedSessionError)
+        throw error51;
       if (!persisted) {
         try {
           if (session.name !== name)
@@ -38691,13 +39419,17 @@ class GptControlService {
         } catch (cleanupError) {
           conversation = await this.store.updateConversation(conversation.id, {
             browserSessionId: session.sessionId,
-            browserPageId: session.pageId
+            browserPageId: session.pageId,
+            desktopPoolLane: session.desktopPoolLane,
+            desktopPoolLeaseState: session.desktopPoolLeaseState
           });
           await this.store.updateRun(run.id, {
             receipt: {
               ...run.receipt,
               browserDriverId: available.driver.id,
-              localBrowserSessionId: session.sessionId
+              localBrowserSessionId: session.sessionId,
+              desktopPoolLane: session.desktopPoolLane,
+              desktopPoolLeaseState: session.desktopPoolLeaseState
             }
           });
           throw new Error(`${errorMessage2(error51)} Browser cleanup was not proved; durable ownership was retained: ${errorMessage2(cleanupError)}`);
@@ -38736,8 +39468,8 @@ class GptControlService {
       pageId: required2(conversation.browserPageId, "browser page id"),
       name: required2(conversation.browserSessionName, "browser session name")
     };
-    await assertExactDriverSession(available.driver, expected);
-    return { driver: available.driver, expected };
+    const session = await assertExactDriverSession(available.driver, expected);
+    return { driver: available.driver, expected, session };
   }
   async persistConversationIdentity(conversationId, identity, assistantTurnCount) {
     const canonical = providerConversationIdentity(identity.url);
@@ -38884,6 +39616,7 @@ class GptControlService {
       error: reason,
       completedAt: nowIso(),
       diagnostics: {
+        ...current.diagnostics ?? {},
         terminalReason: reason,
         recoveryAttempts: result?.recoveryAttempts,
         localAssistantTurnCount: result?.localAssistantTurnCount,
@@ -38891,15 +39624,15 @@ class GptControlService {
         lastObservedUiState: result?.lastObservedUiState
       },
       receipt: {
-        ...run.receipt,
-        observedModel: result?.observedModel ?? run.receipt.observedModel,
-        observedEffort: result?.observedEffort ?? run.receipt.observedEffort,
-        model: result?.observedModel ?? run.receipt.model,
-        modelVerified: result?.modelVerified ?? run.receipt.modelVerified ?? false,
-        modelEvidenceKind: result?.modelEvidenceKind ?? run.receipt.modelEvidenceKind,
-        modelVerifiedAt: result?.modelVerifiedAt ?? run.receipt.modelVerifiedAt,
-        providerConversationId: result?.providerConversationId ?? run.receipt.providerConversationId,
-        providerConversationUrl: result?.providerConversationUrl ?? run.receipt.providerConversationUrl,
+        ...current.receipt,
+        observedModel: result?.observedModel ?? current.receipt.observedModel,
+        observedEffort: result?.observedEffort ?? current.receipt.observedEffort,
+        model: result?.observedModel ?? current.receipt.model,
+        modelVerified: result?.modelVerified ?? current.receipt.modelVerified ?? false,
+        modelEvidenceKind: result?.modelEvidenceKind ?? current.receipt.modelEvidenceKind,
+        modelVerifiedAt: result?.modelVerifiedAt ?? current.receipt.modelVerifiedAt,
+        providerConversationId: result?.providerConversationId ?? current.receipt.providerConversationId,
+        providerConversationUrl: result?.providerConversationUrl ?? current.receipt.providerConversationUrl,
         localAssistantTurnCount: result?.localAssistantTurnCount,
         recoveryAttempts: result?.recoveryAttempts,
         completedAt: nowIso()
@@ -39096,6 +39829,7 @@ function publicPolicy(policy) {
     maxAttachmentFiles: policy.maxAttachmentFiles,
     maxAttachmentBytes: policy.maxAttachmentBytes,
     maxPromptBytes: policy.maxPromptBytes,
+    maxActiveGenerations: policy.maxActiveGenerations,
     maxConcurrentWorkers: policy.maxConcurrentWorkers,
     activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
     providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
@@ -39294,7 +40028,7 @@ function abortableSleep2(ms, signal) {
 
 // src/task_store.ts
 import { constants as constants4 } from "node:fs";
-import { createHash as createHash7, randomUUID as randomUUID5 } from "node:crypto";
+import { createHash as createHash7, randomUUID as randomUUID6 } from "node:crypto";
 import { lstat as lstat3, open as open4, readdir as readdir2, rename as rename2 } from "node:fs/promises";
 import { dirname as dirname4, resolve as resolve7 } from "node:path";
 var TERMINAL3 = new Set(["completed", "failed", "cancelled"]);
@@ -39826,7 +40560,7 @@ async function atomicWrite2(path, value, createOnly) {
   const current = await lstat3(path);
   if (current.isSymbolicLink() || !current.isFile())
     throw new Error(`Refused unsafe task destination: ${path}`);
-  const scratch = confinedPath(dirname4(path), `.${randomUUID5()}.tmp`);
+  const scratch = confinedPath(dirname4(path), `.${randomUUID6()}.tmp`);
   const handle = await open4(scratch, "wx", 384);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}
@@ -40208,6 +40942,68 @@ function registerCoreTools(server, service, taskStore) {
       localAssistantTurnCount: conversation.browserAssistantTurnCount
     });
   });
+  server.registerTool("gpt_conversation_find", {
+    description: "Search the authenticated ChatGPT Desktop sidebar without opening, sending, or changing a conversation. Returns exact provider conversation IDs for secure attachment.",
+    inputSchema: {
+      query: exports_external.string().min(1).max(256).optional(),
+      pinned: exports_external.boolean().optional(),
+      project_id: exports_external.string().min(1).max(256).optional(),
+      limit: exports_external.number().int().min(1).max(50).optional()
+    },
+    annotations: { readOnlyHint: true }
+  }, async (params) => {
+    const catalog = await service.findConversations({
+      query: params.query,
+      pinned: params.pinned,
+      projectId: params.project_id,
+      limit: params.limit
+    });
+    return toolPayload(`${catalog.conversations.length} ChatGPT conversation${catalog.conversations.length === 1 ? "" : "s"} matched.`, catalog);
+  });
+  server.registerTool("gpt_conversation_find_and_attach", {
+    description: "Search the authenticated ChatGPT Desktop sidebar, require exactly one match, and securely attach that exact conversation in a GPT-Control-owned background session.",
+    inputSchema: {
+      query: exports_external.string().min(1).max(256),
+      pinned: exports_external.boolean().optional(),
+      project_id: exports_external.string().min(1).max(256).optional()
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params, extra) => {
+    const { match, conversation } = await service.findAndAttachConversation({
+      query: params.query,
+      pinned: params.pinned,
+      projectId: params.project_id,
+      limit: 2
+    }, extra.sessionId);
+    return toolPayload(`Found and attached ${match.title}.`, {
+      match,
+      conversationId: conversation.id,
+      providerConversationId: conversation.providerConversationId,
+      providerConversationUrl: conversation.providerConversationUrl
+    });
+  });
+  server.registerTool("gpt_conversation_read", {
+    description: "Read the bounded newest visible user and assistant turns from one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+    inputSchema: {
+      conversation_id: exports_external.string(),
+      limit: exports_external.number().int().min(1).max(20).optional()
+    },
+    annotations: { readOnlyHint: true }
+  }, async (params, extra) => {
+    const turns = await service.readConversation(params.conversation_id, params.limit ?? 10, extra.sessionId);
+    return toolPayload(`${turns.length} visible ChatGPT turn${turns.length === 1 ? "" : "s"}.`, {
+      conversationId: params.conversation_id,
+      turns
+    });
+  });
+  server.registerTool("gpt_conversation_status", {
+    description: "Report passive live state and durable model receipts for one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+    inputSchema: { conversation_id: exports_external.string() },
+    annotations: { readOnlyHint: true }
+  }, async (params, extra) => {
+    const status = await service.conversationStatus(params.conversation_id, extra.sessionId);
+    return toolPayload(`ChatGPT conversation ${params.conversation_id} is ${status.state}.`, status);
+  });
   server.registerTool("gpt_conversation_close", {
     description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
     inputSchema: { conversation_id: exports_external.string() },
@@ -40237,6 +41033,11 @@ function registerCoreTools(server, service, taskStore) {
       ...result
     });
   });
+  server.registerTool("gpt_provider_resume", {
+    description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+    inputSchema: { confirmation: exports_external.literal("RESUME CHATGPT") },
+    annotations: { readOnlyHint: false, destructiveHint: false }
+  }, async (params) => toolPayload("GPT-Control provider safety state updated.", await service.resumeProviderSafety(params.confirmation)));
   server.registerTool("gpt_diagnose", {
     description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
     inputSchema: {},
@@ -40376,7 +41177,7 @@ async function prepareBackgroundWorker(service, taskStore, monitors, activationT
       method: "tools/call",
       params: { name: toolName, arguments: params }
     };
-    task = await taskStore.createTask({ ttl: null, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS }, randomUUID6(), request, sessionId);
+    task = await taskStore.createTask({ ttl: null, pollInterval: SUBAGENT_TASK_POLL_INTERVAL_MS }, randomUUID7(), request, sessionId);
     await taskStore.bindRun(task.taskId, run.id);
     callbackBound = await codexCallback?.register(task.taskId, params.callback_thread_id) ?? false;
     await taskStore.updateTaskStatus(task.taskId, "working", `GPT Worker ${run.id} is prepared for background activation.`);

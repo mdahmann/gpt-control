@@ -379,6 +379,72 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		});
 	});
 
+	server.registerTool("gpt_conversation_find", {
+		description: "Search the authenticated ChatGPT Desktop sidebar without opening, sending, or changing a conversation. Returns exact provider conversation IDs for secure attachment.",
+		inputSchema: {
+			query: z.string().min(1).max(256).optional(),
+			pinned: z.boolean().optional(),
+			project_id: z.string().min(1).max(256).optional(),
+			limit: z.number().int().min(1).max(50).optional(),
+		},
+		annotations: { readOnlyHint: true },
+	}, async (params) => {
+		const catalog = await service.findConversations({
+			query: params.query,
+			pinned: params.pinned,
+			projectId: params.project_id,
+			limit: params.limit,
+		});
+		return toolPayload(`${catalog.conversations.length} ChatGPT conversation${catalog.conversations.length === 1 ? "" : "s"} matched.`, catalog);
+	});
+
+	server.registerTool("gpt_conversation_find_and_attach", {
+		description: "Search the authenticated ChatGPT Desktop sidebar, require exactly one match, and securely attach that exact conversation in a GPT-Control-owned background session.",
+		inputSchema: {
+			query: z.string().min(1).max(256),
+			pinned: z.boolean().optional(),
+			project_id: z.string().min(1).max(256).optional(),
+		},
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params, extra) => {
+		const { match, conversation } = await service.findAndAttachConversation({
+			query: params.query,
+			pinned: params.pinned,
+			projectId: params.project_id,
+			limit: 2,
+		}, extra.sessionId);
+		return toolPayload(`Found and attached ${match.title}.`, {
+			match,
+			conversationId: conversation.id,
+			providerConversationId: conversation.providerConversationId,
+			providerConversationUrl: conversation.providerConversationUrl,
+		});
+	});
+
+	server.registerTool("gpt_conversation_read", {
+		description: "Read the bounded newest visible user and assistant turns from one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		inputSchema: {
+			conversation_id: z.string(),
+			limit: z.number().int().min(1).max(20).optional(),
+		},
+		annotations: { readOnlyHint: true },
+	}, async (params, extra) => {
+		const turns = await service.readConversation(params.conversation_id, params.limit ?? 10, extra.sessionId);
+		return toolPayload(`${turns.length} visible ChatGPT turn${turns.length === 1 ? "" : "s"}.`, {
+			conversationId: params.conversation_id,
+			turns,
+		});
+	});
+
+	server.registerTool("gpt_conversation_status", {
+		description: "Report passive live state and durable model receipts for one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		inputSchema: { conversation_id: z.string() },
+		annotations: { readOnlyHint: true },
+	}, async (params, extra) => {
+		const status = await service.conversationStatus(params.conversation_id, extra.sessionId);
+		return toolPayload(`ChatGPT conversation ${params.conversation_id} is ${status.state}.`, status);
+	});
+
 	server.registerTool("gpt_conversation_close", {
 		description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
 		inputSchema: { conversation_id: z.string() },
@@ -413,6 +479,12 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 			...result,
 		});
 	});
+
+	server.registerTool("gpt_provider_resume", {
+		description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+		inputSchema: { confirmation: z.literal("RESUME CHATGPT") },
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params) => toolPayload("GPT-Control provider safety state updated.", await service.resumeProviderSafety(params.confirmation)));
 
 	server.registerTool("gpt_diagnose", {
 		description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",

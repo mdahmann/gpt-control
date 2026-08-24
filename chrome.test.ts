@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +9,10 @@ import {
 	captureOwnedScreenshot,
 	clickSend,
 	createSession,
+	discoverChatGptModels,
+	discoverChatGptProjects,
 	extractChatPageObservation,
+	extractConversationTurns,
 	extractComposerModel,
 	fillPrompt,
 	openChat,
@@ -21,6 +24,7 @@ import {
 	waitForOwnedChatReady,
 } from "./src/chatgpt";
 import { FakeChromeBridge, makeChromeService } from "./test_helpers";
+import { GptControlService } from "./src/service";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -45,7 +49,7 @@ async function readyFake(options: ConstructorParameters<typeof FakeChromeBridge>
 }
 
 describe("observed Chrome failures", () => {
-	test("dismisses a visible ChatGPT rate-limit notice, cools down, and submits exactly once", async () => {
+	test("persists a visible ChatGPT rate limit and never dismisses or retries it", async () => {
 		const bridge = new FakeChromeBridge({
 			rateLimitNotice: true,
 			currentEffortPicker: true,
@@ -54,7 +58,7 @@ describe("observed Chrome failures", () => {
 			availableModels: ["GPT-5.6 Sol"],
 			availableEfforts: ["High", "Pro"],
 		});
-		const { service } = makeChromeService(scratch(), scratch(), bridge, {
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge, {
 			rateLimitBaseDelayMs: 1,
 			rateLimitMaxDelayMs: 4,
 		});
@@ -65,10 +69,33 @@ describe("observed Chrome failures", () => {
 			chatgptEffort: "Pro",
 			timeoutMs: 1000,
 		});
-		expect(result.run.status).toBe("completed");
-		expect(bridge.dismissedRateLimits).toHaveLength(1);
-		expect(bridge.submittedPrompts).toEqual(["recover after rate limit"]);
+		expect(result.run.status).toBe("needs_user");
+		expect(bridge.dismissedRateLimits).toEqual([]);
+		expect(bridge.submittedPrompts).toEqual([]);
 		expect(result.run.diagnostics).toMatchObject({ rateLimitEvents: 1 });
+		expect(await store.getProviderThrottle()).toMatchObject({
+			reason: "chatgpt_rate_limit",
+			manualResumeRequired: true,
+		});
+	});
+
+	test("pauses all sends when ChatGPT reports suspicious account activity", async () => {
+		const bridge = new FakeChromeBridge({ providerSafetyNotice: "suspicious_activity", composerAbsent: true });
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "chat", prompt: "do not send", timeoutMs: 1000 });
+		expect(result.run.status).toBe("needs_user");
+		expect(bridge.submittedPrompts).toEqual([]);
+		expect(await store.getProviderThrottle()).toMatchObject({
+			reason: "suspicious_activity",
+			manualResumeRequired: true,
+		});
+	});
+
+	test("classifies a visible human-verification challenge without scanning conversation text", () => {
+		const challenge = extractChatPageObservation('<main><div role="dialog" data-testid="captcha-challenge">Verify that you are human to continue.</div></main>');
+		expect(challenge.providerSafetyReason).toBe("human_verification");
+		const quoted = extractChatPageObservation('<main><div data-message-author-role="assistant"><p>Do not claim suspicious activity without evidence.</p></div></main>');
+		expect(quoted.providerSafetyReason).toBeUndefined();
 	});
 
 	test("waits through the chrome://newtab first-tab race before any origin-gated action", async () => {
@@ -174,6 +201,28 @@ describe("observed Chrome failures", () => {
 });
 
 describe("truthful composer model provenance", () => {
+	test("discovers the native desktop picker and project action labels", async () => {
+		const { bridge, tabId } = await readyFake({
+			currentEffortPicker: true,
+			desktopPickerMarkup: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+			availableProjects: ["Projects", "Sequence"],
+		});
+		const catalog = await discoverChatGptModels(bridge.exec, bridge.launcher, tabId, undefined, 200);
+		expect(catalog).toMatchObject({
+			currentModel: "GPT-5.6 Sol",
+			currentEffort: "Pro",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.5" }],
+			efforts: [{ label: "Instant" }, { label: "Medium" }, { label: "High" }, { label: "Extra High" }, { label: "Pro" }],
+		});
+		expect(await discoverChatGptProjects(bridge.exec, bridge.launcher, tabId, undefined, 200)).toMatchObject({
+			projects: [{ name: "Projects" }, { name: "Sequence" }],
+		});
+	});
+
 	test("discovers the live underlying models and effort levels without sending", async () => {
 		const bridge = new FakeChromeBridge({
 			currentEffortPicker: true,
@@ -544,6 +593,71 @@ describe("ChatGPT organization controls", () => {
 		expect(bridgeB.activeTabs()).toEqual([]);
 	});
 
+	test("journals release-unproved maintenance and attach sessions before show or failed close", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const base = makeChromeService(root, workspace, bridge);
+			const underlying = bridge.capabilities().browser!.driver;
+			let showCalls = 0;
+			let closeCalls = 0;
+			let returnWrongName = false;
+			const driver = new Proxy(underlying, {
+				get(target, property) {
+					if (property === "create") return async (...args: Parameters<typeof underlying.create>) => {
+						const created = await underlying.create(...args);
+						return {
+							...created,
+							...(returnWrongName ? { name: "foreign-session-name" } : {}),
+							desktopPoolLane: 2,
+							desktopPoolLeaseState: "release_unproved" as const,
+						};
+					};
+				if (property === "show") return async () => { showCalls += 1; throw new Error("show must not run"); };
+				if (property === "close") return async () => { closeCalls += 1; throw new Error("close blocked by retained lifecycle lease"); };
+				const value = Reflect.get(target, property);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const service = new GptControlService(bridge.exec, base.store, base.service.policy, {
+			resolveCapabilities: async () => ({
+				browser: { driver, probe: { ready: true, driver: driver.id, secureInput: true, protocolVersion: 2 }, source: "test" },
+			}),
+		});
+
+		await expect(service.listModels({ refresh: true })).rejects.toThrow("durable ownership receipt maint_");
+		expect(showCalls).toBe(0);
+		expect(closeCalls).toBe(1);
+		const maintenanceFiles = readdirSync(join(root, "maintenance"));
+		expect(maintenanceFiles).toHaveLength(1);
+		expect(JSON.parse(readFileSync(join(root, "maintenance", maintenanceFiles[0]), "utf8"))).toMatchObject({
+			kind: "model_catalog",
+			browserSessionName: expect.stringContaining("gpt-control:catalog:"),
+			desktopPoolLane: 2,
+			desktopPoolLeaseState: "release_unproved",
+			status: "retained",
+		});
+
+		await expect(service.attachConversation({ providerConversationId: "attach-chat-123" })).rejects.toThrow("durable ownership receipt conv_");
+		expect(showCalls).toBe(0);
+		expect(closeCalls).toBe(2);
+			const attached = (await base.store.listConversations()).find((conversation) => conversation.providerConversationId === "attach-chat-123");
+			expect(attached).toMatchObject({ desktopPoolLane: 2, desktopPoolLeaseState: "release_unproved" });
+
+			returnWrongName = true;
+			await expect(service.listProjects({ refresh: true })).rejects.toThrow("wrong ownership name");
+			expect(showCalls).toBe(0);
+			expect(closeCalls).toBe(3);
+			const retainedWrongName = readdirSync(join(root, "maintenance"))
+				.map((file) => JSON.parse(readFileSync(join(root, "maintenance", file), "utf8")))
+				.find((receipt) => receipt.kind === "project_catalog");
+			expect(retainedWrongName).toMatchObject({
+				browserSessionName: "foreign-session-name",
+				desktopPoolLeaseState: "release_unproved",
+				status: "retained",
+			});
+		});
+
 	test("pins, renames, moves, and archives one exact owned conversation with read-back", async () => {
 		const bridge = new FakeChromeBridge({ availableProjects: ["Zenbox", "Sequence"] });
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -554,6 +668,62 @@ describe("ChatGPT organization controls", () => {
 		expect(await service.manageConversation(conversationId, { action: "move", project: "Zenbox" })).toMatchObject({ project: "Zenbox" });
 		expect(await service.manageConversation(conversationId, { action: "archive" })).toMatchObject({ archived: true });
 		expect((await service.store.getConversation(conversationId)).closedAt).toBeDefined();
+	});
+
+	test("proves native project membership, removes the chat from its project, and then archives it", async () => {
+		const bridge = new FakeChromeBridge({
+			availableProjects: ["Zenbox", "Sequence"],
+			desktopOrganizationMarkup: true,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({ kind: "chat", prompt: "native organization target", timeoutMs: 1000 });
+		const conversationId = started.conversation.id;
+		expect(await service.manageConversation(conversationId, { action: "move", project: "Zenbox" })).toMatchObject({ project: "Zenbox" });
+		expect(await service.manageConversation(conversationId, { action: "archive" })).toMatchObject({ archived: true });
+		expect((await service.store.getConversation(conversationId)).closedAt).toBeDefined();
+	});
+
+	test("reports passive exact-conversation status without sending another prompt", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "High",
+			availableModels: ["GPT-5.6 Sol"],
+			availableEfforts: ["High"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const started = await service.start({
+			kind: "chat",
+			prompt: "status target",
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "High",
+			timeoutMs: 1000,
+		});
+		const status = await service.conversationStatus(started.conversation.id);
+		expect(status).toMatchObject({
+			conversationId: started.conversation.id,
+			providerConversationUrl: started.run.receipt.providerConversationUrl,
+			state: "idle",
+			assistantTurnCount: 1,
+			requestedModel: "GPT-5.6 Sol",
+			observedModel: "GPT-5.6 Sol",
+			requestedEffort: "High",
+			observedEffort: "High",
+		});
+		expect(bridge.submittedPrompts).toEqual(["status target"]);
+		await service.start({
+			kind: "chat",
+			prompt: "queued status target",
+			conversationId: started.conversation.id,
+			chatgptModel: "GPT-5.6 Sol",
+			chatgptEffort: "High",
+			wait: false,
+		}, { deferExecution: true });
+		const unverified = await service.conversationStatus(started.conversation.id);
+		expect(unverified.requestedModel).toBeUndefined();
+		expect(unverified.observedModel).toBeUndefined();
+		expect(unverified.requestedEffort).toBeUndefined();
+		expect(unverified.observedEffort).toBeUndefined();
 	});
 });
 
@@ -645,6 +815,51 @@ describe("honest terminal state and owned-tab boundaries", () => {
 	test("does not treat unrelated Stop recording controls as generation", () => {
 		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>complete answer</p></div></div><button aria-label="Stop recording">Voice</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation.answering).toBe(false);
+	});
+
+	test("observes native ChatGPT Desktop user and assistant turns", () => {
+		const observation = extractChatPageObservation(`<main>
+			<div data-content-search-unit-key="fallback-turn-0:0:user">
+				<div data-user-message-bubble="true"><div class="text-size-chat whitespace-pre-wrap"><div class="_MarkdownRoot_native"><p>desktop question</p></div></div></div>
+			</div>
+			<div data-content-search-unit-key="fallback-turn-0:2:assistant">
+				<span>ChatGPT said:</span><div class="_MarkdownRoot_native"><p>desktop answer</p></div>
+			</div>
+			<div contenteditable="true" aria-label="Message ChatGPT"></div>
+		</main>`);
+		expect(observation.snapshot).toMatchObject({ count: 1, text: "desktop answer", hasMarkdown: true });
+		expect(observation.latestUserPromptSha256).toBe(createHash("sha256").update("desktop question").digest("hex"));
+		expect(observation.composerReady).toBe(true);
+	});
+
+	test("reads only the bounded newest visible turns from an attached desktop conversation", () => {
+		const turns = extractConversationTurns(`<main>
+			<div data-content-search-unit-key="fallback-turn-0:0:user"><div data-user-message-bubble="true"><div class="_MarkdownRoot_native"><p>first question</p></div></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:1:assistant"><div class="_MarkdownRoot_native"><p>first answer</p></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:2:user"><div data-user-message-bubble="true"><div class="_MarkdownRoot_native"><p>second question</p></div></div></div>
+			<div data-content-search-unit-key="fallback-turn-0:3:assistant"><div class="_MarkdownRoot_native"><p>second answer</p></div></div>
+		</main>`, 2);
+		expect(turns).toEqual([
+			{ role: "user", text: "second question", messageId: "fallback-turn-0:2:user" },
+			{ role: "assistant", text: "second answer", messageId: "fallback-turn-0:3:assistant" },
+		]);
+	});
+
+	test("uses the native ChatGPT Desktop Send control", async () => {
+		const attempts: string[] = [];
+		const exec = async (_command: string, args: string[]) => {
+			const selector = args[2] ?? "";
+			attempts.push(selector);
+			const success = selector === 'button[aria-label="Send"]';
+			return {
+				stdout: JSON.stringify(success ? { success: true, result: {} } : { success: false, error: `No element found: ${selector}` }),
+				stderr: success ? "" : `No element found: ${selector}`,
+				code: success ? 0 : 1,
+				killed: false,
+			};
+		};
+		await clickSend(exec, { command: "desktop-test", args: [], origin: "desktop test" }, 1);
+		expect(attempts.at(-1)).toBe('button[aria-label="Send"]');
 	});
 
 	test("hashes bounded browser-visible tool cards without treating them as trusted output", () => {

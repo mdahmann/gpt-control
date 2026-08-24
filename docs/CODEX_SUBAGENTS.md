@@ -80,15 +80,18 @@ claiming that automatic wake-up is available. This release uses the local
 
 ## GPT Worker concurrency
 
-- The default GPT Worker ceiling is six. The operator can set
-  `GPT_CONTROL_MAX_WORKERS` from 1 through 10. Ten is the hard ceiling. The old
-  `GPT_CONTROL_MAX_PRO_WORKERS` name remains a compatibility alias.
+- One batch can prepare up to ten GPT Workers. The default active ChatGPT
+  generation limit is one across GPT Chat, GPT Worker, and GPT Sub-agent runs.
+  The operator can set `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` from 1 through 10.
+  `GPT_CONTROL_MAX_WORKERS` and `GPT_CONTROL_MAX_PRO_WORKERS` remain compatibility
+  aliases.
 - Each worker receives a new owned browser session and ChatGPT conversation.
 - A durable global ordering prevents separate broker processes from exceeding
   the configured ceiling.
-- A visible ChatGPT rate-limit notice creates one shared durable cooldown and
-  lowers admission for new Workers. Successful work restores one slot at a
-  time, up to the configured ceiling.
+- A visible ChatGPT rate limit, suspicious-activity notice, or human-verification
+  challenge creates one durable global safety pause. GPT-Control does not
+  dismiss or retry it. A human must review the account and explicitly call
+  `gpt_provider_resume` with `RESUME CHATGPT` before any new send can start.
 - A submitted turn keeps its slot until completion or a proved inactive Stop;
   timeout alone does not release live provider capacity.
 - Work above the configured ceiling remains queued fairly until a slot opens or

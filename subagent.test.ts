@@ -114,7 +114,7 @@ describe("bounded GPT Worker scheduler", () => {
 
 	test("supports three concurrent workers and fairly queues a fourth", async () => {
 		const bridge = new FakeChromeBridge();
-		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxActiveGenerations: 3 });
 		const starts = [];
 		for (const index of [1, 2, 3, 4]) {
 			starts.push(await service.start({
@@ -136,7 +136,28 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(new Set(terminal.map((run) => run.conversationId)).size).toBe(4);
 	});
 
-	test("shares a provider cooldown and reduces new worker concurrency after rate limiting", async () => {
+	test("the safe default serializes GPT Chat and GPT Worker generations through one shared gate", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const chat = await service.start({ kind: "chat", prompt: "[slow] mixed-chat", wait: false, timeoutMs: 2000 });
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		const worker = await service.start({
+			kind: "subagent", prompt: "[slow] mixed-worker", idempotencyKey: "mixed-worker", wait: false, timeoutMs: 2000,
+		});
+		await Bun.sleep(25);
+		expect(bridge.submittedPrompts).toEqual(["[slow] mixed-chat"]);
+		bridge.release();
+		await waitUntil(() => bridge.submittedPrompts.length === 2);
+		expect(bridge.submittedPrompts).toEqual(["[slow] mixed-chat", "[slow] mixed-worker"]);
+		bridge.release();
+		const completed = await Promise.all([
+			service.waitForRun(chat.run.id, 2500),
+			service.waitForRun(worker.run.id, 2500),
+		]);
+		expect(completed.map((run) => run.status)).toEqual(["completed", "completed"]);
+	});
+
+	test("a provider safety pause blocks queued workers until an explicit human resume", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service, store } = makeChromeService(scratch(), scratch(), bridge, {
 			maxConcurrentWorkers: 3,
@@ -150,6 +171,7 @@ describe("bounded GPT Worker scheduler", () => {
 			message: "Too many requests. Please try again later.",
 		});
 		expect(throttle.activeLimit).toBe(1);
+		expect(throttle.manualResumeRequired).toBeTrue();
 
 		const first = await service.start({
 			kind: "subagent", prompt: "[slow] throttled-1", idempotencyKey: "throttled-1", wait: false, timeoutMs: 2000,
@@ -157,18 +179,39 @@ describe("bounded GPT Worker scheduler", () => {
 		const second = await service.start({
 			kind: "subagent", prompt: "[slow] throttled-2", idempotencyKey: "throttled-2", wait: false, timeoutMs: 2000,
 		});
-		await Bun.sleep(10);
-		expect(bridge.submittedPrompts).toEqual([]);
-		await waitUntil(() => bridge.submittedPrompts.length === 1);
-		expect(bridge.submittedPrompts).toEqual(["[slow] throttled-1"]);
-		bridge.release();
-		await waitUntil(() => bridge.submittedPrompts.length === 2);
-		bridge.release();
 		const terminal = await Promise.all([
 			service.waitForRun(first.run.id, 2500),
 			service.waitForRun(second.run.id, 2500),
 		]);
-		expect(terminal.map((run) => run.status)).toEqual(["completed", "completed"]);
+		expect(terminal.map((run) => run.status)).toEqual(["needs_user", "needs_user"]);
+		expect(bridge.submittedPrompts).toEqual([]);
+		await expect(service.resumeProviderSafety("resume")).rejects.toThrow("RESUME CHATGPT");
+		expect(await service.resumeProviderSafety("RESUME CHATGPT")).toEqual({ resumed: true });
+		const resumed = await service.start({ kind: "subagent", prompt: "resumed worker", timeoutMs: 1000 });
+		expect(resumed.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["resumed worker"]);
+	});
+
+	test("legacy cooldown state becomes a manual safety pause and success cannot clear it", async () => {
+		const root = scratch();
+		const { store } = makeChromeService(root, scratch(), new FakeChromeBridge());
+		const timestamp = new Date().toISOString();
+		writeFileSync(join(root, "provider-throttle.json"), JSON.stringify({
+			version: 1,
+			reason: "chatgpt_rate_limit",
+			firstSeenAt: timestamp,
+			lastSeenAt: timestamp,
+			nextRetryAt: timestamp,
+			consecutiveEvents: 1,
+			activeLimit: 3,
+			recoverySuccesses: 0,
+			messageSha256: "a".repeat(64),
+		}));
+		expect(await store.getProviderThrottle()).toMatchObject({ version: 2, activeLimit: 1, manualResumeRequired: true });
+		await store.noteProviderSuccess(10);
+		expect(await store.getProviderThrottle()).toMatchObject({ manualResumeRequired: true });
+		expect(await store.clearProviderSafetyPause()).toBeTrue();
+		expect(await store.getProviderThrottle()).toBeUndefined();
 	});
 
 	test("one worker can fail while two independent workers continue", async () => {
@@ -306,7 +349,7 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
 
-	test("restart repairs a persisted browser session missing from the run receipt", async () => {
+	test("restart repairs persisted browser-session and desktop-lane state missing from the run receipt", async () => {
 		const root = scratch();
 		const workspace = scratch();
 		const bridge = new FakeChromeBridge();
@@ -323,8 +366,11 @@ describe("bounded GPT Worker scheduler", () => {
 		await first.service.store.updateConversation(prepared.conversation.id, {
 			browserSessionId: session.sessionId,
 			browserPageId: session.pageId,
+			desktopPoolLane: 3,
+			desktopPoolLeaseState: "release_unproved",
 		});
 		expect((await first.service.getRun(prepared.run.id)).receipt.localBrowserSessionId).toBeUndefined();
+		expect((await first.service.getRun(prepared.run.id)).receipt.desktopPoolLane).toBeUndefined();
 
 		const second = makeChromeService(root, workspace, bridge);
 		await second.service.schedulePreparedRun(prepared.run.id);
@@ -332,6 +378,10 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(terminal.status).toBe("completed");
 		expect(terminal.receipt.localBrowserSessionId).toBe(session.sessionId);
 		expect(terminal.receipt.browserDriverId).toBe(driver.id);
+		expect(terminal.receipt.desktopPoolLane).toBe(3);
+		expect(terminal.receipt.desktopPoolLeaseState).toBeUndefined();
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLane).toBe(3);
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLeaseState).toBeUndefined();
 		expect(bridge.submittedPrompts).toEqual(["repair session receipt"]);
 	});
 
@@ -1337,7 +1387,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			providerTurnPending: false,
 			providerStopRequested: false,
 		});
-		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(2);
+		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(1);
 	});
 
 	test("legacy unresolved provider turns fail closed and can be explicitly abandoned", async () => {

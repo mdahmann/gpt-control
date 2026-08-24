@@ -1,0 +1,10 @@
+export function assertRegularUploadFiles(files: string[]): Promise<string[]>;
+export function canonicalProviderUrl(value: unknown): string | undefined;
+export function classifyDesktopMode(input: Record<string, unknown>): "chatgpt" | "codex" | "unknown";
+export function collectConversationIdentity(input: Record<string, unknown>): string | undefined;
+export function loadDesktopSession(root: string, sessionId: string): Promise<Record<string, any>>;
+export function loadSelectorConfig(env?: Record<string, string | undefined>): Record<string, string[]>;
+export function normalizeText(value: unknown): string;
+export function parseLoopbackEndpoint(value: string): { origin: string; hostname: string; port: number };
+export function saveDesktopSession(root: string, record: Record<string, any>): Promise<void>;
+export function sha256(value: string | Buffer): string;

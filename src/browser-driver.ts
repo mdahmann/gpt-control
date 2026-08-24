@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
 	CHATGPT_ORIGIN,
+	ChatGptProviderSafetyError,
+	ChatGptRateLimitError,
 	attachFiles,
 	captureOwnedScreenshot,
 	clickRecoveryControl,
@@ -16,8 +18,9 @@ import {
 	reloadPage,
 	discoverChatGptModels,
 	discoverChatGptProjects,
-	dismissChatGptRateLimitNotice,
+	extractConversationTurns,
 	manageChatGptConversation,
+	readPageHtml,
 	selectAndVerifyChatGptModel,
 	setSessionState,
 	showSession,
@@ -33,12 +36,14 @@ import {
 	type ChatGptProjectCatalog,
 	type ChatGptConversationAction,
 	type ChatGptConversationActionResult,
+	type ChatGptConversationTurn,
 	type ChatGptSelection,
 	type ModelVerification,
 } from "./chatgpt";
 import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
 import { probeBridge, resolveBridgeLauncher, splitCommandLine, type Launcher } from "./transport";
 import type { Exec } from "./types";
+import { sanitizeBrowserDriverEnv } from "../scripts/driver-env.mjs";
 
 export const BROWSER_DRIVER_PROTOCOL_VERSION = 2;
 export type DriverPageId = string | number;
@@ -51,6 +56,20 @@ export interface DriverProbe {
 	secureInput: boolean;
 	protocolVersion: typeof BROWSER_DRIVER_PROTOCOL_VERSION;
 	reason?: string;
+	driverVersion?: string;
+	stateWriterVersion?: number;
+	host?: {
+		appPath: string;
+		bundleId: string;
+		teamId: string;
+		listenerPid: number;
+		endpoint: string;
+		browserVersion: string;
+		browserInstanceId: string;
+	};
+	runtimeExecutable?: string;
+	runtimeBundlePath?: string;
+	runtimeBundleSha256?: string;
 }
 
 export interface DriverSession {
@@ -58,6 +77,32 @@ export interface DriverSession {
 	pageId: DriverPageId;
 	name: string;
 	url: string;
+	/** Non-sensitive native desktop-pool ownership receipt. */
+	desktopPoolLane?: number;
+	/** The pool returned ownership, but could not prove lifecycle-lock release. */
+	desktopPoolLeaseState?: "release_unproved";
+}
+
+export interface ChatGptConversationCatalogEntry {
+	providerConversationId: string;
+	providerConversationUrl: string;
+	title: string;
+	pinned: boolean;
+	projectId?: string;
+	current?: boolean;
+	updatedAt?: string;
+}
+
+export interface ChatGptConversationCatalog {
+	conversations: ChatGptConversationCatalogEntry[];
+	discoveredAt: string;
+}
+
+export interface ChatGptConversationFindRequest {
+	query?: string;
+	pinned?: boolean;
+	projectId?: string;
+	limit?: number;
 }
 
 export interface WebChatDriver {
@@ -70,12 +115,13 @@ export interface WebChatDriver {
 	fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
 	discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog>;
 	discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog>;
+	findConversations?(request: ChatGptConversationFindRequest, signal?: AbortSignal): Promise<ChatGptConversationCatalog>;
+	readConversation?(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]>;
 	manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult>;
 	selectModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
 	verifyModel(session: DriverSession, selection: ChatGptSelection | ChatGptModel, signal?: AbortSignal): Promise<ModelVerification>;
 	send(session: DriverSession, signal?: AbortSignal): Promise<void>;
 	observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation>;
-	dismissRateLimitNotice?(session: DriverSession, signal?: AbortSignal): Promise<string | undefined>;
 	recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void>;
 	setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void>;
 	close(sessionId: string, signal?: AbortSignal): Promise<void>;
@@ -131,6 +177,15 @@ export async function waitForDriverReady(
 				last = `owned page is still committing (${session.url})`;
 			} else {
 				const observation = await driver.observe(session, options.signal);
+				if (observation.providerSafetyReason) {
+					throw new ChatGptProviderSafetyError(
+						observation.providerSafetyReason,
+						observation.providerSafetyMessage ?? "ChatGPT requires human account review.",
+					);
+				}
+				if (observation.rateLimited) {
+					throw new ChatGptRateLimitError(observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+				}
 				if (observation.composerReady) return { session, observation };
 				last = `ChatGPT loaded at ${session.url}, but its composer is not ready (${observation.stateSummary})`;
 			}
@@ -162,6 +217,7 @@ export async function waitForCompletedDriverTurn(
 		) => Promise<"approved" | "unavailable" | "mismatch">;
 		providerTurnIdentityPersisted?: boolean;
 		onRateLimit?: (message: string) => Promise<void>;
+		onProviderSafety?: (reason: "suspicious_activity" | "human_verification", message: string) => Promise<void>;
 	},
 ): Promise<DriverCompletionOutcome> {
 	const intervalMs = options.intervalMs ?? browserPollIntervalMs();
@@ -242,32 +298,21 @@ export async function waitForCompletedDriverTurn(
 		}
 
 		let observation = await driver.observe(session, options.signal);
+		if (observation.providerSafetyReason) {
+			const message = observation.providerSafetyMessage ?? "ChatGPT requires human account review.";
+			await options.onProviderSafety?.(observation.providerSafetyReason, message);
+			return needsUser(
+				`ChatGPT automation paused for human account review (${observation.providerSafetyReason}): ${message}`,
+				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
+			);
+		}
 		if (observation.rateLimited) {
 			const message = observation.rateLimitMessage ?? "ChatGPT reported too many requests.";
 			await options.onRateLimit?.(message);
-			if (!driver.dismissRateLimitNotice) {
-				return needsUser(
-					`ChatGPT is temporarily rate limited and this browser driver cannot dismiss the notice safely: ${message}`,
-					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
-				);
-			}
-			try {
-				await driver.dismissRateLimitNotice(session, options.signal);
-				recoveryAttempts.push({
-					at: nowIso(), action: "dismiss_rate_limit", reason: message, outcome: "recovered",
-				});
-			} catch (error) {
-				recoveryAttempts.push({
-					at: nowIso(), action: "dismiss_rate_limit", reason: message, outcome: "failed", detail: errorMessage(error),
-				});
-				return needsUser(
-					`ChatGPT rate-limit notice could not be dismissed safely: ${errorMessage(error)}`,
-					latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
-				);
-			}
-			previous = undefined;
-			steady = 0;
-			continue;
+			return needsUser(
+				`ChatGPT reported a rate limit. GPT-Control paused all new sends until a human explicitly resumes them: ${message}`,
+				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, observation.stateSummary,
+			);
 		}
 		let providerTurnIdentityPending = false;
 		lastObservedUiState = observation.stateSummary;
@@ -500,10 +545,11 @@ function needsUser(
 }
 
 function requiresRecovery(observation: ChatPageObservation): boolean {
-	return Boolean(observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
+	return Boolean(observation.providerSafetyReason || observation.rateLimited || observation.errorMessage || observation.retryAvailable || observation.continueAvailable);
 }
 
 function exactNeedsUserReason(observation: ChatPageObservation, prefix: string): string {
+	if (observation.providerSafetyReason) return `${prefix}: ChatGPT requires human account review (${observation.providerSafetyReason}): ${observation.providerSafetyMessage ?? "review required"}`;
 	if (observation.rateLimitMessage) return `${prefix}: ChatGPT is temporarily rate limited: ${observation.rateLimitMessage}`;
 	if (observation.errorMessage) return `${prefix}: ${observation.errorMessage}`;
 	if (observation.continueAvailable) return `${prefix}: ChatGPT requires Continue generating.`;
@@ -566,6 +612,17 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 			throw new Error(`Owned browser page drifted from ${session.url} to ${current.url}; action refused.`);
 		}
 		return current;
+	}
+
+	private async assertSessionOwnership(session: DriverSession, signal?: AbortSignal): Promise<void> {
+		const owned = await showSession(this.exec, this.launcher, session.sessionId, signal);
+		const pageId = tabIdFromSession(owned);
+		if (pageId === undefined || String(pageId) !== String(session.pageId)) {
+			throw new Error(`Browser session ${session.sessionId} no longer owns the recorded page; observation refused.`);
+		}
+		if (typeof owned.name !== "string" || owned.name !== session.name) {
+			throw new Error(`Refused observation on renamed or foreign browser session ${session.sessionId}.`);
+		}
 	}
 
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
@@ -635,6 +692,11 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		return discoverChatGptProjects(this.exec, this.launcher, numericPageId(session.pageId), signal);
 	}
 
+	async readConversation(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]> {
+		await this.assertActionTarget(session, signal);
+		return extractConversationTurns(await readPageHtml(this.exec, this.launcher, numericPageId(session.pageId), signal), limit);
+	}
+
 	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {
 		await this.assertActionTarget(session, signal);
 		return manageChatGptConversation(this.exec, this.launcher, numericPageId(session.pageId), action, signal, 30_000, exactActionTarget(session));
@@ -656,14 +718,11 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	}
 
 	async observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation> {
+		// Observation is how bounded recovery detects URL drift. Prove the exact
+		// session/page/name ownership without requiring the old URL to remain
+		// current, then read only that proved page.
+		await this.assertSessionOwnership(session, signal);
 		return readChatPageObservation(this.exec, this.launcher, numericPageId(session.pageId), signal);
-	}
-
-	async dismissRateLimitNotice(session: DriverSession, signal?: AbortSignal): Promise<string | undefined> {
-		await this.assertActionTarget(session, signal);
-		return dismissChatGptRateLimitNotice(
-			this.exec, this.launcher, numericPageId(session.pageId), signal, exactActionTarget(session),
-		);
 	}
 
 	async recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void> {
@@ -703,11 +762,19 @@ function exactActionTarget(session: DriverSession): ExactBrowserActionTarget {
 
 const DriverIdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
 const SessionSchema = z.object({
-	sessionId: z.string().min(1),
+	sessionId: z.string().min(1).max(512),
 	pageId: z.union([z.string(), z.number()]),
 	name: z.string(),
 	url: z.string(),
+	desktopPoolLane: z.number().int().min(1).max(10).optional(),
+	desktopPoolLeaseState: z.literal("release_unproved").optional(),
 }).strict();
+const ProvisionalSessionSchema = z.object({
+	sessionId: z.string().min(1).max(512),
+	pageId: z.union([z.string(), z.number()]),
+	name: z.string(),
+	url: z.string(),
+}).passthrough();
 const SnapshotSchema = z.object({
 	count: z.number().int().nonnegative(),
 	text: z.string(),
@@ -732,6 +799,8 @@ const ObservationSchema = z.object({
 	continueAvailable: z.boolean(),
 	rateLimited: z.boolean().default(false),
 	rateLimitMessage: z.string().optional(),
+	providerSafetyReason: z.enum(["suspicious_activity", "human_verification"]).optional(),
+	providerSafetyMessage: z.string().optional(),
 	errorMessage: z.string().optional(),
 	stateSummary: z.string(),
 }).strict();
@@ -756,6 +825,23 @@ const ProjectCatalogSchema = z.object({
 	projects: z.array(z.object({ name: z.string().min(1) }).strict()),
 	discoveredAt: z.string().min(1),
 }).strict();
+const ConversationCatalogSchema = z.object({
+	conversations: z.array(z.object({
+		providerConversationId: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/),
+		providerConversationUrl: z.string().url(),
+		title: z.string().min(1).max(512),
+		pinned: z.boolean(),
+		projectId: z.string().min(1).max(256).optional(),
+		current: z.boolean().optional(),
+		updatedAt: z.string().min(1).optional(),
+	}).strict()),
+	discoveredAt: z.string().min(1),
+}).strict();
+const ConversationTurnsSchema = z.array(z.object({
+	role: z.enum(["user", "assistant"]),
+	text: z.string().min(1),
+	messageId: z.string().min(1).optional(),
+}).strict());
 const ConversationActionResultSchema = z.object({
 	pinned: z.boolean().optional(),
 	archived: z.boolean().optional(),
@@ -769,6 +855,25 @@ const ProbeSchema = z.object({
 	secureInput: z.boolean(),
 	protocolVersion: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
 	reason: z.string().optional(),
+	driverVersion: z.string().min(1).max(128).optional(),
+	stateWriterVersion: z.number().int().positive().optional(),
+	host: z.object({
+		appPath: z.string().min(1),
+		bundleId: z.string().min(1).max(256),
+		teamId: z.string().min(1).max(64),
+		listenerPid: z.number().int().positive(),
+		endpoint: z.string().url(),
+		browserVersion: z.string().min(1).max(512),
+		browserInstanceId: z.string().min(8).max(256),
+	}).strict().optional(),
+	runtimeExecutable: z.string().min(1).optional(),
+	runtimeBundlePath: z.string().min(1).optional(),
+	runtimeBundleSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+	pool: z.object({
+		size: z.number().int().min(1).max(10),
+		startPort: z.number().int().min(1024).max(65_535),
+		rootSha256: z.string().regex(/^[a-f0-9]{64}$/),
+	}).strict().optional(),
 }).strict();
 const EnvelopeSchema = z.object({
 	version: z.literal(BROWSER_DRIVER_PROTOCOL_VERSION),
@@ -776,6 +881,19 @@ const EnvelopeSchema = z.object({
 	result: z.unknown().optional(),
 	error: z.string().optional(),
 }).strict();
+
+function sameCreateDestination(observed: string, requested: string): boolean {
+	try {
+		const left = new URL(observed);
+		const right = new URL(requested);
+		return left.origin === right.origin
+			&& left.pathname.replace(/\/$/, "") === right.pathname.replace(/\/$/, "")
+			&& left.search === right.search
+			&& !left.hash && !right.hash;
+	} catch {
+		return false;
+	}
+}
 
 export class ExternalCommandBrowserDriver implements WebChatDriver {
 	private readonly command: string;
@@ -806,7 +924,35 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 	}
 
 	async create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession> {
-		return SessionSchema.parse(await this.call("create", { name, url }, signal));
+		const raw = await this.call("create", { name, url }, signal);
+		const parsed = SessionSchema.safeParse(raw);
+		if (parsed.success) return parsed.data;
+		const provisional = ProvisionalSessionSchema.safeParse(raw);
+		if (!provisional.success
+			|| provisional.data.name !== name
+			|| !sameCreateDestination(provisional.data.url, url)) throw parsed.error;
+		try {
+			// A create response can fail local validation after the external driver has
+			// already created durable state. Cleanup is independent of a cancelled
+			// caller so a malformed receipt cannot silently consume a pool lane.
+			const rebound = ProvisionalSessionSchema.safeParse(await this.call("show", {
+				sessionId: provisional.data.sessionId,
+			}));
+			if (!rebound.success
+				|| rebound.data.sessionId !== provisional.data.sessionId
+				|| rebound.data.pageId !== provisional.data.pageId
+				|| rebound.data.name !== name
+				|| !sameCreateDestination(rebound.data.url, url)) {
+				throw new Error("Malformed create receipt did not rebind to the complete caller-owned destination tuple.");
+			}
+			await this.close(provisional.data.sessionId);
+		} catch (cleanupError) {
+			throw new Error(
+				`Browser driver create receipt failed validation and cleanup was not proved for session ${provisional.data.sessionId}: ${errorMessage(cleanupError)}`,
+				{ cause: parsed.error },
+			);
+		}
+		throw parsed.error;
 	}
 
 	async show(sessionId: string, signal?: AbortSignal): Promise<DriverSession> {
@@ -831,6 +977,14 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 
 	async discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog> {
 		return ProjectCatalogSchema.parse(await this.call("discover_projects", { session }, signal));
+	}
+
+	async findConversations(request: ChatGptConversationFindRequest, signal?: AbortSignal): Promise<ChatGptConversationCatalog> {
+		return ConversationCatalogSchema.parse(await this.call("find_conversations", { ...request }, signal));
+	}
+
+	async readConversation(session: DriverSession, limit: number, signal?: AbortSignal): Promise<ChatGptConversationTurn[]> {
+		return ConversationTurnsSchema.parse(await this.call("read_conversation", { session, limit }, signal));
 	}
 
 	async manageConversation(session: DriverSession, action: ChatGptConversationAction, signal?: AbortSignal): Promise<ChatGptConversationActionResult> {
@@ -900,7 +1054,7 @@ async function invokeJsonCommand(
 			child = spawn(command, args, {
 				stdio: ["pipe", "pipe", "pipe"],
 				signal,
-				env: sanitizedDriverEnv(process.env),
+				env: sanitizeBrowserDriverEnv(process.env),
 			});
 		} catch (error) {
 			reject(error);
@@ -931,26 +1085,17 @@ async function invokeJsonCommand(
 		child.on("close", (code) => finish(() => {
 			if (stdoutBytes > limit) return reject(new Error("Browser driver response exceeded 16 MiB."));
 			const output = Buffer.concat(stdout).toString("utf8").trim();
-			if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code}.`));
+			if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `Browser driver exited ${code} without a valid protocol envelope.`));
 			if (output === "") return reject(new Error("Browser driver returned no JSON."));
 			try {
 				resolve(JSON.parse(output));
 			} catch {
-				reject(new Error(`Browser driver returned invalid JSON: ${output.slice(0, 400)}`));
+				const digest = createHash("sha256").update(output, "utf8").digest("hex");
+				reject(new Error(`Browser driver returned invalid JSON (${Buffer.byteLength(output, "utf8")} bytes, sha256=${digest}).`));
 			}
 		}));
 		child.stdin!.end(`${request}\n`);
 	});
-}
-
-function sanitizedDriverEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	const safe = new Set(["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
-	const output: NodeJS.ProcessEnv = {};
-	for (const [key, value] of Object.entries(env)) {
-		if (value === undefined) continue;
-		if (safe.has(key) || key.startsWith("GPT_CONTROL_DRIVER_") || key.startsWith("CHROME_BRIDGE_")) output[key] = value;
-	}
-	return output;
 }
 
 function offlineProbe(driver: string, reason: string): DriverProbe {

@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.4.4",
+  "version": "0.5.0-alpha.8",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents.",
   "author": {
     "name": "Miles Dahmann"
@@ -33,9 +33,7 @@
     "defaultPrompt": [
       "Start a GPT Chat and send this exact message.",
       "Start a GPT Worker for this bounded task with GPT-5.6 Sol at High effort.",
-      "Start a GPT Worker titled Teach Reliability with project ID SEQ.",
-      "Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete.",
-      "Continue the exact GPT-Control conversation without creating or resubmitting a replacement turn."
+      "Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete."
     ],
     "screenshots": []
   }
