@@ -28,6 +28,7 @@ export interface BridgeProbe {
 	ready: boolean;
 	endpoint?: string;
 	extension?: string;
+	expectedTargetEnforcement?: string;
 	reason?: string;
 }
 
@@ -244,6 +245,7 @@ export async function probeBridge(
 			ready: readString(payload, "endpointStatus") === "reachable" && readString(payload, "extension") === "connected",
 			endpoint: readString(payload, "endpoint"),
 			extension: readString(payload, "extension"),
+			expectedTargetEnforcement: readString(payload, "expectedTargetEnforcement"),
 			reason: readString(payload, "reason"),
 		};
 	} catch {

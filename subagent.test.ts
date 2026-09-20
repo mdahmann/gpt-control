@@ -36,14 +36,29 @@ async function waitUntil(check: () => boolean | Promise<boolean>, timeoutMs = 20
 }
 
 describe("bounded GPT Worker scheduler", () => {
-	test("runs one successful worker in one independently owned tab", async () => {
+	test("closes the independently owned tab after a successful worker finishes", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const result = await service.start({ kind: "subagent", prompt: "single worker", idempotencyKey: "single-worker", timeoutMs: 1000 });
 		expect(result.run.status).toBe("completed");
-		expect(bridge.activeTabs()).toHaveLength(1);
+		expect(bridge.activeTabs()).toEqual([]);
 		expect(bridge.submittedPrompts).toEqual(["single worker"]);
 		expect(result.run.receipt).toMatchObject({ observedModel: "Pro", modelVerified: true });
+		expect((await service.store.getConversation(result.conversation.id)).closedAt).toBeDefined();
+	});
+
+	test("reconciles a stale terminal worker tab after an earlier close failure", async () => {
+		const bridge = new FakeChromeBridge({ failCloseCount: 1 });
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "subagent", prompt: "stale worker", timeoutMs: 1000 });
+		expect(result.run.status).toBe("completed");
+		expect(bridge.activeTabs()).toHaveLength(1);
+		expect(await service.cleanupTerminalWorkerConversations()).toEqual({
+			closed: [result.conversation.id],
+			blocked: [],
+		});
+		expect(bridge.activeTabs()).toEqual([]);
+		expect(await service.cleanupTerminalWorkerConversations()).toEqual({ closed: [], blocked: [] });
 	});
 
 	test("binds the first provider user-message id when ChatGPT renders Markdown syntax away", async () => {
@@ -114,7 +129,7 @@ describe("bounded GPT Worker scheduler", () => {
 
 	test("supports three concurrent workers and fairly queues a fourth", async () => {
 		const bridge = new FakeChromeBridge();
-		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxActiveGenerations: 3 });
 		const starts = [];
 		for (const index of [1, 2, 3, 4]) {
 			starts.push(await service.start({
@@ -136,7 +151,28 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(new Set(terminal.map((run) => run.conversationId)).size).toBe(4);
 	});
 
-	test("shares a provider cooldown and reduces new worker concurrency after rate limiting", async () => {
+	test("the safe default serializes GPT Chat and GPT Worker generations through one shared gate", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxActiveGenerations: 1 });
+		const chat = await service.start({ kind: "chat", prompt: "[slow] mixed-chat", wait: false, timeoutMs: 2000 });
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+		const worker = await service.start({
+			kind: "subagent", prompt: "[slow] mixed-worker", idempotencyKey: "mixed-worker", wait: false, timeoutMs: 2000,
+		});
+		await Bun.sleep(25);
+		expect(bridge.submittedPrompts).toEqual(["[slow] mixed-chat"]);
+		bridge.release();
+		await waitUntil(() => bridge.submittedPrompts.length === 2);
+		expect(bridge.submittedPrompts).toEqual(["[slow] mixed-chat", "[slow] mixed-worker"]);
+		bridge.release();
+		const completed = await Promise.all([
+			service.waitForRun(chat.run.id, 2500),
+			service.waitForRun(worker.run.id, 2500),
+		]);
+		expect(completed.map((run) => run.status)).toEqual(["completed", "completed"]);
+	});
+
+	test("a provider safety pause blocks queued workers until an explicit human resume", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service, store } = makeChromeService(scratch(), scratch(), bridge, {
 			maxConcurrentWorkers: 3,
@@ -150,6 +186,7 @@ describe("bounded GPT Worker scheduler", () => {
 			message: "Too many requests. Please try again later.",
 		});
 		expect(throttle.activeLimit).toBe(1);
+		expect(throttle.manualResumeRequired).toBeTrue();
 
 		const first = await service.start({
 			kind: "subagent", prompt: "[slow] throttled-1", idempotencyKey: "throttled-1", wait: false, timeoutMs: 2000,
@@ -157,18 +194,39 @@ describe("bounded GPT Worker scheduler", () => {
 		const second = await service.start({
 			kind: "subagent", prompt: "[slow] throttled-2", idempotencyKey: "throttled-2", wait: false, timeoutMs: 2000,
 		});
-		await Bun.sleep(10);
-		expect(bridge.submittedPrompts).toEqual([]);
-		await waitUntil(() => bridge.submittedPrompts.length === 1);
-		expect(bridge.submittedPrompts).toEqual(["[slow] throttled-1"]);
-		bridge.release();
-		await waitUntil(() => bridge.submittedPrompts.length === 2);
-		bridge.release();
 		const terminal = await Promise.all([
 			service.waitForRun(first.run.id, 2500),
 			service.waitForRun(second.run.id, 2500),
 		]);
-		expect(terminal.map((run) => run.status)).toEqual(["completed", "completed"]);
+		expect(terminal.map((run) => run.status)).toEqual(["needs_user", "needs_user"]);
+		expect(bridge.submittedPrompts).toEqual([]);
+		await expect(service.resumeProviderSafety("resume")).rejects.toThrow("RESUME CHATGPT");
+		expect(await service.resumeProviderSafety("RESUME CHATGPT")).toEqual({ resumed: true });
+		const resumed = await service.start({ kind: "subagent", prompt: "resumed worker", timeoutMs: 1000 });
+		expect(resumed.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["resumed worker"]);
+	});
+
+	test("legacy cooldown state becomes a manual safety pause and success cannot clear it", async () => {
+		const root = scratch();
+		const { store } = makeChromeService(root, scratch(), new FakeChromeBridge());
+		const timestamp = new Date().toISOString();
+		writeFileSync(join(root, "provider-throttle.json"), JSON.stringify({
+			version: 1,
+			reason: "chatgpt_rate_limit",
+			firstSeenAt: timestamp,
+			lastSeenAt: timestamp,
+			nextRetryAt: timestamp,
+			consecutiveEvents: 1,
+			activeLimit: 3,
+			recoverySuccesses: 0,
+			messageSha256: "a".repeat(64),
+		}));
+		expect(await store.getProviderThrottle()).toMatchObject({ version: 2, activeLimit: 1, manualResumeRequired: true });
+		await store.noteProviderSuccess(10);
+		expect(await store.getProviderThrottle()).toMatchObject({ manualResumeRequired: true });
+		expect(await store.clearProviderSafetyPause()).toBeTrue();
+		expect(await store.getProviderThrottle()).toBeUndefined();
 	});
 
 	test("one worker can fail while two independent workers continue", async () => {
@@ -306,7 +364,7 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
 
-	test("restart repairs a persisted browser session missing from the run receipt", async () => {
+	test("restart repairs persisted browser-session and desktop-lane state missing from the run receipt", async () => {
 		const root = scratch();
 		const workspace = scratch();
 		const bridge = new FakeChromeBridge();
@@ -323,8 +381,11 @@ describe("bounded GPT Worker scheduler", () => {
 		await first.service.store.updateConversation(prepared.conversation.id, {
 			browserSessionId: session.sessionId,
 			browserPageId: session.pageId,
+			desktopPoolLane: 3,
+			desktopPoolLeaseState: "release_unproved",
 		});
 		expect((await first.service.getRun(prepared.run.id)).receipt.localBrowserSessionId).toBeUndefined();
+		expect((await first.service.getRun(prepared.run.id)).receipt.desktopPoolLane).toBeUndefined();
 
 		const second = makeChromeService(root, workspace, bridge);
 		await second.service.schedulePreparedRun(prepared.run.id);
@@ -332,6 +393,10 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(terminal.status).toBe("completed");
 		expect(terminal.receipt.localBrowserSessionId).toBe(session.sessionId);
 		expect(terminal.receipt.browserDriverId).toBe(driver.id);
+		expect(terminal.receipt.desktopPoolLane).toBe(3);
+		expect(terminal.receipt.desktopPoolLeaseState).toBeUndefined();
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLane).toBe(3);
+		expect((await second.store.getConversation(prepared.conversation.id)).desktopPoolLeaseState).toBeUndefined();
 		expect(bridge.submittedPrompts).toEqual(["repair session receipt"]);
 	});
 
@@ -425,16 +490,97 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts[0]).toContain("@GitHub");
 		expect(bridge.submittedPrompts[0]).toContain("@Zenbox");
 		expect(bridge.submittedPrompts[1]).toBe("Use @GitHub and @Zenbox to inspect the repository evidence.");
+		const connectorTypeRequests = bridge.privateRequests.filter((request) => request.action === "type");
+		expect(connectorTypeRequests.length).toBeGreaterThan(0);
+		expect(connectorTypeRequests.every((request) => request.payload.expectedTarget === undefined)).toBe(true);
+		expect(bridge.privateRequests.filter((request) => request.action === "ping").length).toBeGreaterThanOrEqual(connectorTypeRequests.length * 2);
 	});
 
-	test("blocks required connectors before browser allocation when literal mentions are missing", async () => {
+	test("selects preferred connector pills in the single main assignment", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const assignment = "Use @Zenbox and @Compound Engineering to review the plan.";
+		const value = await service.start({
+			kind: "subagent",
+			prompt: assignment,
+			idempotencyKey: "inline-connector-selection",
+			connectors: ["Zenbox", "Compound Engineering"],
+			connectorMode: "prefer",
+			timeoutMs: 1000,
+		});
+		expect(value.run.status).toBe("completed");
+		expect(value.run.connectorSelection).toMatchObject({
+			status: "verified",
+			names: ["Zenbox", "Compound Engineering"],
+		});
+		expect(bridge.submittedPrompts).toHaveLength(1);
+		expect(bridge.submittedPrompts[0]).toContain("@Zenbox @Compound Engineering");
+		expect(bridge.submittedPrompts[0]).toContain(assignment);
+		const connectorTypeRequests = bridge.privateRequests.filter((request) => request.action === "type");
+		expect(connectorTypeRequests.length).toBeGreaterThan(0);
+	});
+
+	test("accepts the at-prefixed connector name reported by ChatGPT", async () => {
+		const assignment = "Use @Zenbox for one read-only delivery check.";
+		const bridge = new FakeChromeBridge({
+			responseForPrompt: (prompt) => prompt.includes("Before we start the assignment")
+				? JSON.stringify({ connectors: [{ name: "@Zenbox", status: "ready", payload: "The secure MCP tunnel is active." }] })
+				: undefined,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const value = await service.start({
+			kind: "subagent",
+			prompt: assignment,
+			idempotencyKey: "at-prefixed-connector-name",
+			connectors: ["Zenbox"],
+			connectorMode: "require",
+			timeoutMs: 1000,
+		});
+		expect({
+			status: value.run.status,
+			preflightStatus: value.run.connectorPreflight?.status,
+			submittedPrompts: bridge.submittedPrompts,
+		}).toEqual({
+			status: "completed",
+			preflightStatus: "passed",
+			submittedPrompts: [expect.stringContaining("@Zenbox"), assignment],
+		});
+	});
+
+	test("treats an exact Compound Engineering pill as instruction-plugin readiness without tool discovery", async () => {
+		const assignment = "Use @Zenbox and @Compound Engineering to produce a read-only plan.";
+		const bridge = new FakeChromeBridge({
+			responseForPrompt: (prompt) => prompt.includes("Before we start the assignment")
+				? JSON.stringify({ connectors: [
+					{ name: "Zenbox", status: "ready", payload: "connection_health returned healthy" },
+					{ name: "Compound Engineering", status: "ready", payload: "exact connector pill selected" },
+				] })
+				: undefined,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const value = await service.start({
+			kind: "subagent",
+			prompt: assignment,
+			idempotencyKey: "instruction-plugin-preflight",
+			connectors: ["Zenbox", "Compound Engineering"],
+			connectorMode: "require",
+			timeoutMs: 1000,
+		});
+		expect(value.run.status).toBe("completed");
+		expect(value.run.connectorPreflight).toMatchObject({ status: "passed" });
+		expect(bridge.submittedPrompts[0]).toContain("instruction plugin, not a callable tool");
+		expect(bridge.submittedPrompts[0]).toContain("exact selected connector pill is the readiness proof");
+		expect(bridge.submittedPrompts[1]).toBe(assignment);
+	});
+
+	test.each(["prefer", "require"] as const)("blocks %s connectors before browser allocation when literal mentions are missing", async (connectorMode) => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		await expect(service.start({
 			kind: "subagent",
 			prompt: "Inspect the repository evidence.",
 			connectors: ["GitHub", "Zenbox"],
-			connectorMode: "require",
+			connectorMode,
 		})).rejects.toThrow("@GitHub, @Zenbox");
 		expect(bridge.activeTabs()).toEqual([]);
 	});
@@ -555,6 +701,31 @@ describe("bounded GPT Worker scheduler", () => {
 });
 
 describe("existing ChatGPT conversation attachment", () => {
+	test("refuses a whole-session close when the owned group contains another page", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const attached = await service.attachConversation({
+			conversationUrl: "https://chatgpt.com/c/mixed-session-chat",
+		});
+		bridge.addSessionTab(attached.browserSessionId!, "https://beta.alomoves.com/search?q=6347");
+
+		await expect(service.closeConversation(attached.id)).rejects.toThrow("owns 2 pages");
+		expect(bridge.activeTabs()).toHaveLength(2);
+		expect((await service.store.getConversation(attached.id)).closedAt).toBeUndefined();
+	});
+
+	test("marks a conversation closed when its exact owned browser page is already gone", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const attached = await service.attachConversation({
+			conversationUrl: "https://chatgpt.com/c/already-closed-chat",
+		});
+		bridge.closeTab(Number(attached.browserPageId));
+
+		expect((await service.closeConversation(attached.id)).closedAt).toBeDefined();
+		expect(bridge.activeTabs()).toEqual([]);
+	});
+
 	test("attaches an exact existing conversation, follows up with the raw prompt, and closes only the local tab", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -1337,7 +1508,77 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			providerTurnPending: false,
 			providerStopRequested: false,
 		});
-		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(2);
+		expect(bridge.stopClicks.length).toBeGreaterThanOrEqual(1);
+	});
+
+	test("explicit cancel releases a terminal pre-send failure without sealing a provider slot", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(join(root, "state"), workspace, bridge);
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] never crossed send boundary",
+			idempotencyKey: "definitive-pre-send-failure",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		await service.suspendActiveRunsForRestart();
+		await service.store.updateRun(started.run.id, {
+			status: "needs_user",
+			providerTurnPending: true,
+			providerStopRequested: true,
+			providerUserMessageId: undefined,
+			error: 'Could not click the ChatGPT send button. Last error: No element found for selector button[aria-label="Send"]',
+			completedAt: new Date().toISOString(),
+		});
+
+		const cancelled = await service.cancelRun(started.run.id);
+		expect(cancelled).toMatchObject({
+			status: "needs_user",
+			providerTurnPending: false,
+			providerStopRequested: false,
+		});
+		expect(bridge.stopClicks).toEqual([]);
+	});
+
+	test("explicit cancel abandons only a terminal provider turn past the trusted grace window", async () => {
+		const root = scratch();
+		const workspace = join(root, "workspace");
+		mkdirSync(workspace, { recursive: true });
+		const bridge = new FakeChromeBridge({ postSendIdleReads: 1000 });
+		const { service } = makeChromeService(join(root, "state"), workspace, bridge, { activeTurnGraceMs: 60_000 });
+		const started = await service.start({
+			kind: "subagent",
+			prompt: "[slow] explicit stale cancellation",
+			idempotencyKey: "explicit-stale-cancellation",
+			wait: false,
+			timeoutMs: 5000,
+		});
+		await waitUntil(async () => Boolean((await service.getRun(started.run.id)).providerUserMessageId));
+		await service.suspendActiveRunsForRestart();
+		await service.store.updateRun(started.run.id, {
+			status: "needs_user",
+			providerTurnPending: true,
+			providerStopRequested: true,
+			completedAt: new Date().toISOString(),
+		});
+
+		const recent = await service.cancelRun(started.run.id);
+		expect(recent.providerTurnPending).toBe(true);
+		expect(recent.providerTurnAbandonedAt).toBeUndefined();
+
+		const runPath = join(root, "state", "runs", `${started.run.id}.json`);
+		const persisted = JSON.parse(readFileSync(runPath, "utf8")) as Record<string, unknown>;
+		persisted.completedAt = new Date(Date.now() - 120_000).toISOString();
+		persisted.providerActiveDeadlineAt = new Date(Date.now() - 120_000).toISOString();
+		writeFileSync(runPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
+		const stale = await service.cancelRun(started.run.id);
+		expect(stale.providerTurnPending).toBe(false);
+		expect(stale.providerStopRequested).toBe(false);
+		expect(stale.providerTurnAbandonedAt).toBeDefined();
 	});
 
 	test("legacy unresolved provider turns fail closed and can be explicitly abandoned", async () => {
@@ -1895,6 +2136,35 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 			expect(await harness.taskStore.listBindings()).toEqual([]);
 			expect(harness.bridge.submittedPrompts).toHaveLength(2);
 			expect(harness.bridge.submittedPrompts[1]).toBe("Use @GitHub for the fallback worker.");
+		} finally {
+			await harness.close();
+		}
+	});
+
+	test("reports verified inline connector selection through the public MCP result", async () => {
+		const harness = await connectMcp({ taskSupport: false, clientTasks: false });
+		try {
+			const result = await harness.client.callTool({
+				name: "gpt_worker_run",
+				arguments: {
+					prompt: "Use @Zenbox for the single-turn assignment.",
+					idempotency_key: "inline-connector-public-result",
+					connectors: ["Zenbox"],
+					connector_mode: "prefer",
+					timeout_ms: 1000,
+				},
+			});
+			expect(result.isError).not.toBe(true);
+			expect(result.structuredContent).toMatchObject({ run: {
+				status: "completed",
+				connectorVerification: {
+					status: "selection_verified",
+					evidenceKind: "selected_connector_pills",
+					names: ["Zenbox"],
+				},
+			} });
+			expect(harness.bridge.submittedPrompts).toHaveLength(1);
+			expect(harness.bridge.submittedPrompts[0]).toContain("Use @Zenbox for the single-turn assignment.");
 		} finally {
 			await harness.close();
 		}

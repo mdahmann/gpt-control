@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export const PACKAGE_NAME = "gpt-control";
-export const PACKAGE_VERSION = "0.4.4";
+export const PACKAGE_VERSION = "0.5.0-alpha.10";
 export const STORAGE_VERSION = 3;
 
 export type Provider = "browser";
@@ -35,6 +35,12 @@ export interface ConnectorPreflightReceipt {
 	toolCards?: ConnectorToolCardReceipt[];
 	verifiedAt?: string;
 	error?: string;
+}
+
+export interface ConnectorSelectionReceipt {
+	status: "verified";
+	names: string[];
+	verifiedAt: string;
 }
 
 export interface AttachmentReceipt {
@@ -98,6 +104,11 @@ export interface RunDiagnostics {
 	lastRateLimitAt?: string;
 	providerCooldownUntil?: string;
 	providerConcurrencyLimit?: number;
+	providerSafetyReason?: "chatgpt_rate_limit" | "suspicious_activity" | "human_verification";
+	providerSafetyPausedAt?: string;
+	providerSafetyMessageSha256?: string;
+	providerActiveObservedAt?: string;
+	providerActiveState?: string;
 }
 
 export interface ReviewReceipt {
@@ -130,6 +141,8 @@ export interface ReviewReceipt {
 	providerConversationUrl?: string;
 	providerRunId?: string;
 	localBrowserSessionId?: string;
+	desktopPoolLane?: number;
+	desktopPoolLeaseState?: "release_unproved";
 	localAssistantTurnCount?: number;
 	recoveryAttempts?: RecoveryAttempt[];
 }
@@ -145,6 +158,8 @@ export interface ConversationRecord {
 	browserSessionId?: string;
 	browserSessionName?: string;
 	browserPageId?: BrowserPageId;
+	desktopPoolLane?: number;
+	desktopPoolLeaseState?: "release_unproved";
 	browserAssistantTurnCount?: number;
 	providerPinned?: boolean;
 	providerTitle?: string;
@@ -166,6 +181,7 @@ export interface RunRecord {
 	kind: RunKind;
 	connectorIntent?: ConnectorIntent;
 	connectorPreflight?: ConnectorPreflightReceipt;
+	connectorSelection?: ConnectorSelectionReceipt;
 	status: RunStatus;
 	executionReady: boolean;
 	/** True until the exact submitted provider turn is final or proved stopped. */
@@ -186,6 +202,8 @@ export interface RunRecord {
 	pinChatRequested?: boolean;
 	timeoutMs?: number;
 	deadlineAt?: string;
+	/** One durable, non-renewable deadline granted only after the exact provider turn is visibly active. */
+	providerActiveDeadlineAt?: string;
 	idempotencyKeyHash?: string;
 	idempotencyRequestHash?: string;
 	mcpTaskId?: string;

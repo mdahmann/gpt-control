@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
@@ -15,10 +15,14 @@ import {
 	waitForDriverReady,
 	type DriverCompletionOutcome,
 	type ExpectedDriverSession,
+	type ChatGptConversationCatalog,
+	type ChatGptConversationFindRequest,
+	type DriverSession,
 	type WebChatDriver,
 } from "./browser-driver";
 import {
 	CHATGPT_ORIGIN,
+	ChatGptProviderSafetyError,
 	ChatGptRateLimitError,
 	canonicalPromptObservationText,
 	providerConversationIdentity,
@@ -26,6 +30,7 @@ import {
 	type ChatGptProjectCatalog,
 	type ChatGptConversationAction,
 	type ChatGptConversationActionResult,
+	type ChatGptConversationTurn,
 	type ChatPageObservation,
 } from "./chatgpt";
 import {
@@ -51,15 +56,46 @@ import {
 	type OperatorPolicy,
 } from "./policy";
 import { buildReviewPrompt, parseReviewReport } from "./review";
-import { idempotencyKeyHash, RunStore, type DurableRunRequest } from "./store";
+import { idempotencyKeyHash, RunStore, type DurableRunRequest, type MaintenanceReceipt } from "./store";
 import { passiveTransportDiscovery } from "./transport";
 import type { Exec } from "./types";
 
 const TERMINAL = new Set<RunStatus>(["completed", "failed", "cancelled", "needs_user"]);
 const catalogRefreshes = new Map<string, Promise<unknown>>();
 
+function isDefinitivePreSendFailure(run: RunRecord): boolean {
+	return !run.providerUserMessageId
+		&& Boolean(run.error?.includes("Could not click the ChatGPT send button"))
+		&& Boolean(run.error?.includes("No element found for selector"));
+}
+
+function terminalProviderTurnIsPastExplicitCancelGrace(run: RunRecord, graceMs: number, now = Date.now()): boolean {
+	if (!TERMINAL.has(run.status) || !run.providerTurnPending || !run.providerStopRequested) return false;
+	const completedAt = Date.parse(run.completedAt ?? "");
+	if (!Number.isFinite(completedAt)) return false;
+	const providerDeadline = Date.parse(run.providerActiveDeadlineAt ?? "");
+	const safeFrom = Number.isFinite(providerDeadline) ? Math.max(completedAt, providerDeadline) : completedAt;
+	return now - safeFrom >= graceMs;
+}
+
+function ownedBrowserPageIsMissing(error: unknown): boolean {
+	return /session not found|owns no page|no longer owns the recorded page|no such tab|tab not found|target closed/i.test(errorMessage(error));
+}
+
 class RestartSuspension extends Error {
 	constructor() { super("GPT-Control monitoring suspended for process restart."); }
+}
+
+class RetainedCreatedSessionError extends Error {}
+
+class ProviderSafetyPauseError extends Error {
+	constructor(
+		readonly reason: "chatgpt_rate_limit" | "suspicious_activity" | "human_verification",
+		message: string,
+	) {
+		super(message);
+		this.name = "ProviderSafetyPauseError";
+	}
 }
 
 export interface StartRequest {
@@ -139,6 +175,29 @@ export interface AttachConversationRequest {
 	conversationUrl?: string;
 	providerConversationId?: string;
 	timeoutMs?: number;
+}
+
+export interface ConversationStatusResult {
+	conversationId: string;
+	providerConversationId?: string;
+	providerConversationUrl?: string;
+	title?: string;
+	pinned?: boolean;
+	project?: string;
+	projectId?: string;
+	state: "idle" | "generating" | "rate_limited" | "error" | "needs_user" | "interrupted";
+	stateSummary: string;
+	assistantTurnCount: number;
+	requestedModel?: string;
+	observedModel?: string;
+	requestedEffort?: string;
+	observedEffort?: string;
+	latestTurnAt?: string;
+	visibleToolCards: Array<{ label: string; sha256: string }>;
+	rateLimitMessage?: string;
+	interruptionReason?: "provider" | "user";
+	interruptionMessage?: string;
+	errorMessage?: string;
 }
 
 export interface ServiceDependencies {
@@ -230,7 +289,7 @@ export class GptControlService {
 	private readonly activeRuns = new Map<string, ActiveRun>();
 	private readonly activeStopReconciliations = new Map<string, Promise<void>>();
 	private readonly cancellationIntents = new Set<string>();
-	private readonly workerSlots: FairSemaphore;
+	private readonly providerSlots: FairSemaphore;
 
 	constructor(
 		exec: Exec,
@@ -246,7 +305,7 @@ export class GptControlService {
 			outputRoot: join(store.root, "generated"),
 		});
 		this.dependencies = { resolveCapabilities: dependencies.resolveCapabilities ?? resolveCapabilities };
-		this.workerSlots = new FairSemaphore(this.policy.maxConcurrentWorkers);
+		this.providerSlots = new FairSemaphore(this.policy.maxActiveGenerations);
 	}
 
 	async listModels(options: { refresh?: boolean } = {}): Promise<ModelCatalogResult> {
@@ -259,9 +318,8 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:catalog:${opaqueId("task")}`;
-			const session = await route.driver.create(name, CHATGPT_ORIGIN);
-			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-			try {
+			const discoveryUrl = await this.modelCatalogDiscoveryUrl(route.driver);
+			return this.withMaintenanceSession("model_catalog", route.driver, name, discoveryUrl, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverModels(ready.session);
 				const record: CatalogCacheRecord<ChatGptModelCatalog> = {
@@ -273,9 +331,7 @@ export class GptControlService {
 				};
 				await this.store.putCatalogCache("models", record);
 				return modelCatalogResult(record, "refreshed");
-			} finally {
-				await route.driver.close(session.sessionId).catch(() => undefined);
-			}
+			});
 		}));
 	}
 
@@ -289,9 +345,7 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:projects:${opaqueId("task")}`;
-			const session = await route.driver.create(name, CHATGPT_ORIGIN);
-			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
-			try {
+			return this.withMaintenanceSession("project_catalog", route.driver, name, CHATGPT_ORIGIN, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverProjects(ready.session);
 				const record: CatalogCacheRecord<ChatGptProjectCatalog> = {
@@ -303,10 +357,122 @@ export class GptControlService {
 				};
 				await this.store.putCatalogCache("projects", record);
 				return projectCatalogResult(record, "refreshed");
-			} finally {
-				await route.driver.close(session.sessionId).catch(() => undefined);
-			}
+			});
 		}));
+	}
+
+	private async modelCatalogDiscoveryUrl(driver: WebChatDriver): Promise<string> {
+		const runs = await this.store.listRuns({ limit: null });
+		const activeConversationIds = new Set(runs.filter((run) =>
+			run.status === "queued" || run.status === "running" || run.providerTurnPending === true)
+			.map((run) => run.conversationId));
+		const conversations = (await this.store.listConversations()).filter((conversation) =>
+			conversation.provider === "browser"
+				&& !conversation.providerArchivedAt
+				&& conversation.providerConversationUrl
+				&& providerConversationIdentity(conversation.providerConversationUrl));
+		const local = conversations.find((conversation) =>
+			!conversation.closedAt && !activeConversationIds.has(conversation.id))
+			?? conversations.find((conversation) => !activeConversationIds.has(conversation.id));
+		if (local?.providerConversationUrl) return providerConversationIdentity(local.providerConversationUrl)!.url;
+		if (driver.findConversations) {
+			const live = await driver.findConversations({ limit: 1 });
+			const first = live.conversations[0];
+			if (first) return providerConversationIdentity(first.providerConversationUrl)?.url ?? CHATGPT_ORIGIN;
+		}
+		return CHATGPT_ORIGIN;
+	}
+
+	private async withMaintenanceSession<T>(
+		kind: "model_catalog" | "project_catalog",
+		driver: WebChatDriver,
+		name: string,
+		url: string,
+		work: (session: DriverSession, expected: ExpectedDriverSession) => Promise<T>,
+	): Promise<T> {
+			const session = await driver.create(name, url);
+			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
+		let retainedHandled = false;
+		try {
+			await this.validateCreatedSession(driver, session, expected, async () => {
+				const timestamp = nowIso();
+				const receipt: MaintenanceReceipt = {
+					version: 1,
+					id: `maint_${randomUUID().replaceAll("-", "")}`,
+					kind,
+						browserDriverId: driver.id,
+						browserSessionId: session.sessionId,
+						browserPageId: session.pageId,
+						browserSessionName: session.name,
+					browserUrl: session.url,
+					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: "release_unproved",
+					status: "retained",
+					createdAt: timestamp,
+					updatedAt: timestamp,
+				};
+				await this.store.putMaintenanceReceipt(receipt);
+				return {
+					label: receipt.id,
+					markClosed: async () => this.store.putMaintenanceReceipt({ ...receipt, status: "closed", updatedAt: nowIso() }),
+				};
+			});
+			return await work(session, expected);
+		} catch (error) {
+			if (error instanceof RetainedCreatedSessionError) retainedHandled = true;
+			throw error;
+		} finally {
+			if (!retainedHandled) await driver.close(session.sessionId, undefined, session.pageId);
+		}
+	}
+
+	private async validateCreatedSession(
+		driver: WebChatDriver,
+		session: DriverSession,
+		expected: ExpectedDriverSession,
+			retain: () => Promise<{ label: string; markClosed: () => Promise<void> }>,
+		): Promise<void> {
+			if (session.desktopPoolLeaseState !== "release_unproved") {
+				if (session.name !== expected.name) throw new Error("Browser driver returned a session with the wrong ownership name.");
+				await assertExactDriverSession(driver, expected);
+				return;
+			}
+			const durable = await retain();
+			const validationError = session.name !== expected.name
+				? " Browser driver returned a session with the wrong ownership name."
+				: "";
+			try {
+				await driver.close(session.sessionId, undefined, session.pageId);
+				await durable.markClosed();
+			} catch (cleanupError) {
+				throw new RetainedCreatedSessionError(
+					`Desktop session creation succeeded, but lifecycle-lock release and cleanup were not proved; durable ownership receipt ${durable.label} was retained.${validationError} Cleanup error: ${errorMessage(cleanupError)}`,
+				);
+			}
+			throw new RetainedCreatedSessionError(
+				`Desktop session creation succeeded, but lifecycle-lock release was not proved; cleanup was proved in durable ownership receipt ${durable.label}.${validationError}`,
+			);
+	}
+
+	async findConversations(request: ChatGptConversationFindRequest = {}): Promise<ChatGptConversationCatalog> {
+		const query = request.query?.replace(/\s+/g, " ").trim();
+		if (query !== undefined && (query.length < 1 || query.length > 256)) {
+			throw new Error("Conversation query must be 1-256 characters.");
+		}
+		const limit = request.limit ?? 20;
+		if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("Conversation search limit must be 1-50.");
+		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
+		const route = selectRoute(capabilities, { transport: "browser" });
+		assertTransportAllowed(this.policy, route.kind);
+		if (!route.driver.findConversations) {
+			throw new Error(`Browser driver ${route.driver.id} does not support read-only ChatGPT conversation discovery.`);
+		}
+		return route.driver.findConversations({
+			...(query ? { query } : {}),
+			...(request.pinned !== undefined ? { pinned: request.pinned } : {}),
+			...(request.projectId ? { projectId: request.projectId } : {}),
+			limit,
+		});
 	}
 
 	async manageConversation(
@@ -327,7 +493,7 @@ export class GptControlService {
 			await assertExactDriverSession(driver, expected);
 			const result = await driver.manageConversation(await driver.show(expected.sessionId), action);
 			if (action.action === "archive") {
-				await driver.close(expected.sessionId);
+				await driver.close(expected.sessionId, undefined, expected.pageId);
 				const archivedAt = nowIso();
 				await this.store.updateConversation(conversationId, { closedAt: archivedAt, providerArchivedAt: archivedAt });
 			} else if (action.action === "pin" || action.action === "unpin") {
@@ -338,6 +504,106 @@ export class GptControlService {
 				await this.store.updateConversation(conversationId, { providerProject: result.project });
 			}
 			return result;
+		});
+	}
+
+	async readConversation(
+		conversationId: string,
+		limit = 10,
+		mcpSessionId?: string,
+	): Promise<ChatGptConversationTurn[]> {
+		if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
+			if (conversation.closedAt) throw new Error(`Conversation ${conversationId} is closed.`);
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			const session = await assertExactDriverSession(driver, expected);
+			if (!driver.readConversation) throw new Error(`Browser driver ${driver.id} does not support conversation reads.`);
+			return driver.readConversation(session, limit);
+		});
+	}
+
+	async findAndAttachConversation(
+		request: ChatGptConversationFindRequest,
+		mcpSessionId?: string,
+	): Promise<{ match: ChatGptConversationCatalog["conversations"][number]; conversation: ConversationRecord }> {
+		const catalog = await this.findConversations(request);
+		if (catalog.conversations.length === 0) throw new Error("No ChatGPT conversation matched the requested search.");
+		if (catalog.conversations.length !== 1) {
+			throw new Error(`ChatGPT conversation search is ambiguous; ${catalog.conversations.length} conversations matched. Narrow the title or filters before attachment.`);
+		}
+		const match = catalog.conversations[0];
+		let conversation = await this.attachConversation({ providerConversationId: match.providerConversationId }, mcpSessionId);
+		conversation = await this.store.updateConversation(conversation.id, {
+			providerTitle: match.title,
+			providerPinned: match.pinned,
+			...(match.projectId ? { providerProject: match.projectId } : {}),
+		});
+		return { match, conversation };
+	}
+
+	async conversationStatus(
+		conversationId: string,
+		mcpSessionId?: string,
+	): Promise<ConversationStatusResult> {
+		return this.store.withConversationOwnershipLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (mcpSessionId !== undefined && conversation.mcpSessionId !== mcpSessionId) {
+				throw new Error("This GPT-Control conversation is not owned by the current MCP session.");
+			}
+			if (conversation.closedAt) throw new Error(`Conversation ${conversationId} is closed.`);
+			const { driver, expected } = await this.resolveOwnedDriver(conversation);
+			const session = await assertExactDriverSession(driver, expected);
+			const observation = await driver.observe(session);
+			let metadata: ChatGptConversationCatalog["conversations"][number] | undefined;
+			if (driver.findConversations && conversation.providerConversationId) {
+				const catalog = await driver.findConversations({
+					...(conversation.providerTitle ? { query: conversation.providerTitle } : {}),
+					limit: 50,
+				});
+				metadata = catalog.conversations.find((entry) => entry.providerConversationId === conversation.providerConversationId);
+			}
+			const latestRun = (await this.store.listRuns({ limit: null }))
+				.filter((run) => run.conversationId === conversationId)
+				.sort((left, right) => right.receipt.startedAt.localeCompare(left.receipt.startedAt))[0];
+			const state: ConversationStatusResult["state"] = observation.providerSafetyReason
+				? "needs_user"
+				: observation.rateLimited
+				? "rate_limited"
+				: observation.turnInterruption ? "interrupted"
+				: observation.errorMessage ? "error"
+					: observation.answering || observation.thinking || observation.toolRunning ? "generating"
+						: observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
+			return {
+				conversationId,
+				providerConversationId: conversation.providerConversationId,
+				providerConversationUrl: conversation.providerConversationUrl,
+				title: metadata?.title ?? conversation.providerTitle,
+				pinned: metadata?.pinned ?? conversation.providerPinned,
+				project: conversation.providerProject,
+				projectId: metadata?.projectId,
+				state,
+				stateSummary: observation.stateSummary,
+				assistantTurnCount: observation.snapshot.count,
+				...(latestRun?.receipt.modelVerified === true
+					&& latestRun.receipt.modelEvidenceKind === "composer_selector"
+					&& latestRun.receipt.observedModel
+					? {
+						requestedModel: latestRun.receipt.requestedModel,
+						observedModel: latestRun.receipt.observedModel,
+						requestedEffort: latestRun.receipt.requestedEffort,
+						observedEffort: latestRun.receipt.observedEffort,
+					} : {}),
+				latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
+				visibleToolCards: observation.visibleToolCards,
+				rateLimitMessage: observation.rateLimitMessage,
+				interruptionReason: observation.turnInterruption,
+				interruptionMessage: observation.interruptionMessage,
+				errorMessage: observation.errorMessage,
+			};
 		});
 	}
 
@@ -458,8 +724,16 @@ export class GptControlService {
 				&& current.status !== "completed" && current.status !== "failed";
 			if (current.providerTurnPending || legacyPending) {
 				const requested = await this.store.requestProviderStop(runId);
-				const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
-				if (!stopped) this.scheduleProviderStopReconciliation(runId);
+				if (isDefinitivePreSendFailure(requested)) {
+					await this.store.clearProviderTurnState(runId);
+				} else {
+					const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
+					if (!stopped && terminalProviderTurnIsPastExplicitCancelGrace(requested, this.policy.activeTurnGraceMs)) {
+						await this.store.abandonProviderTurn(runId);
+					} else if (!stopped) {
+						this.scheduleProviderStopReconciliation(runId);
+					}
+				}
 			}
 			if (current.status === "cancelled") {
 				await this.store.deleteRunRequest(runId).catch(() => undefined);
@@ -545,21 +819,7 @@ export class GptControlService {
 				return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
 			});
 			if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-			return this.store.withConversationLock(conversationId, async () => {
-				const conversation = await this.store.getConversation(conversationId);
-				if (conversation.closedAt) return conversation;
-				if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-				if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
-					return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-				}
-				if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
-					throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
-				}
-				const { driver, expected } = await this.resolveOwnedDriver(conversation);
-				await assertExactDriverSession(driver, expected);
-				await driver.close(expected.sessionId);
-				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-			});
+			return this.closeOwnedConversationSession(conversationId);
 		});
 	}
 
@@ -587,8 +847,32 @@ export class GptControlService {
 			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
 			let persisted = false;
 			try {
-				if (session.name !== name) throw new Error("Browser driver returned an attached session with the wrong ownership name.");
-				await assertExactDriverSession(route.driver, expected);
+				await this.validateCreatedSession(route.driver, session, expected, async () => {
+					const retained: ConversationRecord = {
+						version: STORAGE_VERSION,
+						id,
+						provider: "browser",
+						providerConversationId: identity.id,
+						providerConversationUrl: identity.url,
+						browserDriverId: route.driver.id,
+						browserSessionId: session.sessionId,
+							browserSessionName: session.name,
+						browserPageId: session.pageId,
+						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: "release_unproved",
+						workspaceRoot: this.policy.workspaceRoot,
+						policyFingerprint: this.policy.fingerprint,
+						mcpSessionId,
+						createdAt: timestamp,
+						updatedAt: timestamp,
+					};
+					await this.store.putConversation(retained);
+					persisted = true;
+					return {
+						label: id,
+						markClosed: async () => { await this.store.updateConversation(id, { closedAt: nowIso() }); },
+					};
+				});
 				const conversation: ConversationRecord = {
 					version: STORAGE_VERSION,
 					id,
@@ -599,6 +883,7 @@ export class GptControlService {
 					browserSessionId: session.sessionId,
 					browserSessionName: name,
 					browserPageId: session.pageId,
+					desktopPoolLane: session.desktopPoolLane,
 					workspaceRoot: this.policy.workspaceRoot,
 					policyFingerprint: this.policy.fingerprint,
 					mcpSessionId,
@@ -616,9 +901,10 @@ export class GptControlService {
 					browserAssistantTurnCount: ready.observation.snapshot.count,
 				});
 			} catch (error) {
+				if (error instanceof RetainedCreatedSessionError) throw error;
 				try {
 					await assertExactDriverSession(route.driver, expected);
-					await route.driver.close(expected.sessionId);
+					await route.driver.close(expected.sessionId, undefined, expected.pageId);
 					if (persisted) await this.store.updateConversation(id, { closedAt: nowIso() });
 				} catch (cleanupError) {
 					throw new Error(`${errorMessage(error)} Attached browser cleanup was not proved for local conversation ${id}: ${errorMessage(cleanupError)}`);
@@ -630,7 +916,18 @@ export class GptControlService {
 
 	/** Passive only: no discovered driver or provider executable runs. */
 	async diagnose(): Promise<Record<string, unknown>> {
-		return { ...passiveTransportDiscovery(), policy: publicPolicy(this.policy) };
+		return {
+			...passiveTransportDiscovery(),
+			policy: publicPolicy(this.policy),
+			providerSafety: await this.store.getProviderThrottle(),
+		};
+	}
+
+	async resumeProviderSafety(confirmation: string): Promise<{ resumed: boolean }> {
+		if (confirmation !== "RESUME CHATGPT") {
+			throw new Error("Provider safety resume requires the exact confirmation RESUME CHATGPT after a human reviews the account.");
+		}
+		return { resumed: await this.store.clearProviderSafetyPause() };
 	}
 
 	async activeSmokeTest(): Promise<Record<string, unknown>> {
@@ -652,6 +949,11 @@ export class GptControlService {
 			attempted.push(run.id);
 			try {
 				const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
+				if (isDefinitivePreSendFailure(stopRun)) {
+					await this.store.clearProviderTurnState(run.id);
+					stopped.push(run.id);
+					continue;
+				}
 				// This is observation plus an idempotent Stop click only when the exact
 				// owned conversation still proves an active provider turn.
 				if (await this.stopOwnedBrowserRun(stopRun)) stopped.push(run.id);
@@ -665,6 +967,34 @@ export class GptControlService {
 			}
 		}
 		return { attempted, stopped, blocked };
+	}
+
+	async cleanupTerminalWorkerConversations(): Promise<{
+		closed: string[];
+		blocked: Array<{ runId: string; reason: string }>;
+	}> {
+		const closed: string[] = [];
+		const blocked: Array<{ runId: string; reason: string }> = [];
+		const runs = await this.store.listRuns({ limit: null });
+		const activeConversationIds = new Set(runs.filter((run) =>
+			run.status === "queued" || run.status === "running" || run.providerTurnPending === true)
+			.map((run) => run.conversationId));
+		const inspectedConversationIds = new Set<string>();
+		for (const run of runs) {
+			if (!this.canCloseTerminalWorkerConversation(run)) continue;
+			if (activeConversationIds.has(run.conversationId) || inspectedConversationIds.has(run.conversationId)) continue;
+			inspectedConversationIds.add(run.conversationId);
+			try {
+				const conversation = await this.store.getConversation(run.conversationId);
+				if (conversation.closedAt) continue;
+				await this.store.withConversationOwnershipLock(run.conversationId, () =>
+					this.closeOwnedConversationSession(run.conversationId));
+				closed.push(run.conversationId);
+			} catch (error) {
+				blocked.push({ runId: run.id, reason: errorMessage(error) });
+			}
+		}
+		return { closed, blocked };
 	}
 
 	async recoverActiveRuns(): Promise<{ resumed: string[]; blocked: string[]; deferred: string[] }> {
@@ -733,9 +1063,10 @@ export class GptControlService {
 				run: await this.store.getRun(created.run.id),
 			};
 		}
+		const synchronousWaitMs = request.timeoutMs + this.policy.activeTurnGraceMs + 60_000;
 		return {
 			conversation: await this.store.getConversation(created.conversation.id),
-			run: await this.waitForRun(created.run.id, request.timeoutMs + 60_000),
+			run: await this.waitForRun(created.run.id, synchronousWaitMs),
 		};
 	}
 
@@ -927,10 +1258,9 @@ export class GptControlService {
 				() => this.executeRun(runId, controller.signal, recovery),
 				{ timeoutMs: Math.max(30_000, (run.timeoutMs ?? 600_000) + 60_000) },
 			);
-			if (run.kind !== "subagent") return work();
-			const admitted = await this.waitForGlobalWorkerTurn(runId, controller.signal);
+			const admitted = await this.waitForGlobalProviderTurn(runId, controller.signal);
 			return admitted
-				? this.workerSlots.run(work, controller.signal)
+				? this.providerSlots.run(work, controller.signal)
 				: this.store.getRun(runId);
 		})().catch(async (error) => {
 			if (this.cancellationIntents.has(runId)) return this.persistCancellation(runId);
@@ -953,6 +1283,23 @@ export class GptControlService {
 				this.scheduleProviderStopReconciliation(runId);
 			}
 			return terminal;
+		}).then(async (terminal) => {
+			if (!this.canCloseTerminalWorkerConversation(terminal)) return terminal;
+			try {
+				await this.closeTerminalWorkerConversation(terminal);
+				return terminal;
+			} catch (error) {
+				const warning = `Terminal GPT Worker tab cleanup was not proved: ${errorMessage(error)}`;
+				const current = await this.store.getRun(runId);
+				const warnings = current.diagnostics?.organizationWarnings ?? [];
+				if (warnings.includes(warning)) return current;
+				return this.store.updateRun(runId, {
+					diagnostics: {
+						...(current.diagnostics ?? {}),
+						organizationWarnings: [...warnings, warning],
+					},
+				});
+			}
 		}).finally(() => {
 			this.activeRuns.delete(runId);
 			this.cancellationIntents.delete(runId);
@@ -962,28 +1309,27 @@ export class GptControlService {
 		return promise;
 	}
 
-	private async waitForGlobalWorkerTurn(runId: string, signal: AbortSignal): Promise<boolean> {
+	private async waitForGlobalProviderTurn(runId: string, signal: AbortSignal): Promise<boolean> {
 		for (;;) {
-			if (signal.aborted) throw signal.reason ?? new Error("Worker admission was cancelled.");
+			if (signal.aborted) throw signal.reason ?? new Error("Provider admission was cancelled.");
 			const current = await this.store.getRun(runId);
 			if (TERMINAL.has(current.status)) return false;
 			const throttle = await this.store.getProviderThrottle();
-			const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-			if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-				const deadline = Date.parse(current.deadlineAt ?? "");
-				if (Number.isFinite(deadline) && cooldownUntil >= deadline) {
-					await this.store.updateRun(runId, {
-						status: "needs_user", completedAt: nowIso(),
-						error: "ChatGPT rate-limit cooldown extends beyond this GPT Worker's bounded deadline. The assignment was not sent.",
-					});
-					return false;
-				}
-				await abortableSleep(Math.min(250, cooldownUntil - Date.now()), signal);
-				continue;
+			if (throttle?.manualResumeRequired) {
+				await this.store.updateRun(runId, {
+					status: "needs_user", completedAt: nowIso(),
+					error: `ChatGPT sends are paused for human review (${throttle.reason}). The assignment was not sent. After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+					diagnostics: {
+						...(current.diagnostics ?? {}),
+						providerSafetyReason: throttle.reason,
+						providerSafetyPausedAt: throttle.lastSeenAt,
+					},
+				});
+				return false;
 			}
-			const effectiveLimit = Math.min(this.policy.maxConcurrentWorkers, throttle?.activeLimit ?? this.policy.maxConcurrentWorkers);
+			const effectiveLimit = this.policy.maxActiveGenerations;
 			const contenders = (await this.store.listRuns({ limit: null }))
-				.filter((run) => run.kind === "subagent" && (
+				.filter((run) => (
 					run.providerTurnPending === true
 					|| (run.executionReady && (run.status === "queued" || run.status === "running"))
 					|| (run.providerTurnPending === undefined && (run.status === "needs_user" || run.status === "cancelled")
@@ -996,7 +1342,7 @@ export class GptControlService {
 			if (Number.isFinite(deadline) && Date.now() >= deadline) {
 				await this.store.updateRun(runId, {
 					status: "needs_user", completedAt: nowIso(),
-					error: "The GPT Worker exceeded its bounded global admission deadline before a trusted concurrency slot became available.",
+					error: "The GPT-Control run exceeded its bounded global admission deadline before a trusted provider slot became available.",
 				});
 				return false;
 			}
@@ -1018,46 +1364,40 @@ export class GptControlService {
 				throw new Error("ChatGPT remained rate limited until the GPT Worker deadline. The assignment was not sent again.");
 			}
 			const throttle = await this.store.getProviderThrottle();
-			const cooldownUntil = throttle ? Date.parse(throttle.nextRetryAt) : Number.NaN;
-			if (Number.isFinite(cooldownUntil) && Date.now() < cooldownUntil) {
-				await abortableSleep(Math.min(250, cooldownUntil - Date.now()), signal);
-				continue;
+			if (throttle?.manualResumeRequired) {
+				throw new ProviderSafetyPauseError(throttle.reason, `ChatGPT sends remain paused for human review (${throttle.reason}).`);
 			}
 			const session = await assertExactDriverSession(driver, expected, signal);
 			const observation = await driver.observe(session, signal);
-			if (observation.rateLimited) {
-				run = await this.handleProviderRateLimit(
-					driver, session, run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.", signal,
+			if (observation.providerSafetyReason) {
+				run = await this.recordProviderSafety(
+					run,
+					observation.providerSafetyReason,
+					observation.providerSafetyMessage ?? "ChatGPT requires human account review.",
 				);
-				continue;
+				throw new ProviderSafetyPauseError(observation.providerSafetyReason, "ChatGPT requires human account review. No prompt was sent.");
+			}
+			if (observation.rateLimited) {
+				run = await this.recordProviderRateLimit(run, observation.rateLimitMessage ?? "ChatGPT reported too many requests.");
+				throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
 			}
 			try {
 				return { run, session, value: await action(session) };
 			} catch (error) {
+				if (error instanceof ChatGptProviderSafetyError) {
+					run = await this.recordProviderSafety(run, error.reason, error.notice);
+					throw new ProviderSafetyPauseError(error.reason, "ChatGPT requires human account review. No prompt was sent.");
+				}
 				if (!(error instanceof ChatGptRateLimitError)) throw error;
-				run = await this.handleProviderRateLimit(driver, session, run, error.notice, signal);
+				run = await this.recordProviderRateLimit(run, error.notice);
+				throw new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
 			}
 		}
 	}
 
-	private async handleProviderRateLimit(
-		driver: WebChatDriver,
-		session: Awaited<ReturnType<WebChatDriver["show"]>>,
-		run: RunRecord,
-		message: string,
-		signal: AbortSignal,
-	): Promise<RunRecord> {
-		const updated = await this.recordProviderRateLimit(run, message);
-		if (!driver.dismissRateLimitNotice) {
-			throw new Error(`ChatGPT is temporarily rate limited and the active browser driver cannot dismiss its notice safely: ${message}`);
-		}
-		await driver.dismissRateLimitNotice(session, signal);
-		return updated;
-	}
-
 	private async recordProviderRateLimit(run: RunRecord, message: string): Promise<RunRecord> {
 		const throttle = await this.store.noteProviderRateLimit({
-			maxConcurrentWorkers: this.policy.maxConcurrentWorkers,
+			maxConcurrentWorkers: this.policy.maxActiveGenerations,
 			baseDelayMs: this.policy.rateLimitBaseDelayMs,
 			maxDelayMs: this.policy.rateLimitMaxDelayMs,
 			message,
@@ -1073,6 +1413,28 @@ export class GptControlService {
 			},
 		});
 		return updated;
+	}
+
+	private async recordProviderSafety(
+		run: RunRecord,
+		reason: "suspicious_activity" | "human_verification",
+		message: string,
+	): Promise<RunRecord> {
+		const pause = await this.store.noteProviderSafetyPause({
+			reason,
+			baseDelayMs: this.policy.rateLimitBaseDelayMs,
+			maxDelayMs: this.policy.rateLimitMaxDelayMs,
+			message,
+		});
+		const current = await this.store.getRun(run.id);
+		return this.store.updateRun(run.id, {
+			diagnostics: {
+				...(current.diagnostics ?? {}),
+				providerSafetyReason: reason,
+				providerSafetyPausedAt: pause.lastSeenAt,
+				providerSafetyMessageSha256: pause.messageSha256,
+			},
+		});
 	}
 
 	private async executeRun(runId: string, signal: AbortSignal, recovery: boolean): Promise<RunRecord> {
@@ -1140,7 +1502,7 @@ export class GptControlService {
 					completedAt,
 				},
 			});
-			await this.store.noteProviderSuccess(this.policy.maxConcurrentWorkers);
+			await this.store.noteProviderSuccess(this.policy.maxActiveGenerations);
 			return run;
 		} catch (error) {
 			resetCapabilityCache();
@@ -1160,6 +1522,29 @@ export class GptControlService {
 					await this.closeUnsubmittedOwnedConversation(cancelled.conversationId).catch(() => undefined);
 				}
 				return cancelled;
+			}
+			let providerSafetyError = error instanceof ProviderSafetyPauseError ? error : undefined;
+			if (error instanceof ChatGptProviderSafetyError) {
+				current = await this.recordProviderSafety(current, error.reason, error.notice);
+				providerSafetyError = new ProviderSafetyPauseError(error.reason, "ChatGPT requires human account review. No prompt was sent.");
+			} else if (error instanceof ChatGptRateLimitError) {
+				current = await this.recordProviderRateLimit(current, error.notice);
+				providerSafetyError = new ProviderSafetyPauseError("chatgpt_rate_limit", "ChatGPT reported a rate limit. No prompt was sent.");
+			}
+			if (providerSafetyError) {
+				const terminal = await this.store.updateRun(run.id, {
+					status: "needs_user",
+					error: `${providerSafetyError.message} After reviewing the account, explicitly call gpt_provider_resume with confirmation RESUME CHATGPT.`,
+					completedAt: nowIso(),
+					diagnostics: {
+						...(current.diagnostics ?? {}),
+						providerSafetyReason: providerSafetyError.reason,
+					},
+				});
+				if (terminal.submissionState === "not_submitted") {
+					await this.closeUnsubmittedOwnedConversation(terminal.conversationId).catch(() => undefined);
+				}
+				return terminal;
 			}
 			const ambiguous = current.submissionState === "submitting" || current.submissionState === "submitted";
 			const terminal = await this.store.updateRun(run.id, {
@@ -1293,7 +1678,21 @@ export class GptControlService {
 				},
 			});
 			await driver.upload(activeSession, run.attachmentManifest.files.map((file) => file.path), signal);
-			await driver.fill(activeSession, request.prompt, signal);
+			if (run.connectorIntent?.mode === "prefer") {
+				if (!driver.fillWithConnectorMentions) {
+					throw new Error("Inline connector selection is unavailable. The assignment was not sent.");
+				}
+				await driver.fillWithConnectorMentions(activeSession, request.prompt, run.connectorIntent.names, signal);
+				run = await this.store.updateRun(run.id, {
+					connectorSelection: {
+						status: "verified",
+						names: [...run.connectorIntent.names],
+						verifiedAt: nowIso(),
+					},
+				});
+			} else {
+				await driver.fill(activeSession, request.prompt, signal);
+			}
 			const verification = await this.withProviderRateLimitRecovery(
 				driver, expected, run, signal,
 				(session) => driver.verifyModel(session, requestedSelection, signal),
@@ -1487,16 +1886,27 @@ export class GptControlService {
 			}
 		}
 
-		const remaining = Math.max(1, Math.min(
-			run.timeoutMs ?? 600_000,
-			Date.parse(run.deadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600_000),
-		));
+		const completionDeadlineAt = run.providerActiveDeadlineAt ?? run.deadlineAt;
+		const remaining = Math.max(1,
+			Date.parse(completionDeadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600_000));
 		const outcome = await waitForCompletedDriverTurn(driver, expected, {
 			baselineCount: required(baselineCount, "assistant-turn baseline"),
 			timeoutMs: remaining,
 			conversationUrl: conversation.providerConversationUrl,
 			providerTurnIdentityPersisted: Boolean(run.providerUserMessageId && run.receipt.providerConversationUrl),
+			activeTurnGraceMs: this.policy.activeTurnGraceMs,
+			activeDeadlineAt: run.providerActiveDeadlineAt,
 			signal,
+			onActiveTurnGrace: async (receipt) => {
+				run = await this.store.updateRun(run.id, {
+					providerActiveDeadlineAt: receipt.deadlineAt,
+					diagnostics: {
+						...(run.diagnostics ?? {}),
+						providerActiveObservedAt: receipt.observedAt,
+						providerActiveState: receipt.stateSummary,
+					},
+				});
+			},
 			onConversationIdentity: async (identity) => {
 				await this.persistConversationIdentity(conversation.id, identity);
 			},
@@ -1519,6 +1929,9 @@ export class GptControlService {
 			},
 			onRateLimit: async (message) => {
 				run = await this.recordProviderRateLimit(run, message);
+			},
+			onProviderSafety: async (reason, message) => {
+				run = await this.recordProviderSafety(run, reason, message);
 			},
 		});
 		if (outcome.terminalStatus === "needs_user") {
@@ -1621,7 +2034,14 @@ export class GptControlService {
 				},
 			});
 			const prompt = connectorPreflightPrompt(intent.names);
-			await driver.fill(activeSession, prompt, signal);
+			if (!driver.fillWithConnectorMentions) {
+				return { terminal: browserNeedsUser(
+					"Required connector preflight cannot prove selected ChatGPT connector mentions with this browser driver. The main assignment was not sent.",
+					conversation,
+					run,
+				) };
+			}
+			await driver.fillWithConnectorMentions(activeSession, prompt, intent.names, signal);
 			const verification = await this.withProviderRateLimitRecovery(
 				driver, expected, run, signal,
 				(session) => driver.verifyModel(session, requestedSelection, signal),
@@ -1692,6 +2112,9 @@ export class GptControlService {
 			onRateLimit: async (message) => {
 				run = await this.recordProviderRateLimit(run, message);
 			},
+			onProviderSafety: async (reason, message) => {
+				run = await this.recordProviderSafety(run, reason, message);
+			},
 		});
 		if (outcome.terminalStatus !== "completed" || !outcome.snapshot) {
 			const reason = outcome.reason ?? "Required connector preflight did not complete.";
@@ -1755,13 +2178,27 @@ export class GptControlService {
 			if (run.receipt.localBrowserSessionId && run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
 				throw new Error("Run receipt browser-session identity conflicts with its durable conversation.");
 			}
+			const lanes = [conversation.desktopPoolLane, run.receipt.desktopPoolLane, owned.session.desktopPoolLane]
+				.filter((lane): lane is number => lane !== undefined);
+			if (new Set(lanes).size > 1) throw new Error("Desktop-pool lane identity conflicts across durable recovery receipts.");
+			const desktopPoolLane = lanes[0];
+			if (conversation.desktopPoolLane !== desktopPoolLane || conversation.desktopPoolLeaseState !== undefined) {
+				conversation = await this.store.updateConversation(conversation.id, {
+					desktopPoolLane,
+					desktopPoolLeaseState: undefined,
+				});
+			}
 			if (run.receipt.browserDriverId !== owned.driver.id
-				|| run.receipt.localBrowserSessionId !== owned.expected.sessionId) {
+				|| run.receipt.localBrowserSessionId !== owned.expected.sessionId
+				|| run.receipt.desktopPoolLane !== desktopPoolLane
+				|| run.receipt.desktopPoolLeaseState !== undefined) {
 				run = await this.store.updateRun(run.id, {
 					receipt: {
 						...run.receipt,
 						browserDriverId: owned.driver.id,
 						localBrowserSessionId: owned.expected.sessionId,
+						desktopPoolLane,
+						desktopPoolLeaseState: undefined,
 					},
 				});
 			}
@@ -1772,7 +2209,7 @@ export class GptControlService {
 					throw new Error("Terminal run retains an unresolved provider turn; browser ownership was preserved for Stop reconciliation.");
 				}
 				await assertExactDriverSession(owned.driver, owned.expected);
-				await owned.driver.close(owned.expected.sessionId);
+				await owned.driver.close(owned.expected.sessionId, undefined, owned.expected.pageId);
 				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
 				throw new Error("Run became terminal while browser-session ownership was being recovered.");
 			}
@@ -1797,11 +2234,34 @@ export class GptControlService {
 		};
 		let persisted = false;
 		try {
-			if (session.name !== name) throw new Error("Browser driver returned a session with the wrong ownership name.");
-			await assertExactDriverSession(available.driver, expected, signal);
+			await this.validateCreatedSession(available.driver, session, expected, async () => {
+					conversation = await this.store.updateConversation(conversation.id, {
+					browserSessionId: session.sessionId,
+					browserSessionName: session.name,
+					browserPageId: session.pageId,
+					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: "release_unproved",
+				});
+				persisted = true;
+				run = await this.store.updateRun(run.id, {
+					receipt: {
+						...run.receipt,
+						browserDriverId: available.driver.id,
+						localBrowserSessionId: session.sessionId,
+						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: "release_unproved",
+					},
+				});
+				return {
+					label: `${conversation.id}/${run.id}`,
+					markClosed: async () => { await this.store.updateConversation(conversation.id, { closedAt: nowIso() }); },
+				};
+			});
 			conversation = await this.store.updateConversation(conversation.id, {
 				browserSessionId: session.sessionId,
 				browserPageId: session.pageId,
+				desktopPoolLane: session.desktopPoolLane,
+				desktopPoolLeaseState: session.desktopPoolLeaseState,
 			});
 			persisted = true;
 			run = await this.store.updateRun(run.id, {
@@ -1809,31 +2269,38 @@ export class GptControlService {
 					...run.receipt,
 					browserDriverId: available.driver.id,
 					localBrowserSessionId: session.sessionId,
+					desktopPoolLane: session.desktopPoolLane,
+					desktopPoolLeaseState: session.desktopPoolLeaseState,
 				},
 			});
 			if (TERMINAL.has(run.status)) {
 				await assertExactDriverSession(available.driver, expected);
-				await available.driver.close(session.sessionId);
+				await available.driver.close(session.sessionId, undefined, session.pageId);
 				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
 				throw new Error("Run became terminal while its owned browser session was being allocated.");
 			}
 			return { conversation, run, driver: available.driver, expected };
 		} catch (error) {
+			if (error instanceof RetainedCreatedSessionError) throw error;
 			if (!persisted) {
 				try {
 					if (session.name !== name) throw new Error("Created browser session did not retain its broker ownership name.");
 					await assertExactDriverSession(available.driver, expected);
-					await available.driver.close(session.sessionId);
+					await available.driver.close(session.sessionId, undefined, session.pageId);
 				} catch (cleanupError) {
 					conversation = await this.store.updateConversation(conversation.id, {
 						browserSessionId: session.sessionId,
 						browserPageId: session.pageId,
+						desktopPoolLane: session.desktopPoolLane,
+						desktopPoolLeaseState: session.desktopPoolLeaseState,
 					});
 					await this.store.updateRun(run.id, {
 						receipt: {
 							...run.receipt,
 							browserDriverId: available.driver.id,
 							localBrowserSessionId: session.sessionId,
+							desktopPoolLane: session.desktopPoolLane,
+							desktopPoolLeaseState: session.desktopPoolLeaseState,
 						},
 					});
 					throw new Error(
@@ -1857,13 +2324,55 @@ export class GptControlService {
 		}
 		const { driver, expected } = await this.resolveOwnedDriver(conversation);
 		await assertExactDriverSession(driver, expected);
-		await driver.close(expected.sessionId);
+		await driver.close(expected.sessionId, undefined, expected.pageId);
 		await this.store.updateConversation(conversationId, { closedAt: nowIso() });
+	}
+
+	private async closeOwnedConversationSession(conversationId: string): Promise<ConversationRecord> {
+		return this.store.withConversationLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (conversation.closedAt) return conversation;
+			if (conversation.provider !== "browser") {
+				throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+			}
+			if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+			}
+			if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+				throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+			}
+			try {
+				const { driver, expected } = await this.resolveOwnedDriver(conversation);
+				await assertExactDriverSession(driver, expected);
+				await driver.close(expected.sessionId, undefined, expected.pageId);
+			} catch (error) {
+				if (!ownedBrowserPageIsMissing(error)) throw error;
+			}
+			return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+		});
+	}
+
+	private canCloseTerminalWorkerConversation(run: RunRecord): boolean {
+		const legacyUnresolved = run.providerTurnPending === undefined
+			&& (run.status === "cancelled" || run.status === "needs_user")
+			&& (run.submissionState === "submitting" || run.submissionState === "submitted");
+		return run.kind === "subagent"
+			&& TERMINAL.has(run.status)
+			&& run.providerTurnPending !== true
+			&& !legacyUnresolved;
+	}
+
+	private async closeTerminalWorkerConversation(run: RunRecord): Promise<boolean> {
+		if (!this.canCloseTerminalWorkerConversation(run)) return false;
+		const conversation = await this.store.getConversation(run.conversationId);
+		if (conversation.closedAt) return false;
+		await this.closeConversation(conversation.id);
+		return true;
 	}
 
 	private async resolveOwnedDriver(
 		conversation: ConversationRecord,
-	): Promise<{ driver: WebChatDriver; expected: ExpectedDriverSession }> {
+	): Promise<{ driver: WebChatDriver; expected: ExpectedDriverSession; session: DriverSession }> {
 		const capabilities = await this.dependencies.resolveCapabilities(this.exec);
 		const available = capabilities.browser;
 		if (!available) throw new Error("The configured secure browser driver is unavailable. No fallback was launched.");
@@ -1876,8 +2385,8 @@ export class GptControlService {
 			pageId: required(conversation.browserPageId, "browser page id"),
 			name: required(conversation.browserSessionName, "browser session name"),
 		};
-		await assertExactDriverSession(available.driver, expected);
-		return { driver: available.driver, expected };
+		const session = await assertExactDriverSession(available.driver, expected);
+		return { driver: available.driver, expected, session };
 	}
 
 	private async persistConversationIdentity(
@@ -2001,6 +2510,10 @@ export class GptControlService {
 		if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url) return false;
 		let observation = await driver.observe(session);
 		if (!this.observationProvesRun(run, observation)) return false;
+		if (observation.turnInterruption) {
+			await this.store.clearProviderTurnState(run.id);
+			return true;
+		}
 		let stopIssued = false;
 		if (observation.answering || observation.thinking || observation.toolRunning) {
 			await driver.recover(session, "stop");
@@ -2045,6 +2558,7 @@ export class GptControlService {
 			error: reason,
 			completedAt: nowIso(),
 			diagnostics: {
+				...(current.diagnostics ?? {}),
 				terminalReason: reason,
 				recoveryAttempts: result?.recoveryAttempts,
 				localAssistantTurnCount: result?.localAssistantTurnCount,
@@ -2052,15 +2566,15 @@ export class GptControlService {
 				lastObservedUiState: result?.lastObservedUiState,
 			},
 			receipt: {
-				...run.receipt,
-				observedModel: result?.observedModel ?? run.receipt.observedModel,
-				observedEffort: result?.observedEffort ?? run.receipt.observedEffort,
-				model: result?.observedModel ?? run.receipt.model,
-				modelVerified: result?.modelVerified ?? run.receipt.modelVerified ?? false,
-				modelEvidenceKind: result?.modelEvidenceKind ?? run.receipt.modelEvidenceKind,
-				modelVerifiedAt: result?.modelVerifiedAt ?? run.receipt.modelVerifiedAt,
-				providerConversationId: result?.providerConversationId ?? run.receipt.providerConversationId,
-				providerConversationUrl: result?.providerConversationUrl ?? run.receipt.providerConversationUrl,
+				...current.receipt,
+				observedModel: result?.observedModel ?? current.receipt.observedModel,
+				observedEffort: result?.observedEffort ?? current.receipt.observedEffort,
+				model: result?.observedModel ?? current.receipt.model,
+				modelVerified: result?.modelVerified ?? current.receipt.modelVerified ?? false,
+				modelEvidenceKind: result?.modelEvidenceKind ?? current.receipt.modelEvidenceKind,
+				modelVerifiedAt: result?.modelVerifiedAt ?? current.receipt.modelVerifiedAt,
+				providerConversationId: result?.providerConversationId ?? current.receipt.providerConversationId,
+				providerConversationUrl: result?.providerConversationUrl ?? current.receipt.providerConversationUrl,
 				localAssistantTurnCount: result?.localAssistantTurnCount,
 				recoveryAttempts: result?.recoveryAttempts,
 				completedAt: nowIso(),
@@ -2154,10 +2668,10 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	const connectorIntent = connectorNames.length > 0
 		? { names: connectorNames, mode: request.connectorMode ?? "prefer" }
 		: undefined;
-	if (connectorIntent?.mode === "require") {
+	if (connectorIntent) {
 		const missingMentions = connectorIntent.names.filter((name) => !request.prompt.includes(`@${name}`));
 		if (missingMentions.length > 0) {
-			throw new Error(`Required connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
+			throw new Error(`Connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
 		}
 	}
 	return {
@@ -2226,14 +2740,22 @@ function normalizeProjectId(value: string): string {
 
 function connectorPreflightPrompt(names: readonly string[]): string {
 	const checks = names.map((name) => {
-		const detail = name.toLowerCase() === "zenbox"
-			? "make one harmless read-only health call, such as computer_overview, and include one returned fact"
-			: name.toLowerCase() === "github"
-				? "make one harmless read-only call and include one returned account or repository fact"
-				: "make one harmless read-only health call and include one returned fact";
-		return `- @${name}: ${detail}`;
+		return `- @${name}: ${connectorPreflightDetail(name)}`;
 	}).join("\n");
-	return `Before we start the assignment, please quickly check these connected tools in this same chat:\n${checks}\n\nDo not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise fact returned by the tool"}]}. Include exactly one entry for every listed tool. If a tool is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+	return `Before we start the assignment, please quickly check these connected tools and instruction plugins in this same chat:\n${checks}\n\nDo not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise readiness fact"}]}. Include exactly one entry for every listed connector. For an instruction plugin explicitly marked above, exact pill selection is sufficient and must be reported as ready without tool discovery. If any other connector is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+}
+
+function connectorPreflightDetail(name: string): string {
+	switch (name.toLowerCase()) {
+		case "compound engineering":
+			return "this is an instruction plugin, not a callable tool; the exact selected connector pill is the readiness proof, so do not search for or call tools and report status ready with payload \"exact connector pill selected\"";
+		case "zenbox":
+			return "make one harmless read-only health call, such as computer_overview, and include one returned fact";
+		case "github":
+			return "make one harmless read-only call and include one returned account or repository fact";
+		default:
+			return "make one harmless read-only health call and include one returned fact";
+	}
 }
 
 function parseConnectorPreflight(
@@ -2262,15 +2784,18 @@ function parseConnectorPreflight(
 			return { ok: false, reason: "Required connector preflight contained a malformed connector result." };
 		}
 		const record = entry as { name?: unknown; status?: unknown; payload?: unknown };
-		if (typeof record.name !== "string" || !names.includes(record.name) || seen.has(record.name)) {
+		const connectorName = typeof record.name === "string" && record.name.startsWith("@")
+			? record.name.slice(1)
+			: record.name;
+		if (typeof connectorName !== "string" || !names.includes(connectorName) || seen.has(connectorName)) {
 			return { ok: false, reason: "Required connector preflight returned a missing, duplicate, or unexpected connector name." };
 		}
-		seen.add(record.name);
+		seen.add(connectorName);
 		const usablePayload = typeof record.payload === "string"
 			? record.payload.trim().length > 0
 			: Boolean(record.payload && typeof record.payload === "object" && !Array.isArray(record.payload) && Object.keys(record.payload).length > 0);
 		if (record.status !== "ready" || !usablePayload) {
-			return { ok: false, reason: `Required connector @${record.name} did not report a usable ready payload.` };
+			return { ok: false, reason: `Required connector @${connectorName} did not report a usable ready payload.` };
 		}
 	}
 	return { ok: true };
@@ -2298,7 +2823,9 @@ function publicPolicy(policy: OperatorPolicy): Record<string, unknown> {
 		maxAttachmentFiles: policy.maxAttachmentFiles,
 		maxAttachmentBytes: policy.maxAttachmentBytes,
 		maxPromptBytes: policy.maxPromptBytes,
+		maxActiveGenerations: policy.maxActiveGenerations,
 		maxConcurrentWorkers: policy.maxConcurrentWorkers,
+		activeTurnGraceMs: policy.activeTurnGraceMs,
 		activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
 		providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
 		fingerprint: policy.fingerprint,

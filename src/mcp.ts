@@ -45,7 +45,7 @@ const SubagentSchema = {
 	chatgpt_model: ChatGptModelSchema.optional(),
 	chatgpt_effort: ChatGptEffortSchema.optional(),
 	connectors: z.array(ConnectorNameSchema).max(8).optional(),
-	connector_mode: ConnectorModeSchema.optional(),
+	connector_mode: ConnectorModeSchema.describe("prefer selects connector pills in the single assignment; require sends a separate readiness preflight first.").optional(),
 	timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
 };
 
@@ -379,6 +379,72 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 		});
 	});
 
+	server.registerTool("gpt_conversation_find", {
+		description: "Search the authenticated ChatGPT Desktop sidebar without opening, sending, or changing a conversation. Returns exact provider conversation IDs for secure attachment.",
+		inputSchema: {
+			query: z.string().min(1).max(256).optional(),
+			pinned: z.boolean().optional(),
+			project_id: z.string().min(1).max(256).optional(),
+			limit: z.number().int().min(1).max(50).optional(),
+		},
+		annotations: { readOnlyHint: true },
+	}, async (params) => {
+		const catalog = await service.findConversations({
+			query: params.query,
+			pinned: params.pinned,
+			projectId: params.project_id,
+			limit: params.limit,
+		});
+		return toolPayload(`${catalog.conversations.length} ChatGPT conversation${catalog.conversations.length === 1 ? "" : "s"} matched.`, catalog);
+	});
+
+	server.registerTool("gpt_conversation_find_and_attach", {
+		description: "Search the authenticated ChatGPT Desktop sidebar, require exactly one match, and securely attach that exact conversation in a GPT-Control-owned background session.",
+		inputSchema: {
+			query: z.string().min(1).max(256),
+			pinned: z.boolean().optional(),
+			project_id: z.string().min(1).max(256).optional(),
+		},
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params, extra) => {
+		const { match, conversation } = await service.findAndAttachConversation({
+			query: params.query,
+			pinned: params.pinned,
+			projectId: params.project_id,
+			limit: 2,
+		}, extra.sessionId);
+		return toolPayload(`Found and attached ${match.title}.`, {
+			match,
+			conversationId: conversation.id,
+			providerConversationId: conversation.providerConversationId,
+			providerConversationUrl: conversation.providerConversationUrl,
+		});
+	});
+
+	server.registerTool("gpt_conversation_read", {
+		description: "Read the bounded newest visible user and assistant turns from one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		inputSchema: {
+			conversation_id: z.string(),
+			limit: z.number().int().min(1).max(20).optional(),
+		},
+		annotations: { readOnlyHint: true },
+	}, async (params, extra) => {
+		const turns = await service.readConversation(params.conversation_id, params.limit ?? 10, extra.sessionId);
+		return toolPayload(`${turns.length} visible ChatGPT turn${turns.length === 1 ? "" : "s"}.`, {
+			conversationId: params.conversation_id,
+			turns,
+		});
+	});
+
+	server.registerTool("gpt_conversation_status", {
+		description: "Report passive live state and durable model receipts for one exact GPT-Control-owned ChatGPT conversation. Sends nothing and changes no provider state.",
+		inputSchema: { conversation_id: z.string() },
+		annotations: { readOnlyHint: true },
+	}, async (params, extra) => {
+		const status = await service.conversationStatus(params.conversation_id, extra.sessionId);
+		return toolPayload(`ChatGPT conversation ${params.conversation_id} is ${status.state}.`, status);
+	});
+
 	server.registerTool("gpt_conversation_close", {
 		description: "Close one GPT-Control conversation locally. Provider-side history and uploads are not deleted.",
 		inputSchema: { conversation_id: z.string() },
@@ -413,6 +479,12 @@ function registerCoreTools(server: McpServer, service: GptControlService, taskSt
 			...result,
 		});
 	});
+
+	server.registerTool("gpt_provider_resume", {
+		description: "Clear GPT-Control's local account-safety pause only after a human has reviewed ChatGPT. This tool does not open a browser or send a message.",
+		inputSchema: { confirmation: z.literal("RESUME CHATGPT") },
+		annotations: { readOnlyHint: false, destructiveHint: false },
+	}, async (params) => toolPayload("GPT-Control provider safety state updated.", await service.resumeProviderSafety(params.confirmation)));
 
 	server.registerTool("gpt_diagnose", {
 		description: "Passively report discovered transports and trusted policy. Does not execute a discovered driver, browser, legacy provider CLI, or model.",
@@ -891,7 +963,10 @@ async function monitorTask(
 ): Promise<void> {
 	const initial = await service.getRun(runId);
 	await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
-	let run = await service.waitForRun(runId, (initial.timeoutMs ?? 600_000) + 120_000);
+	let run = await service.waitForRun(
+		runId,
+		(initial.timeoutMs ?? 600_000) + service.policy.activeTurnGraceMs + 120_000,
+	);
 	if (run.status === "queued" || run.status === "running") {
 		run = await service.markNeedsUser(runId, "The GPT Worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
 	}
@@ -933,6 +1008,10 @@ export async function resumeDurableSubagents(
 	const stopRecovery = await service.retryRequestedProviderStops();
 	if (stopRecovery.blocked.length > 0) {
 		console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
+	}
+	const workerCleanup = await service.cleanupTerminalWorkerConversations();
+	if (workerCleanup.blocked.length > 0) {
+		console.error(`GPT-Control could not close ${workerCleanup.blocked.length} terminal GPT Worker browser session(s); a later restart will retry.`);
 	}
 	let bindings = await taskStore.listBindings();
 	const claimedRuns = new Map(
@@ -1040,6 +1119,7 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		providerTurnPending: run.providerTurnPending,
 		providerStopRequested: run.providerStopRequested,
 		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
+		providerActiveDeadlineAt: run.providerActiveDeadlineAt,
 		connectorIntent: run.connectorIntent,
 		connectorVerification: connectorVerification(run),
 		providerRunId: run.providerRunId,
@@ -1068,10 +1148,19 @@ function connectorVerification(run: RunRecord): Record<string, unknown> | undefi
 	if (!run.connectorIntent) return undefined;
 	const preflight = run.connectorPreflight;
 	if (run.connectorIntent.mode !== "require") {
+		if (run.connectorSelection?.status === "verified") {
+			return {
+				status: "selection_verified",
+				evidenceKind: "selected_connector_pills",
+				names: run.connectorSelection.names,
+				verifiedAt: run.connectorSelection.verifiedAt,
+				note: "Exact connector pills were selected in the main assignment. No separate readiness turn was sent; verify connected-tool results independently.",
+			};
+		}
 		return {
 			status: "unverified",
-			evidenceKind: "provider_prompt_intent_only",
-			note: "Preferred connector intent was not preflighted. Verify connected-tool results independently.",
+			evidenceKind: "none",
+			note: "Inline connector selection was not verified. The assignment must not be treated as connector-enabled.",
 		};
 	}
 	if (preflight?.status === "passed") {

@@ -20,9 +20,14 @@ export interface OperatorPolicy {
 	maxAttachmentFiles?: number;
 	maxAttachmentBytes?: number;
 	maxPromptBytes: number;
+	/** Maximum simultaneous ChatGPT generations across every GPT-Control run kind. */
+	maxActiveGenerations: number;
+	/** @deprecated Compatibility alias for maxActiveGenerations. */
 	maxConcurrentWorkers: number;
 	rateLimitBaseDelayMs: number;
 	rateLimitMaxDelayMs: number;
+	/** One non-renewable grace window for an exact provider turn that is still visibly active at its ordinary deadline. */
+	activeTurnGraceMs: number;
 	allowActiveDiagnostics: boolean;
 	providerTurnAbandonmentTokenHash?: string;
 	fingerprint: string;
@@ -41,9 +46,12 @@ export interface OperatorPolicyInput {
 	maxAttachmentFiles?: number;
 	maxAttachmentBytes?: number;
 	maxPromptBytes?: number;
+	maxActiveGenerations?: number;
+	/** @deprecated Compatibility input; prefer maxActiveGenerations. */
 	maxConcurrentWorkers?: number;
 	rateLimitBaseDelayMs?: number;
 	rateLimitMaxDelayMs?: number;
+	activeTurnGraceMs?: number;
 	allowActiveDiagnostics?: boolean;
 	providerTurnAbandonmentToken?: string;
 }
@@ -67,6 +75,19 @@ export function operatorPolicyFromEnv(
 		overrides.rateLimitMaxDelayMs ?? numberFromEnv(env.GPT_CONTROL_RATE_LIMIT_MAX_DELAY_MS) ?? 5 * 60_000,
 		rateLimitBaseDelayMs, 30 * 60_000, "rateLimitMaxDelayMs",
 	);
+	const maxActiveGenerations = boundedInteger(
+		overrides.maxActiveGenerations
+			?? overrides.maxConcurrentWorkers
+			?? numberFromEnv(env.GPT_CONTROL_MAX_ACTIVE_GENERATIONS)
+			?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS)
+			?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS)
+			?? 1,
+		1, 10, "maxActiveGenerations",
+	);
+	const activeTurnGraceMs = boundedInteger(
+		overrides.activeTurnGraceMs ?? numberFromEnv(env.GPT_CONTROL_ACTIVE_TURN_GRACE_MS) ?? 30 * 60_000,
+		1, 2 * 60 * 60_000, "activeTurnGraceMs",
+	);
 	const value = {
 		workspaceRoot,
 		storageRoot,
@@ -80,15 +101,11 @@ export function operatorPolicyFromEnv(
 		maxAttachmentFiles: boundedOptionalInteger(overrides.maxAttachmentFiles ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_FILES), 1, 100, "maxAttachmentFiles"),
 		maxAttachmentBytes: boundedOptionalInteger(overrides.maxAttachmentBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_ATTACHMENT_BYTES), 1, 100 * 1024 * 1024, "maxAttachmentBytes"),
 		maxPromptBytes: boundedInteger(overrides.maxPromptBytes ?? numberFromEnv(env.GPT_CONTROL_MAX_PROMPT_BYTES) ?? 1024 * 1024, 1, 8 * 1024 * 1024, "maxPromptBytes"),
-		maxConcurrentWorkers: boundedInteger(
-			overrides.maxConcurrentWorkers
-				?? numberFromEnv(env.GPT_CONTROL_MAX_WORKERS)
-				?? numberFromEnv(env.GPT_CONTROL_MAX_PRO_WORKERS)
-				?? 6,
-			1, 10, "maxConcurrentWorkers",
-		),
+		maxActiveGenerations,
+		maxConcurrentWorkers: maxActiveGenerations,
 		rateLimitBaseDelayMs,
 		rateLimitMaxDelayMs,
+		activeTurnGraceMs,
 		allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
 		providerTurnAbandonmentTokenHash: abandonmentToken
 			? createHash("sha256").update(abandonmentToken).digest("hex")
@@ -160,7 +177,8 @@ function policyFingerprint(value: Omit<OperatorPolicy, "fingerprint">): string {
 		maxAttachmentFiles: value.maxAttachmentFiles ?? null,
 		maxAttachmentBytes: value.maxAttachmentBytes ?? null,
 		maxPromptBytes: value.maxPromptBytes,
-		maxConcurrentWorkers: value.maxConcurrentWorkers,
+		maxActiveGenerations: value.maxActiveGenerations,
+		activeTurnGraceMs: value.activeTurnGraceMs,
 		allowActiveDiagnostics: value.allowActiveDiagnostics,
 	};
 	return createHash("sha256").update(JSON.stringify(stable)).digest("hex");

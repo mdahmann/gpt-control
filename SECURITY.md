@@ -33,6 +33,13 @@ input. Driver responses are schema validated and size bounded. Environment
 variables passed to external drivers are allowlisted. Prompt entry and send are
 separate operations so GPT-Control can persist the crash boundary.
 
+The installed desktop acceptance path applies the same child-process allowlist,
+compares both launchers and every executed bundle against one clean trusted
+head before and after execution, and requires a runtime-bundle receipt from the
+pool. Active and offline attestations are typed, hold allocation and lane
+lifecycle leases, cover every existing managed lane, and reject retained launch
+receipts.
+
 Chrome Bridge is accepted only through the private request-file RPC adapter.
 The request file is mode 0600, removed after use, and carries prompt and snapshot
 paths outside argv.

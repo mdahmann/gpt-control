@@ -24,6 +24,45 @@ performs local work. The child returns one verified result or one blocker to
 the parent. If native Codex subagents are unavailable, GPT-Control does not
 replace this path with an unmanaged shell loop.
 
+## GPT Sub-agent Goal Mode
+
+Goal Mode is the supervised multi-turn form of GPT Sub-agent. It is a workflow,
+not a fourth product route or a public MCP tool.
+
+The parent gives one native Codex child an explicit goal and verification
+condition. The child owns one exact GPT-Control `conversation_id`. After each
+stable ChatGPT response, the child verifies the result and chooses one of three
+outcomes: finish, send one specific next message in the same conversation, or
+return one precise blocker. It does not send “are you done?” probes, replay the
+assignment, or create a replacement conversation because the provider is slow.
+
+The parent can continue talking with the user while the child works. When the
+Codex runtime exposes native subagent steering, the parent queues ordinary
+guidance to the child for its next safe turn. It interrupts the child only for
+an immediate safety or scope correction. The child remains the sole owner of
+the GPT-Control conversation and incorporates queued direction before its next
+provider send.
+
+GPT-Control distinguishes these states:
+
+- **Active:** the exact page still shows answering, thinking, or tool activity.
+  At the ordinary run deadline, it receives one trusted, non-renewable active
+  grace window. No message is sent during that window.
+- **Settled:** a newer exact assistant turn is stable and the active controls
+  are absent. Only this state can complete a run.
+- **Provider interruption:** ChatGPT reports that it stopped thinking or its
+  generation was interrupted. The child reads the newest bounded turns and may
+  send a specific continuation only when the goal is still unfinished.
+- **User Stop:** ChatGPT reports that the user stopped the response. Goal Mode
+  pauses and does not continue automatically.
+- **Safety pause:** rate limiting, suspicious activity, or human verification
+  ends the loop with a human blocker. No automatic retry or resume occurs.
+
+Chat Manager is a recovery-only fallback when GPT-Control's durable mapping is
+missing or older history is required. It is not queried on every turn. Any
+search must use an exact provider ID or a distinctive title and fail when the
+result is ambiguous.
+
 ## Client paths
 
 ### Detached Codex parent
@@ -80,17 +119,31 @@ claiming that automatic wake-up is available. This release uses the local
 
 ## GPT Worker concurrency
 
-- The default GPT Worker ceiling is six. The operator can set
-  `GPT_CONTROL_MAX_WORKERS` from 1 through 10. Ten is the hard ceiling. The old
-  `GPT_CONTROL_MAX_PRO_WORKERS` name remains a compatibility alias.
+- One batch can prepare up to ten GPT Workers. The default active ChatGPT
+  generation limit is one across GPT Chat, GPT Worker, and GPT Sub-agent runs.
+  The operator can set `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` from 1 through 10.
+  `GPT_CONTROL_MAX_WORKERS` and `GPT_CONTROL_MAX_PRO_WORKERS` remain compatibility
+  aliases.
+- `GPT_CONTROL_ACTIVE_TURN_GRACE_MS` configures the one non-renewable grace
+  window for a proved active or settling exact turn. It defaults to 30 minutes
+  and is bounded to two hours. Changing it changes the trusted policy
+  fingerprint for unfinished runs.
 - Each worker receives a new owned browser session and ChatGPT conversation.
+- A terminal Worker closes its local owned browser session after any provider
+  turn is proved inactive. Provider history remains, and startup reconciles
+  stale terminal Worker sessions. This does not apply to reusable GPT Chat
+  conversations.
+- Automatic cleanup refuses a task session that contains extra browser pages;
+  it never closes an unrelated page merely because it entered the same group.
 - A durable global ordering prevents separate broker processes from exceeding
   the configured ceiling.
-- A visible ChatGPT rate-limit notice creates one shared durable cooldown and
-  lowers admission for new Workers. Successful work restores one slot at a
-  time, up to the configured ceiling.
-- A submitted turn keeps its slot until completion or a proved inactive Stop;
-  timeout alone does not release live provider capacity.
+- A visible ChatGPT rate limit, suspicious-activity notice, or human-verification
+  challenge creates one durable global safety pause. GPT-Control does not
+  dismiss or retry it. A human must review the account and explicitly call
+  `gpt_provider_resume` with `RESUME CHATGPT` before any new send can start.
+- A submitted turn keeps its slot until completion or a proved inactive Stop.
+  A visibly active turn gets one non-renewable grace window after its ordinary
+  deadline; timeout alone does not release live provider capacity.
 - Work above the configured ceiling remains queued fairly until a slot opens or
   its bounded deadline expires.
 - The limit controls browser workers, not repository write authority. Use one
@@ -114,14 +167,18 @@ The optional `connectors` list is included in the hashed provider prompt and
 stored in the durable run. It names connected tools the worker should verify.
 It does not grant permissions.
 
-- `prefer`: continue without an unavailable connector only when the assignment
-  remains supportable, and disclose the limitation.
+- `prefer`: the assignment must contain every literal `@Connector` mention.
+  GPT-Control selects and verifies the exact connector pills in the real
+  assignment, sends one model-visible message, and records
+  `selection_verified`. The assignment should test required access during its
+  work and stop with a blocker if the connector call fails.
 - `require`: the assignment must contain every literal `@Connector` mention.
   GPT-Control first sends one short read-only health check in the same
   conversation. It sends the assignment only after the response contains one
   usable `ready` payload for every connector. Otherwise it returns a blocker.
 
-The required preflight is a health gate, not automatic proof of a connector
+Inline pill selection proves selection, not a connector call. The required
+preflight is a health gate, not automatic proof of a connector
 call. When no connector-named browser tool card is visible, public run data uses
 evidence kind `assistant_reported_preflight`. When the live DOM exposes bounded
 connector-named tool cards, GPT-Control records their labels and hashes with
