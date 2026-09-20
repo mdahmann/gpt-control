@@ -25,7 +25,7 @@ import type { Launcher } from "./transport";
 import type { Exec, ExecResult } from "./types";
 
 export const DESKTOP_DRIVER_ID = "chatgpt-desktop-cdp/v1";
-export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.8";
+export const DESKTOP_DRIVER_VERSION = "0.5.0-alpha.10";
 export const DESKTOP_STATE_WRITER_VERSION = 2;
 
 export interface DesktopCdpTarget {
@@ -150,6 +150,10 @@ const CLOSE_OWNER_LEASE_MS = 300_000;
 const execFileAsync = promisify(execFile);
 
 class UnsafeStateLockError extends Error {}
+
+class UncertainCreateOwnershipError extends Error {
+	readonly code = "uncertain_create_ownership";
+}
 
 export async function handleDesktopDriverRequest(
 	request: DesktopDriverRequest,
@@ -276,7 +280,7 @@ class DesktopCdpBridge {
 				: await this.publicRequest(args);
 			return commandResult(true, result);
 		} catch (error) {
-			return commandResult(false, undefined, errorMessage(error));
+			return commandResult(false, undefined, errorMessage(error), desktopBridgeErrorCode(error));
 		}
 	};
 
@@ -694,7 +698,7 @@ class DesktopCdpBridge {
 						return true;
 					});
 					if (!durableBoundaryRecorded) throw error;
-					throw new Error(`${errorMessage(error)} Native-window creation intent ${operationId} in session ${sessionId} remains durably recorded because no exact target receipt was received; call close with this session ID to recover only after no post-intent renderer remains.`);
+					throw new UncertainCreateOwnershipError(`${errorMessage(error)} Native-window creation intent ${operationId} in session ${sessionId} remains durably recorded because no exact target receipt was received; call close with this session ID to recover only after no post-intent renderer remains.`);
 				}
 				if (!receiptJournaled) {
 					try {
@@ -1464,13 +1468,17 @@ function isSendSelector(selector: string): boolean {
 		|| selector === 'button[aria-label="Send"]';
 }
 
-function commandResult(ok: boolean, result?: unknown, error?: string): ExecResult {
+function commandResult(ok: boolean, result?: unknown, error?: string, errorCode?: string): ExecResult {
 	return {
-		stdout: JSON.stringify(ok ? { success: true, result } : { success: false, error }),
+		stdout: JSON.stringify(ok ? { success: true, result } : { success: false, error, ...(errorCode ? { errorCode } : {}) }),
 		stderr: ok ? "" : (error ?? "Desktop CDP action failed."),
 		code: ok ? 0 : 1,
 		killed: false,
 	};
+}
+
+function desktopBridgeErrorCode(error: unknown): string | undefined {
+	return error instanceof UncertainCreateOwnershipError ? error.code : undefined;
 }
 
 function success(result: unknown): DesktopDriverEnvelope {

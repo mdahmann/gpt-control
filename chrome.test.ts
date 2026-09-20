@@ -14,6 +14,8 @@ import {
 	extractChatPageObservation,
 	extractConversationTurns,
 	extractComposerModel,
+	extractComposerSelection,
+	isChatGptWorkExperience,
 	fillPrompt,
 	openChat,
 	providerConversationIdentity,
@@ -25,6 +27,7 @@ import {
 } from "./src/chatgpt";
 import { FakeChromeBridge, makeChromeService } from "./test_helpers";
 import { GptControlService } from "./src/service";
+import { ChromeBridgeBrowserDriver } from "./src/browser-driver";
 
 const roots: string[] = [];
 function scratch(): string {
@@ -251,6 +254,211 @@ describe("truthful composer model provenance", () => {
 		expect(bridge.privateRequests.filter((request) => request.action === "ping").length).toBeGreaterThanOrEqual(2);
 	});
 
+	test("discovers the current flat model and Power picker without moving its effort", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "Latest",
+			initialModel: "Pro",
+			availableModels: ["Latest", "GPT-5.6 Sol", "GPT-5.5\nLeaving on October 14"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:power-catalog", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog).toMatchObject({
+			currentModel: "Latest",
+			currentEffort: "Pro",
+			models: [
+				{ label: "Latest" },
+				{ label: "GPT-5.6 Sol" },
+				{ label: "GPT-5.5", note: "Leaving on October 14" },
+			],
+			efforts: [{ label: "Instant" }, { label: "Medium" }, { label: "High" }, { label: "Extra High" }, { label: "Pro" }],
+		});
+		expect(bridge.submittedPrompts).toEqual([]);
+		const powerPresses = bridge.privateRequests.filter((request) =>
+			request.action === "press" && request.payload.selector === '[aria-label="Power"]');
+		expect(powerPresses).toEqual([]);
+	});
+
+	test("discovers and verifies the nested model menu behind a combined version and Power pill", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			nestedPowerModelPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:nested-power-catalog", CHATGPT_ORIGIN);
+		const catalog = await driver.discoverModels(session);
+		expect(catalog).toMatchObject({
+			currentModel: "GPT-5.6 Sol",
+			currentEffort: "Pro",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.5" }],
+			efforts: [{ label: "Instant" }, { label: "Medium" }, { label: "High" }, { label: "Extra High" }, { label: "Pro" }],
+		});
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("changes and re-verifies a model and effort through the nested Power picker", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			nestedPowerModelPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "use the nested Power picker",
+			chatgptModel: "GPT-5.5",
+			chatgptEffort: "High",
+			timeoutMs: 1000,
+		});
+		expect(result.run.receipt).toMatchObject({
+			requestedModel: "GPT-5.5",
+			observedModel: "GPT-5.5",
+			requestedEffort: "High",
+			observedEffort: "High",
+			modelVerified: true,
+		});
+		expect(bridge.submittedPrompts).toEqual(["use the nested Power picker"]);
+	});
+
+	test("selects and verifies a model and effort in the current flat Power picker", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "use the current flat picker",
+			chatgptModel: "GPT-5.5",
+			chatgptEffort: "High",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.receipt).toMatchObject({
+			requestedModel: "GPT-5.5",
+			observedModel: "GPT-5.5",
+			requestedEffort: "High",
+			observedEffort: "High",
+			modelVerified: true,
+		});
+		expect(bridge.submittedPrompts).toEqual(["use the current flat picker"]);
+		const powerPresses = bridge.privateRequests.filter((request) =>
+			request.action === "press" && request.payload.selector === '[aria-label="Power"]');
+		expect(powerPresses.length).toBeGreaterThanOrEqual(1);
+		expect(powerPresses.every((request) => request.payload.expectedTarget !== undefined)).toBe(true);
+	});
+
+	test("resolves GPT-6 shorthand to the guarded Latest picker option and preserves the requested model", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "High",
+			availableModels: ["Latest", "GPT-5.6 Sol", "GPT-5.5\nLeaving on October 14"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "use the guarded GPT-6 alias",
+			chatgptModel: "6",
+			chatgptEffort: "Pro",
+			timeoutMs: 1000,
+		});
+		expect(result.run.receipt).toMatchObject({
+			requestedModel: "6",
+			observedModel: "Latest",
+			requestedEffort: "pro",
+			observedEffort: "Pro",
+			modelVerified: true,
+		});
+		expect(bridge.submittedPrompts).toEqual(["use the guarded GPT-6 alias"]);
+	});
+
+	test("resolves GPT-6 shorthand from live metadata attached to the Latest option", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "Latest\nGPT-6 Astra",
+			initialModel: "Pro",
+			availableModels: ["Latest\nGPT-6 Astra", "GPT-5.5\nLeaving on October 14"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "use live picker metadata for GPT-6",
+			chatgptModel: "GPT-6 Astra",
+			chatgptEffort: "Pro",
+			timeoutMs: 1000,
+		});
+		expect(result.run.receipt).toMatchObject({
+			requestedModel: "GPT-6 Astra",
+			observedModel: "Latest",
+			requestedEffort: "pro",
+			observedEffort: "Pro",
+			modelVerified: true,
+		});
+		expect(bridge.submittedPrompts).toEqual(["use live picker metadata for GPT-6"]);
+	});
+
+	test("does not resolve GPT-6 shorthand when the live catalog lacks the current GPT-5.6 sibling", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "Latest",
+			initialModel: "Pro",
+			availableModels: ["Latest", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "do not guess the Latest model",
+			chatgptModel: "GPT-6",
+			chatgptEffort: "Pro",
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("failed");
+		expect(result.run.error).toContain("Requested ChatGPT model GPT-6 is unavailable");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("direct pre-send verification also guards the GPT-6 Latest alias", async () => {
+		const bridge = new FakeChromeBridge({
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			initialUnderlyingModel: "Latest",
+			initialModel: "Pro",
+			availableModels: ["Latest", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const driver = bridge.capabilities().browser?.driver;
+		if (!driver) throw new Error("fake browser driver unavailable");
+		const session = await driver.create("gpt-control:gpt6-alias-verification", CHATGPT_ORIGIN);
+		await expect(driver.verifyModel(session, { model: "GPT-6", effort: "Pro" }))
+			.rejects.toThrow("Requested ChatGPT model GPT-6 is unavailable");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
 	test("ignores a retained inactive advanced picker before opening the live picker", async () => {
 		const bridge = new FakeChromeBridge({
 			currentEffortPicker: true,
@@ -378,6 +586,62 @@ describe("truthful composer model provenance", () => {
 		expect(observation).toMatchObject({ label: "Pro", normalized: "pro", selector: '[id="radix-fresh-model"]' });
 	});
 
+	test("reads the current split model and effort pill on a fresh chat", () => {
+		const html = '<main><form class="group/composer"><div id="prompt-textarea" contenteditable="true"></div><button id="radix-current" aria-haspopup="menu"><span class="uFxlGa_SliderTriggerModelLabel">GPT-6 Astra</span><span class="uFxlGa_SliderTriggerEffortLabel">Max</span></button></form></main>';
+		expect(extractComposerModel(html)).toMatchObject({
+			label: "GPT-6 Astra Max",
+			normalized: "gpt-6 astra max",
+			selector: '[id="radix-current"]',
+		});
+		expect(extractComposerSelection(html)).toEqual({ model: "GPT-6 Astra", effort: "Max" });
+	});
+
+	test("detects Work from its selected mode, header, or composer without confusing an ordinary chat", () => {
+		expect(isChatGptWorkExperience('<main><button role="tab" aria-selected="true">Work</button><form><div id="prompt-textarea">Work on anything</div></form></main>')).toBe(true);
+		expect(isChatGptWorkExperience('<main><header class="page-header">Check tool health · Work</header><form><div id="prompt-textarea" contenteditable="true"></div></form></main>')).toBe(true);
+		expect(isChatGptWorkExperience('<main><button role="tab" aria-selected="true">Chat</button><form><div id="prompt-textarea" contenteditable="true" aria-label="Chat with ChatGPT">Ask anything</div></form></main>')).toBe(false);
+	});
+
+	test("refuses a Work composer before model selection or prompt submission", async () => {
+		const bridge = new FakeChromeBridge();
+		const html = '<main><header class="page-header">New task · Work</header><form><div id="prompt-textarea" contenteditable="true">Work on anything</div><button id="radix-current" aria-haspopup="menu"><span class="uFxlGa_SliderTriggerModelLabel">GPT-6 Astra</span><span class="uFxlGa_SliderTriggerEffortLabel">Max</span></button></form></main>';
+		const exec: typeof bridge.exec = async (command, args, options) => {
+			if (command === bridge.launcher.command && args[0] === "getHTML") {
+				writeFileSync(args[2], html);
+				return { stdout: JSON.stringify({ success: true }), stderr: "", code: 0, killed: false };
+			}
+			return bridge.exec(command, args, options);
+		};
+		await expect(selectAndVerifyChatGptModel(
+			exec, bridge.launcher, 70, { model: "GPT-6 Astra", effort: "Max" },
+		)).rejects.toThrow("ChatGPT Work is selected");
+		expect(bridge.calls).toEqual([]);
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
+	test("verifies an already-selected split model and effort without opening the picker", async () => {
+		const bridge = new FakeChromeBridge();
+		const html = '<main><form class="group/composer"><div id="prompt-textarea" contenteditable="true"></div><button id="radix-current" aria-haspopup="menu"><span class="uFxlGa_SliderTriggerModelLabel">GPT-6 Astra</span><span class="uFxlGa_SliderTriggerEffortLabel">Max</span></button></form></main>';
+		const exec: typeof bridge.exec = async (command, args, options) => {
+			if (command === bridge.launcher.command && args[0] === "getHTML") {
+				writeFileSync(args[2], html);
+				return { stdout: JSON.stringify({ success: true }), stderr: "", code: 0, killed: false };
+			}
+			return bridge.exec(command, args, options);
+		};
+		const receipt = await selectAndVerifyChatGptModel(
+			exec, bridge.launcher, 70, { model: "GPT-6 Astra", effort: "Max" },
+		);
+		expect(receipt).toMatchObject({
+			requestedModel: "GPT-6 Astra",
+			observedModel: "GPT-6 Astra",
+			requestedEffort: "Max",
+			observedEffort: "Max",
+			modelVerified: true,
+		});
+		expect(bridge.calls).toEqual([]);
+	});
+
 	test("does not accept an Upgrade to Pro action as selected-model evidence", () => {
 		const observation = extractComposerModel('<form data-testid="composer"><button data-testid="model-switcher-dropdown-button" aria-label="Upgrade to Pro">Upgrade to Pro</button><div id="prompt-textarea" contenteditable="true"></div></form>');
 		expect(observation?.label).toBe("Upgrade to Pro");
@@ -400,6 +664,20 @@ describe("truthful composer model provenance", () => {
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
 
+	test("closes a newly-created task session when browser setup fails", async () => {
+		const bridge = new FakeChromeBridge();
+		const exec: typeof bridge.exec = async (command, args, options) => {
+			if (args[0] === "taskSession" && args[1] === "show") {
+				return { stdout: "", stderr: "deterministic show failure", code: 1, killed: false };
+			}
+			return bridge.exec(command, args, options);
+		};
+		const driver = new ChromeBridgeBrowserDriver(exec, bridge.launcher);
+		await expect(driver.create("gpt-control:failed-create", CHATGPT_ORIGIN)).rejects.toThrow("deterministic show failure");
+		expect(bridge.calls.some((call) => call.args[0] === "taskSession" && call.args[1] === "close")).toBe(true);
+		expect(bridge.activeTabs()).toEqual([]);
+	});
+
 	test("uses a refreshed exact conversation URL for a safe follow-up turn", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
@@ -414,6 +692,9 @@ describe("truthful composer model provenance", () => {
 		expect(second.run.status).toBe("completed");
 		expect(bridge.submittedPrompts).toEqual(["first exact turn", "second exact turn"]);
 		expect(second.run.receipt.providerConversationUrl).toBe(first.run.receipt.providerConversationUrl);
+		expect(bridge.activeTabs()).toHaveLength(1);
+		await service.closeConversation(first.conversation.id);
+		expect(bridge.activeTabs()).toEqual([]);
 	});
 
 	test("fails closed when the selector is absent", async () => {
@@ -546,6 +827,37 @@ describe("ChatGPT organization controls", () => {
 		});
 		expect(secondBridge.calls).toEqual([]);
 		expect(secondBridge.activeTabs()).toEqual([]);
+	});
+
+	test("refreshes models through an attached conversation when Home has no selector", async () => {
+		const bridge = new FakeChromeBridge({
+			modelSelectorAbsentOnHome: true,
+			currentEffortPicker: true,
+			powerSliderPicker: true,
+			nestedPowerModelPicker: true,
+			initialUnderlyingModel: "GPT-5.6 Sol",
+			initialModel: "Pro",
+			availableModels: ["GPT-5.6 Sol", "GPT-5.5"],
+			availableEfforts: ["Instant", "Medium", "High", "Extra High", "Pro"],
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const attached = await service.attachConversation({ providerConversationId: "existing-model-catalog" });
+		const callsBeforeRefresh = bridge.calls.length;
+
+		const result = await service.listModels({ refresh: true });
+
+		expect(result).toMatchObject({
+			cacheStatus: "refreshed",
+			currentModel: "GPT-5.6 Sol",
+			currentEffort: "Pro",
+			models: [{ label: "GPT-5.6 Sol" }, { label: "GPT-5.5" }],
+		});
+		const refreshNavigations = bridge.calls.slice(callsBeforeRefresh)
+			.filter((call) => call.args[0] === "taskSession" && call.args[1] === "navigate");
+		expect(refreshNavigations).toHaveLength(1);
+		expect(refreshNavigations[0].args[3]).toBe("https://chatgpt.com/c/existing-model-catalog");
+		expect(bridge.submittedPrompts).toEqual([]);
+		await service.closeConversation(attached.id);
 	});
 
 	test("a cache miss is explicit and does not open ChatGPT", async () => {
@@ -750,19 +1062,25 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		expect(bridge.submittedPrompts).toHaveLength(1);
 	});
 
-	test("a timeout remains needs_user even when the page later displays a final answer", async () => {
+	test("a visibly active turn gets one durable grace window and can finish without a Stop", async () => {
 		const bridge = new FakeChromeBridge();
-		const { service } = makeChromeService(scratch(), scratch(), bridge);
-		const result = await service.start({ kind: "subagent", prompt: "[slow] timeout", timeoutMs: 40 });
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { activeTurnGraceMs: 300 });
+		const release = setTimeout(() => bridge.release(), 80);
+		const result = await service.start({ kind: "subagent", prompt: "[slow] patient completion", timeoutMs: 40 });
+		clearTimeout(release);
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerActiveDeadlineAt).toBeDefined();
+		expect(result.run.diagnostics?.providerActiveObservedAt).toBeDefined();
+		expect(bridge.stopClicks).toHaveLength(0);
+	});
+
+	test("an active turn becomes needs_user after its one hard grace deadline", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { activeTurnGraceMs: 60 });
+		const result = await service.start({ kind: "subagent", prompt: "[slow] bounded completion", timeoutMs: 40 });
 		expect(result.run.status).toBe("needs_user");
-		await service.retryRequestedProviderStops();
-		const stopped = await service.getRun(result.run.id);
-		expect(stopped.providerTurnPending).toBe(false);
-		expect(stopped.providerStopRequested).toBe(false);
-		expect(bridge.stopClicks).toHaveLength(1);
-		bridge.forceFinal();
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		expect((await service.getRun(result.run.id)).status).toBe("needs_user");
+		expect(result.run.providerActiveDeadlineAt).toBeDefined();
+		expect(result.run.error).toMatch(/active grace deadline/i);
 	});
 
 	test("uploads only broker-owned snapshots and never exposes prompt or original paths in argv", async () => {
@@ -815,6 +1133,46 @@ describe("honest terminal state and owned-tab boundaries", () => {
 	test("does not treat unrelated Stop recording controls as generation", () => {
 		const observation = extractChatPageObservation('<main><div data-message-author-role="assistant"><div class="markdown"><p>complete answer</p></div></div><button aria-label="Stop recording">Voice</button><form data-testid="composer"><button data-testid="model-switcher-dropdown-button">Pro</button><div id="prompt-textarea" contenteditable="true"></div></form></main>');
 		expect(observation.answering).toBe(false);
+	});
+
+	test("distinguishes a provider interruption from a user-requested Stop", () => {
+		const provider = extractChatPageObservation('<main><div role="status">ChatGPT stopped thinking unexpectedly.</div><form><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(provider.turnInterruption).toBe("provider");
+		expect(provider.interruptionMessage).toContain("stopped thinking");
+		expect(provider.errorMessage).toBeUndefined();
+
+		const user = extractChatPageObservation('<main><div role="status">You stopped this response.</div><form><div id="prompt-textarea" contenteditable="true"></div></form></main>');
+		expect(user.turnInterruption).toBe("user");
+		expect(user.interruptionMessage).toContain("stopped this response");
+		expect(user.errorMessage).toBeUndefined();
+	});
+
+	test("returns distinct passive blockers for provider interruption and user Stop without clicking Stop", async () => {
+		const providerBridge = new FakeChromeBridge();
+		const { service: providerService } = makeChromeService(scratch(), scratch(), providerBridge);
+		const provider = await providerService.start({ kind: "subagent", prompt: "[provider-interrupted] inspect", timeoutMs: 250 });
+		expect(provider.run.status).toBe("needs_user");
+		expect(provider.run.error).toMatch(/supervising Codex agent must inspect/i);
+		expect(await providerService.conversationStatus(provider.conversation.id)).toMatchObject({
+			state: "interrupted",
+			interruptionReason: "provider",
+		});
+		await providerService.retryRequestedProviderStops();
+		expect(providerBridge.stopClicks).toHaveLength(0);
+		expect((await providerService.getRun(provider.run.id)).providerTurnPending).toBe(false);
+
+		const userBridge = new FakeChromeBridge();
+		const { service: userService } = makeChromeService(scratch(), scratch(), userBridge);
+		const user = await userService.start({ kind: "subagent", prompt: "[user-stopped] inspect", timeoutMs: 250 });
+		expect(user.run.status).toBe("needs_user");
+		expect(user.run.error).toMatch(/stopped by the user/i);
+		expect(await userService.conversationStatus(user.conversation.id)).toMatchObject({
+			state: "interrupted",
+			interruptionReason: "user",
+		});
+		await userService.retryRequestedProviderStops();
+		expect(userBridge.stopClicks).toHaveLength(0);
+		expect((await userService.getRun(user.run.id)).providerTurnPending).toBe(false);
 	});
 
 	test("observes native ChatGPT Desktop user and assistant turns", () => {

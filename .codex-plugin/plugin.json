@@ -1,6 +1,6 @@
 {
   "name": "gpt-control",
-  "version": "0.5.0-alpha.8",
+  "version": "0.5.0-alpha.10+codex.20260920212837",
   "description": "Hardened signed-in ChatGPT web control with GPT Chat, durable GPT Workers, and Codex-controlled GPT Sub-agents.",
   "author": {
     "name": "Miles Dahmann"
@@ -33,7 +33,7 @@
     "defaultPrompt": [
       "Start a GPT Chat and send this exact message.",
       "Start a GPT Worker for this bounded task with GPT-5.6 Sol at High effort.",
-      "Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete."
+      "Start a GPT Sub-agent in Goal Mode using one ChatGPT conversation until this goal is verified complete."
     ],
     "screenshots": []
   }

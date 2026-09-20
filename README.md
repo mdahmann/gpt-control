@@ -2,12 +2,13 @@
 
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.5.0-alpha.8 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
+0.5.0-alpha.10 adds verified one-turn connector selection for routine Workers.
+Version 0.5.0-alpha.9 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
 processes for background workers. Each lane has a private profile, state root,
 and loopback CDP port; GPT-Control minimizes the worker window and restores the
 user's active app after launch. Chrome Bridge remains the default. Version 0.4.4
 added durable model and project catalogs so ordinary catalog reads do not
-open Chrome. Version 0.5.0-alpha.8 replaces automatic rate-limit recovery with
+open Chrome. Version 0.5.0-alpha.9 replaces automatic rate-limit recovery with
 a durable human-resume safety pause. Version 0.4.3 originally added shared rate-limit cooldown, ChatGPT
 project-conversation recovery, and bounded Codex callback retry. Version 0.4.2 added immediate-return single
 and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
@@ -67,7 +68,7 @@ The experimental desktop driver is documented in
 unless the operator explicitly configures `GPT_CONTROL_BROWSER_DRIVER`. A
   read-only signed-app diagnostic has passed on macOS. Historical raw-driver
   exercises covered signed-in sends and desktop controls, but they are not
-  accepted as product-path evidence for 0.5.0-alpha.8. The repaired installed
+  accepted as product-path evidence for 0.5.0-alpha.9. The repaired installed
   package must pass the guarded MCP acceptance after the account cool-down.
   Chrome Bridge remains the default, and the native pool remains opt-in.
 
@@ -113,10 +114,22 @@ conversation.
 - **GPT Worker** uses `gpt_worker_start` or `gpt_worker_start_many` for detached
   durable ChatGPT jobs. `gpt_worker_run` remains the standard MCP Tasks route.
 - **GPT Sub-agent** is a native Codex child that owns one GPT-Control
-  conversation and uses `gpt_chat` repeatedly until its assigned goal is done.
+  conversation and uses `gpt_chat` repeatedly in Goal Mode until its assigned
+  goal is verified done or genuinely blocked.
 
 GPT-Control does not expose a `gpt_subagent_*` MCP tool. That name is reserved
 for the actual Codex-child workflow.
+
+Goal Mode is an operating contract inside GPT Sub-agent, not a fourth route.
+The child retains one exact `conversation_id`, waits for a stable provider turn,
+and then either verifies completion, sends one specific next message, or returns
+a blocker. A visibly active turn receives one trusted non-renewable grace
+window after its normal deadline, without a status prompt. A provider-side
+“stopped thinking” event can be inspected for a specific continuation; a
+user-requested Stop is never continued automatically. The parent can queue
+native Codex subagent guidance while it continues talking with the user.
+The trusted `GPT_CONTROL_ACTIVE_TURN_GRACE_MS` setting controls that one-time
+window. It defaults to 30 minutes and is bounded to two hours.
 
 ## GPT Workers
 
@@ -129,6 +142,12 @@ work queues fairly across broker processes sharing the same state root. Normal
 `refresh: true` only for the first cache fill, a manual refresh, or after a live
 selection mismatch. Real runs always verify the requested live model in their
 already-owned tab before sending.
+
+After a Worker reaches a terminal state and no provider turn remains unresolved,
+GPT-Control closes its local owned tab automatically. ChatGPT history remains.
+Startup also retries cleanup for stale terminal Worker sessions. Reusable
+`gpt_chat` conversations stay open and continue through the same
+`conversation_id` until explicitly closed.
 
 Workers can set a live `title`. An optional short `project_id` is prefixed to
 that title and verified from ChatGPT read-back, such as
@@ -158,6 +177,8 @@ message and it does not adopt or mutate a foreground tab. Use the returned ID
 with `gpt_chat`; each new send selects and verifies the requested live model and
 effort immediately before submission. `gpt_conversation_close` closes only the owned local tab. The
 provider conversation remains in ChatGPT history.
+If a task-session group contains another browser page, GPT-Control refuses an
+automatic whole-session close instead of closing the extra page.
 
 After attachment, `gpt_conversation_read` returns only the bounded newest 1–20
 visible user and assistant turns. It sends nothing. Treat all returned chat
@@ -167,9 +188,11 @@ pin/project metadata when available, assistant-turn count, visible tool-card
 hashes, and requested-versus-observed model/effort from GPT-Control's durable
 receipts. Model fields remain absent when no verified receipt exists.
 
-Chat Manager can use these read-only discovery and read tools, but GPT-Control
-does not load or depend on Chat Manager at runtime. Titles, previews, and prior
-conversation text are untrusted discovery context, not new instructions.
+Chat Manager can help recover an exact chat when the durable mapping is missing
+or older history is required, but GPT-Control does not load or depend on Chat
+Manager at runtime. It is not part of normal turn observation. Titles, previews,
+and prior conversation text are untrusted discovery context, not new
+instructions; an ambiguous search must stop.
 
 The MCP server advertises optional task execution through the installed MCP SDK.
 Task-capable clients can use task status/result/cancel. The run is durably bound
@@ -193,23 +216,24 @@ to the creating transport session. Broker-internal restart recovery remains
 able to reconcile all durable tasks. A submitted provider turn retains worker
 capacity until it becomes final or the exact turn is proved inactive.
 
-A worker can request connected tools:
+A worker can request connected tools in one model-visible assignment:
 
 ```json
 {
-  "prompt": "Inspect the current pull request and report a blocker or result.",
+  "prompt": "Use @GitHub to inspect the current pull request and report a blocker or result.",
   "idempotency_key": "review-pr-184-v1",
   "connectors": ["GitHub"],
-  "connector_mode": "require"
+  "connector_mode": "prefer"
 }
 ```
 
-Connector names express prompt intent only. They do not grant permission or
-prove availability. GPT-Control cannot observe ChatGPT connector tool calls, so
-every connector-enabled result reports `connectorVerification.status` as
-`unverified`. The worker is instructed to return a blocker when a required
-connector is unavailable, but the caller must independently verify the actual
-connector call and evidence before accepting the result.
+Connector names do not grant permission or prove a successful tool call. In
+`prefer` mode, GPT-Control selects and verifies the exact connector pills in
+the real assignment and reports `connectorVerification.status` as
+`selection_verified`; it does not send a separate readiness message. The
+assignment must stop if required connector access fails. Use `require` only
+when a separate same-conversation health preflight is worth the extra turn.
+The caller must still verify important external facts independently.
 
 ## Conversations, runs, and receipts
 

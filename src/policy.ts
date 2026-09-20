@@ -26,6 +26,8 @@ export interface OperatorPolicy {
 	maxConcurrentWorkers: number;
 	rateLimitBaseDelayMs: number;
 	rateLimitMaxDelayMs: number;
+	/** One non-renewable grace window for an exact provider turn that is still visibly active at its ordinary deadline. */
+	activeTurnGraceMs: number;
 	allowActiveDiagnostics: boolean;
 	providerTurnAbandonmentTokenHash?: string;
 	fingerprint: string;
@@ -49,6 +51,7 @@ export interface OperatorPolicyInput {
 	maxConcurrentWorkers?: number;
 	rateLimitBaseDelayMs?: number;
 	rateLimitMaxDelayMs?: number;
+	activeTurnGraceMs?: number;
 	allowActiveDiagnostics?: boolean;
 	providerTurnAbandonmentToken?: string;
 }
@@ -81,6 +84,10 @@ export function operatorPolicyFromEnv(
 			?? 1,
 		1, 10, "maxActiveGenerations",
 	);
+	const activeTurnGraceMs = boundedInteger(
+		overrides.activeTurnGraceMs ?? numberFromEnv(env.GPT_CONTROL_ACTIVE_TURN_GRACE_MS) ?? 30 * 60_000,
+		1, 2 * 60 * 60_000, "activeTurnGraceMs",
+	);
 	const value = {
 		workspaceRoot,
 		storageRoot,
@@ -98,6 +105,7 @@ export function operatorPolicyFromEnv(
 		maxConcurrentWorkers: maxActiveGenerations,
 		rateLimitBaseDelayMs,
 		rateLimitMaxDelayMs,
+		activeTurnGraceMs,
 		allowActiveDiagnostics: overrides.allowActiveDiagnostics ?? env.GPT_CONTROL_ALLOW_ACTIVE_DIAGNOSTICS === "1",
 		providerTurnAbandonmentTokenHash: abandonmentToken
 			? createHash("sha256").update(abandonmentToken).digest("hex")
@@ -170,6 +178,7 @@ function policyFingerprint(value: Omit<OperatorPolicy, "fingerprint">): string {
 		maxAttachmentBytes: value.maxAttachmentBytes ?? null,
 		maxPromptBytes: value.maxPromptBytes,
 		maxActiveGenerations: value.maxActiveGenerations,
+		activeTurnGraceMs: value.activeTurnGraceMs,
 		allowActiveDiagnostics: value.allowActiveDiagnostics,
 	};
 	return createHash("sha256").update(JSON.stringify(stable)).digest("hex");

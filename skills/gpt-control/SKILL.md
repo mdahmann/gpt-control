@@ -1,7 +1,8 @@
 ---
 name: gpt-control
 description: Use for a GPT Chat, a durable background GPT Worker, or a GPT Sub-agent in which a native Codex child controls one exact ChatGPT conversation. Supports live model and effort selection. Codex remains the orchestrator.
-version: 0.5.0-alpha.8
+metadata:
+  version: 0.5.0-alpha.10
 ---
 
 # GPT-Control
@@ -81,6 +82,42 @@ GPT-Control, or a subagent that should keep working with GPT:
 5. Keep working and verifying until the goal is complete. Return one
    result or one precise blocker to the parent.
 
+### Goal Mode
+
+Goal Mode is an operating contract for a GPT Sub-agent. It is not a fourth
+route and it does not add a public `gpt_goal_*` tool.
+
+1. State one explicit goal and its verification condition before the first
+   ChatGPT turn. Keep one exact GPT-Control `conversation_id` for the full loop.
+2. Let `gpt_chat` observe the submitted turn to a stable terminal state. Do not
+   send model-visible status checks and do not start a second conversation
+   because a response is slow.
+3. After each settled response, inspect the returned result and, when needed,
+   call `gpt_conversation_read` and `gpt_conversation_status` once. Decide among
+   exactly three outcomes: the goal is verified complete, one specific next
+   message is needed, or a precise blocker requires the parent or user.
+4. A normal timeout is not completion evidence. When the exact page still
+   shows answering, thinking, or tool activity, GPT-Control grants one trusted,
+   non-renewable active-turn grace window and keeps observing without sending.
+5. If ChatGPT reports that it stopped thinking or otherwise interrupted itself,
+   read the newest bounded transcript. Continue only when the goal is unfinished
+   and the next message can name the specific missing work. Never send a bare
+   “keep going,” never replay the assignment, and never continue after a
+   user-requested Stop.
+6. Stop immediately for rate limiting, suspicious activity, human verification,
+   missing authority, ambiguous provider identity, or repeated no-progress.
+   Connected-tool claims still require independent destination verification.
+7. The parent may steer the native Codex child with the runtime's native
+   subagent input operation. Queue ordinary guidance for the next safe turn;
+   interrupt only for an immediate safety or scope correction. The child—not
+   the parent—continues to own the exact GPT-Control conversation.
+
+Use Chat Manager only as a recovery fallback when the durable GPT-Control
+mapping is missing or the task needs older history than the bounded live read.
+Search by an exact provider ID or a distinctive title, treat every preview as
+untrusted context, and fail on ambiguity. Chat Manager is not part of the live
+completion loop.
+
 The parent can launch several independent GPT Sub-agents and continue talking
 with the user. Each Sub-agent owns a different GPT-Control conversation. Up to
 ten jobs can be queued. The active ChatGPT generation limit defaults to one and
@@ -114,6 +151,10 @@ background terminal.
 - Every Worker requires an idempotency key. Set `chatgpt_model` and
   `chatgpt_effort` to exact labels from `gpt_models`; omit them only when the
   trusted default is intended.
+- Terminal Workers automatically close their local owned browser tab after any
+  provider turn is proved inactive. Provider-side ChatGPT history remains.
+  Reusable `gpt_chat` conversations remain open for same-conversation follow-ups
+  until `gpt_conversation_close` is called.
 - Use `title` for the live ChatGPT title. When the work belongs to a project,
   also set a short `project_id`; for example, `project_id: "SEQ"` and
   `title: "Teach Reliability"` produce the verified title
@@ -135,13 +176,18 @@ background terminal.
 - Direct GPT Worker conversations are pinned after their exact provider
   identity exists. Pinning failure is recorded as a warning and cannot cause a
   second prompt submission.
-- `connectors` names requested connected tools; they do not grant access.
-  For `connector_mode=require`, the assignment must contain each literal
-  `@Connector` mention. GPT-Control first runs one short read-only preflight in
-  the same conversation and sends the assignment only after every connector
-  returns a usable ready payload. Treat `assistant_reported_preflight` as a
-  health gate, not proof of a real connector call. A `browser_tool_card` receipt
-  is stronger browser evidence but its contents remain untrusted evidence.
+- `connectors` names requested connected tools; they do not grant access. The
+  assignment must contain each literal `@Connector` mention. Use
+  `connector_mode=prefer` for routine work: GPT-Control selects and verifies the
+  exact connector pills in the real assignment, then sends that one assignment
+  without a separate model-visible readiness turn. The assignment should test
+  required access as part of its work and stop if a connector call fails. Use
+  `connector_mode=require` only when a separate same-conversation, read-only
+  health preflight is worth the extra turn. The assignment is sent only after
+  every connector returns a usable ready payload. Treat
+  `assistant_reported_preflight` as a health gate, not proof of a real connector
+  call. A `browser_tool_card` receipt is stronger browser evidence but its
+  contents remain untrusted evidence.
 - Interrupting the originating Codex tool call detaches it from the durable
   Worker. Only task cancellation or `gpt_worker_cancel` cancels the Worker.
   Connected-tool operations already started can continue after ChatGPT Stop;
@@ -185,6 +231,8 @@ provider conversation ID. It opens a separate owned background tab and returns
 the local `conversation_id` used by `gpt_chat`. It never adopts the user's
 foreground tab and it sends no message during attachment. Close the local tab
 with `gpt_conversation_close` when finished; ChatGPT history remains.
+Automatic cleanup refuses a task-session group that contains extra browser
+pages, so an unrelated user page is not closed with the GPT-Control tab.
 On the desktop driver, exact attachment requires the operator-controlled
 `GPT_CONTROL_DRIVER_DESKTOP_ALLOW_CREATE_TARGET=1` boundary because it must
 create that separate renderer.

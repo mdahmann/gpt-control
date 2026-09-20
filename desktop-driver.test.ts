@@ -252,7 +252,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			result: {
 				ready: true,
 				driver: "chatgpt-desktop-cdp/v1",
-				driverVersion: "0.5.0-alpha.8",
+				driverVersion: "0.5.0-alpha.10",
 				stateWriterVersion: 2,
 				secureInput: true,
 				protocolVersion: 2,
@@ -957,7 +957,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 		const durable = JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8"));
 		const session = Object.values(durable.sessions)[0] as Record<string, string>;
 		const receipts = join(stateRoot, "creation-receipts");
-		mkdirSync(receipts, { mode: 0o700 });
+		mkdirSync(receipts, { mode: 0o700, recursive: true });
 		writeFileSync(join(receipts, `${session.creationOperationId}.json`), JSON.stringify({
 			version: 1,
 			operationId: session.creationOperationId,
@@ -1042,7 +1042,7 @@ describe("ChatGPT Desktop protocol-v2 adapter", () => {
 			url: "https://chatgpt.com/",
 		}), { environment, stateRoot, allowCreateTarget: false });
 		expect(created.ok).toBe(false);
-		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.8");
+		expect(JSON.parse(readFileSync(join(stateRoot, "state.json"), "utf8")).driverVersion).toBe("0.5.0-alpha.10");
 	});
 
 	test("refuses actions on a migrated legacy renderer that was not driver-created", async () => {

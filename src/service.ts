@@ -63,6 +63,25 @@ import type { Exec } from "./types";
 const TERMINAL = new Set<RunStatus>(["completed", "failed", "cancelled", "needs_user"]);
 const catalogRefreshes = new Map<string, Promise<unknown>>();
 
+function isDefinitivePreSendFailure(run: RunRecord): boolean {
+	return !run.providerUserMessageId
+		&& Boolean(run.error?.includes("Could not click the ChatGPT send button"))
+		&& Boolean(run.error?.includes("No element found for selector"));
+}
+
+function terminalProviderTurnIsPastExplicitCancelGrace(run: RunRecord, graceMs: number, now = Date.now()): boolean {
+	if (!TERMINAL.has(run.status) || !run.providerTurnPending || !run.providerStopRequested) return false;
+	const completedAt = Date.parse(run.completedAt ?? "");
+	if (!Number.isFinite(completedAt)) return false;
+	const providerDeadline = Date.parse(run.providerActiveDeadlineAt ?? "");
+	const safeFrom = Number.isFinite(providerDeadline) ? Math.max(completedAt, providerDeadline) : completedAt;
+	return now - safeFrom >= graceMs;
+}
+
+function ownedBrowserPageIsMissing(error: unknown): boolean {
+	return /session not found|owns no page|no longer owns the recorded page|no such tab|tab not found|target closed/i.test(errorMessage(error));
+}
+
 class RestartSuspension extends Error {
 	constructor() { super("GPT-Control monitoring suspended for process restart."); }
 }
@@ -166,7 +185,7 @@ export interface ConversationStatusResult {
 	pinned?: boolean;
 	project?: string;
 	projectId?: string;
-	state: "idle" | "generating" | "rate_limited" | "error" | "needs_user";
+	state: "idle" | "generating" | "rate_limited" | "error" | "needs_user" | "interrupted";
 	stateSummary: string;
 	assistantTurnCount: number;
 	requestedModel?: string;
@@ -176,6 +195,8 @@ export interface ConversationStatusResult {
 	latestTurnAt?: string;
 	visibleToolCards: Array<{ label: string; sha256: string }>;
 	rateLimitMessage?: string;
+	interruptionReason?: "provider" | "user";
+	interruptionMessage?: string;
 	errorMessage?: string;
 }
 
@@ -297,7 +318,8 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:catalog:${opaqueId("task")}`;
-			return this.withMaintenanceSession("model_catalog", route.driver, name, async (session, expected) => {
+			const discoveryUrl = await this.modelCatalogDiscoveryUrl(route.driver);
+			return this.withMaintenanceSession("model_catalog", route.driver, name, discoveryUrl, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverModels(ready.session);
 				const record: CatalogCacheRecord<ChatGptModelCatalog> = {
@@ -323,7 +345,7 @@ export class GptControlService {
 			const route = selectRoute(capabilities, { transport: "browser" });
 			assertTransportAllowed(this.policy, route.kind);
 			const name = `gpt-control:projects:${opaqueId("task")}`;
-			return this.withMaintenanceSession("project_catalog", route.driver, name, async (session, expected) => {
+			return this.withMaintenanceSession("project_catalog", route.driver, name, CHATGPT_ORIGIN, async (session, expected) => {
 				const ready = await waitForDriverReady(route.driver, expected, { timeoutMs: 60_000 });
 				const catalog = await route.driver.discoverProjects(ready.session);
 				const record: CatalogCacheRecord<ChatGptProjectCatalog> = {
@@ -339,13 +361,36 @@ export class GptControlService {
 		}));
 	}
 
+	private async modelCatalogDiscoveryUrl(driver: WebChatDriver): Promise<string> {
+		const runs = await this.store.listRuns({ limit: null });
+		const activeConversationIds = new Set(runs.filter((run) =>
+			run.status === "queued" || run.status === "running" || run.providerTurnPending === true)
+			.map((run) => run.conversationId));
+		const conversations = (await this.store.listConversations()).filter((conversation) =>
+			conversation.provider === "browser"
+				&& !conversation.providerArchivedAt
+				&& conversation.providerConversationUrl
+				&& providerConversationIdentity(conversation.providerConversationUrl));
+		const local = conversations.find((conversation) =>
+			!conversation.closedAt && !activeConversationIds.has(conversation.id))
+			?? conversations.find((conversation) => !activeConversationIds.has(conversation.id));
+		if (local?.providerConversationUrl) return providerConversationIdentity(local.providerConversationUrl)!.url;
+		if (driver.findConversations) {
+			const live = await driver.findConversations({ limit: 1 });
+			const first = live.conversations[0];
+			if (first) return providerConversationIdentity(first.providerConversationUrl)?.url ?? CHATGPT_ORIGIN;
+		}
+		return CHATGPT_ORIGIN;
+	}
+
 	private async withMaintenanceSession<T>(
 		kind: "model_catalog" | "project_catalog",
 		driver: WebChatDriver,
 		name: string,
+		url: string,
 		work: (session: DriverSession, expected: ExpectedDriverSession) => Promise<T>,
-		): Promise<T> {
-			const session = await driver.create(name, CHATGPT_ORIGIN);
+	): Promise<T> {
+			const session = await driver.create(name, url);
 			const expected: ExpectedDriverSession = { sessionId: session.sessionId, pageId: session.pageId, name };
 		let retainedHandled = false;
 		try {
@@ -377,7 +422,7 @@ export class GptControlService {
 			if (error instanceof RetainedCreatedSessionError) retainedHandled = true;
 			throw error;
 		} finally {
-			if (!retainedHandled) await driver.close(session.sessionId);
+			if (!retainedHandled) await driver.close(session.sessionId, undefined, session.pageId);
 		}
 	}
 
@@ -397,7 +442,7 @@ export class GptControlService {
 				? " Browser driver returned a session with the wrong ownership name."
 				: "";
 			try {
-				await driver.close(session.sessionId);
+				await driver.close(session.sessionId, undefined, session.pageId);
 				await durable.markClosed();
 			} catch (cleanupError) {
 				throw new RetainedCreatedSessionError(
@@ -448,7 +493,7 @@ export class GptControlService {
 			await assertExactDriverSession(driver, expected);
 			const result = await driver.manageConversation(await driver.show(expected.sessionId), action);
 			if (action.action === "archive") {
-				await driver.close(expected.sessionId);
+				await driver.close(expected.sessionId, undefined, expected.pageId);
 				const archivedAt = nowIso();
 				await this.store.updateConversation(conversationId, { closedAt: archivedAt, providerArchivedAt: archivedAt });
 			} else if (action.action === "pin" || action.action === "unpin") {
@@ -528,6 +573,7 @@ export class GptControlService {
 				? "needs_user"
 				: observation.rateLimited
 				? "rate_limited"
+				: observation.turnInterruption ? "interrupted"
 				: observation.errorMessage ? "error"
 					: observation.answering || observation.thinking || observation.toolRunning ? "generating"
 						: observation.retryAvailable || observation.continueAvailable ? "needs_user" : "idle";
@@ -554,6 +600,8 @@ export class GptControlService {
 				latestTurnAt: metadata?.updatedAt ?? latestRun?.receipt.completedAt,
 				visibleToolCards: observation.visibleToolCards,
 				rateLimitMessage: observation.rateLimitMessage,
+				interruptionReason: observation.turnInterruption,
+				interruptionMessage: observation.interruptionMessage,
 				errorMessage: observation.errorMessage,
 			};
 		});
@@ -676,8 +724,16 @@ export class GptControlService {
 				&& current.status !== "completed" && current.status !== "failed";
 			if (current.providerTurnPending || legacyPending) {
 				const requested = await this.store.requestProviderStop(runId);
-				const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
-				if (!stopped) this.scheduleProviderStopReconciliation(runId);
+				if (isDefinitivePreSendFailure(requested)) {
+					await this.store.clearProviderTurnState(runId);
+				} else {
+					const stopped = await this.stopOwnedBrowserRun(requested).catch(() => false);
+					if (!stopped && terminalProviderTurnIsPastExplicitCancelGrace(requested, this.policy.activeTurnGraceMs)) {
+						await this.store.abandonProviderTurn(runId);
+					} else if (!stopped) {
+						this.scheduleProviderStopReconciliation(runId);
+					}
+				}
 			}
 			if (current.status === "cancelled") {
 				await this.store.deleteRunRequest(runId).catch(() => undefined);
@@ -763,21 +819,7 @@ export class GptControlService {
 				return run.status === "queued" || run.status === "running" || run.providerTurnPending === true || legacyUnresolved;
 			});
 			if (active) throw new Error(`Conversation ${conversationId} still has active run ${active.id}; cancel or resolve it before closing.`);
-			return this.store.withConversationLock(conversationId, async () => {
-				const conversation = await this.store.getConversation(conversationId);
-				if (conversation.closedAt) return conversation;
-				if (conversation.provider !== "browser") throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
-				if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
-					return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-				}
-				if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
-					throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
-				}
-				const { driver, expected } = await this.resolveOwnedDriver(conversation);
-				await assertExactDriverSession(driver, expected);
-				await driver.close(expected.sessionId);
-				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
-			});
+			return this.closeOwnedConversationSession(conversationId);
 		});
 	}
 
@@ -862,7 +904,7 @@ export class GptControlService {
 				if (error instanceof RetainedCreatedSessionError) throw error;
 				try {
 					await assertExactDriverSession(route.driver, expected);
-					await route.driver.close(expected.sessionId);
+					await route.driver.close(expected.sessionId, undefined, expected.pageId);
 					if (persisted) await this.store.updateConversation(id, { closedAt: nowIso() });
 				} catch (cleanupError) {
 					throw new Error(`${errorMessage(error)} Attached browser cleanup was not proved for local conversation ${id}: ${errorMessage(cleanupError)}`);
@@ -907,6 +949,11 @@ export class GptControlService {
 			attempted.push(run.id);
 			try {
 				const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
+				if (isDefinitivePreSendFailure(stopRun)) {
+					await this.store.clearProviderTurnState(run.id);
+					stopped.push(run.id);
+					continue;
+				}
 				// This is observation plus an idempotent Stop click only when the exact
 				// owned conversation still proves an active provider turn.
 				if (await this.stopOwnedBrowserRun(stopRun)) stopped.push(run.id);
@@ -920,6 +967,34 @@ export class GptControlService {
 			}
 		}
 		return { attempted, stopped, blocked };
+	}
+
+	async cleanupTerminalWorkerConversations(): Promise<{
+		closed: string[];
+		blocked: Array<{ runId: string; reason: string }>;
+	}> {
+		const closed: string[] = [];
+		const blocked: Array<{ runId: string; reason: string }> = [];
+		const runs = await this.store.listRuns({ limit: null });
+		const activeConversationIds = new Set(runs.filter((run) =>
+			run.status === "queued" || run.status === "running" || run.providerTurnPending === true)
+			.map((run) => run.conversationId));
+		const inspectedConversationIds = new Set<string>();
+		for (const run of runs) {
+			if (!this.canCloseTerminalWorkerConversation(run)) continue;
+			if (activeConversationIds.has(run.conversationId) || inspectedConversationIds.has(run.conversationId)) continue;
+			inspectedConversationIds.add(run.conversationId);
+			try {
+				const conversation = await this.store.getConversation(run.conversationId);
+				if (conversation.closedAt) continue;
+				await this.store.withConversationOwnershipLock(run.conversationId, () =>
+					this.closeOwnedConversationSession(run.conversationId));
+				closed.push(run.conversationId);
+			} catch (error) {
+				blocked.push({ runId: run.id, reason: errorMessage(error) });
+			}
+		}
+		return { closed, blocked };
 	}
 
 	async recoverActiveRuns(): Promise<{ resumed: string[]; blocked: string[]; deferred: string[] }> {
@@ -988,9 +1063,10 @@ export class GptControlService {
 				run: await this.store.getRun(created.run.id),
 			};
 		}
+		const synchronousWaitMs = request.timeoutMs + this.policy.activeTurnGraceMs + 60_000;
 		return {
 			conversation: await this.store.getConversation(created.conversation.id),
-			run: await this.waitForRun(created.run.id, request.timeoutMs + 60_000),
+			run: await this.waitForRun(created.run.id, synchronousWaitMs),
 		};
 	}
 
@@ -1207,6 +1283,23 @@ export class GptControlService {
 				this.scheduleProviderStopReconciliation(runId);
 			}
 			return terminal;
+		}).then(async (terminal) => {
+			if (!this.canCloseTerminalWorkerConversation(terminal)) return terminal;
+			try {
+				await this.closeTerminalWorkerConversation(terminal);
+				return terminal;
+			} catch (error) {
+				const warning = `Terminal GPT Worker tab cleanup was not proved: ${errorMessage(error)}`;
+				const current = await this.store.getRun(runId);
+				const warnings = current.diagnostics?.organizationWarnings ?? [];
+				if (warnings.includes(warning)) return current;
+				return this.store.updateRun(runId, {
+					diagnostics: {
+						...(current.diagnostics ?? {}),
+						organizationWarnings: [...warnings, warning],
+					},
+				});
+			}
 		}).finally(() => {
 			this.activeRuns.delete(runId);
 			this.cancellationIntents.delete(runId);
@@ -1585,7 +1678,21 @@ export class GptControlService {
 				},
 			});
 			await driver.upload(activeSession, run.attachmentManifest.files.map((file) => file.path), signal);
-			await driver.fill(activeSession, request.prompt, signal);
+			if (run.connectorIntent?.mode === "prefer") {
+				if (!driver.fillWithConnectorMentions) {
+					throw new Error("Inline connector selection is unavailable. The assignment was not sent.");
+				}
+				await driver.fillWithConnectorMentions(activeSession, request.prompt, run.connectorIntent.names, signal);
+				run = await this.store.updateRun(run.id, {
+					connectorSelection: {
+						status: "verified",
+						names: [...run.connectorIntent.names],
+						verifiedAt: nowIso(),
+					},
+				});
+			} else {
+				await driver.fill(activeSession, request.prompt, signal);
+			}
 			const verification = await this.withProviderRateLimitRecovery(
 				driver, expected, run, signal,
 				(session) => driver.verifyModel(session, requestedSelection, signal),
@@ -1779,16 +1886,27 @@ export class GptControlService {
 			}
 		}
 
-		const remaining = Math.max(1, Math.min(
-			run.timeoutMs ?? 600_000,
-			Date.parse(run.deadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600_000),
-		));
+		const completionDeadlineAt = run.providerActiveDeadlineAt ?? run.deadlineAt;
+		const remaining = Math.max(1,
+			Date.parse(completionDeadlineAt ?? "") - Date.now() || (run.timeoutMs ?? 600_000));
 		const outcome = await waitForCompletedDriverTurn(driver, expected, {
 			baselineCount: required(baselineCount, "assistant-turn baseline"),
 			timeoutMs: remaining,
 			conversationUrl: conversation.providerConversationUrl,
 			providerTurnIdentityPersisted: Boolean(run.providerUserMessageId && run.receipt.providerConversationUrl),
+			activeTurnGraceMs: this.policy.activeTurnGraceMs,
+			activeDeadlineAt: run.providerActiveDeadlineAt,
 			signal,
+			onActiveTurnGrace: async (receipt) => {
+				run = await this.store.updateRun(run.id, {
+					providerActiveDeadlineAt: receipt.deadlineAt,
+					diagnostics: {
+						...(run.diagnostics ?? {}),
+						providerActiveObservedAt: receipt.observedAt,
+						providerActiveState: receipt.stateSummary,
+					},
+				});
+			},
 			onConversationIdentity: async (identity) => {
 				await this.persistConversationIdentity(conversation.id, identity);
 			},
@@ -1916,7 +2034,14 @@ export class GptControlService {
 				},
 			});
 			const prompt = connectorPreflightPrompt(intent.names);
-			await driver.fill(activeSession, prompt, signal);
+			if (!driver.fillWithConnectorMentions) {
+				return { terminal: browserNeedsUser(
+					"Required connector preflight cannot prove selected ChatGPT connector mentions with this browser driver. The main assignment was not sent.",
+					conversation,
+					run,
+				) };
+			}
+			await driver.fillWithConnectorMentions(activeSession, prompt, intent.names, signal);
 			const verification = await this.withProviderRateLimitRecovery(
 				driver, expected, run, signal,
 				(session) => driver.verifyModel(session, requestedSelection, signal),
@@ -2084,7 +2209,7 @@ export class GptControlService {
 					throw new Error("Terminal run retains an unresolved provider turn; browser ownership was preserved for Stop reconciliation.");
 				}
 				await assertExactDriverSession(owned.driver, owned.expected);
-				await owned.driver.close(owned.expected.sessionId);
+				await owned.driver.close(owned.expected.sessionId, undefined, owned.expected.pageId);
 				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
 				throw new Error("Run became terminal while browser-session ownership was being recovered.");
 			}
@@ -2150,7 +2275,7 @@ export class GptControlService {
 			});
 			if (TERMINAL.has(run.status)) {
 				await assertExactDriverSession(available.driver, expected);
-				await available.driver.close(session.sessionId);
+				await available.driver.close(session.sessionId, undefined, session.pageId);
 				await this.store.updateConversation(conversation.id, { closedAt: nowIso() });
 				throw new Error("Run became terminal while its owned browser session was being allocated.");
 			}
@@ -2161,7 +2286,7 @@ export class GptControlService {
 				try {
 					if (session.name !== name) throw new Error("Created browser session did not retain its broker ownership name.");
 					await assertExactDriverSession(available.driver, expected);
-					await available.driver.close(session.sessionId);
+					await available.driver.close(session.sessionId, undefined, session.pageId);
 				} catch (cleanupError) {
 					conversation = await this.store.updateConversation(conversation.id, {
 						browserSessionId: session.sessionId,
@@ -2199,8 +2324,50 @@ export class GptControlService {
 		}
 		const { driver, expected } = await this.resolveOwnedDriver(conversation);
 		await assertExactDriverSession(driver, expected);
-		await driver.close(expected.sessionId);
+		await driver.close(expected.sessionId, undefined, expected.pageId);
 		await this.store.updateConversation(conversationId, { closedAt: nowIso() });
+	}
+
+	private async closeOwnedConversationSession(conversationId: string): Promise<ConversationRecord> {
+		return this.store.withConversationLock(conversationId, async () => {
+			const conversation = await this.store.getConversation(conversationId);
+			if (conversation.closedAt) return conversation;
+			if (conversation.provider !== "browser") {
+				throw new Error(`Provider ${conversation.provider} cannot be closed by the hardened browser broker.`);
+			}
+			if (!conversation.browserSessionId && conversation.browserPageId === undefined) {
+				return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+			}
+			if (!conversation.browserSessionId || conversation.browserPageId === undefined) {
+				throw new Error(`Conversation ${conversationId} has incomplete browser ownership state.`);
+			}
+			try {
+				const { driver, expected } = await this.resolveOwnedDriver(conversation);
+				await assertExactDriverSession(driver, expected);
+				await driver.close(expected.sessionId, undefined, expected.pageId);
+			} catch (error) {
+				if (!ownedBrowserPageIsMissing(error)) throw error;
+			}
+			return this.store.updateConversation(conversationId, { closedAt: nowIso() });
+		});
+	}
+
+	private canCloseTerminalWorkerConversation(run: RunRecord): boolean {
+		const legacyUnresolved = run.providerTurnPending === undefined
+			&& (run.status === "cancelled" || run.status === "needs_user")
+			&& (run.submissionState === "submitting" || run.submissionState === "submitted");
+		return run.kind === "subagent"
+			&& TERMINAL.has(run.status)
+			&& run.providerTurnPending !== true
+			&& !legacyUnresolved;
+	}
+
+	private async closeTerminalWorkerConversation(run: RunRecord): Promise<boolean> {
+		if (!this.canCloseTerminalWorkerConversation(run)) return false;
+		const conversation = await this.store.getConversation(run.conversationId);
+		if (conversation.closedAt) return false;
+		await this.closeConversation(conversation.id);
+		return true;
 	}
 
 	private async resolveOwnedDriver(
@@ -2343,6 +2510,10 @@ export class GptControlService {
 		if (!expectedIdentity || !currentIdentity || expectedIdentity.url !== currentIdentity.url) return false;
 		let observation = await driver.observe(session);
 		if (!this.observationProvesRun(run, observation)) return false;
+		if (observation.turnInterruption) {
+			await this.store.clearProviderTurnState(run.id);
+			return true;
+		}
 		let stopIssued = false;
 		if (observation.answering || observation.thinking || observation.toolRunning) {
 			await driver.recover(session, "stop");
@@ -2497,10 +2668,10 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	const connectorIntent = connectorNames.length > 0
 		? { names: connectorNames, mode: request.connectorMode ?? "prefer" }
 		: undefined;
-	if (connectorIntent?.mode === "require") {
+	if (connectorIntent) {
 		const missingMentions = connectorIntent.names.filter((name) => !request.prompt.includes(`@${name}`));
 		if (missingMentions.length > 0) {
-			throw new Error(`Required connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
+			throw new Error(`Connector prompts must contain these literal mentions: ${missingMentions.map((name) => `@${name}`).join(", ")}.`);
 		}
 	}
 	return {
@@ -2569,14 +2740,22 @@ function normalizeProjectId(value: string): string {
 
 function connectorPreflightPrompt(names: readonly string[]): string {
 	const checks = names.map((name) => {
-		const detail = name.toLowerCase() === "zenbox"
-			? "make one harmless read-only health call, such as computer_overview, and include one returned fact"
-			: name.toLowerCase() === "github"
-				? "make one harmless read-only call and include one returned account or repository fact"
-				: "make one harmless read-only health call and include one returned fact";
-		return `- @${name}: ${detail}`;
+		return `- @${name}: ${connectorPreflightDetail(name)}`;
 	}).join("\n");
-	return `Before we start the assignment, please quickly check these connected tools in this same chat:\n${checks}\n\nDo not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise fact returned by the tool"}]}. Include exactly one entry for every listed tool. If a tool is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+	return `Before we start the assignment, please quickly check these connected tools and instruction plugins in this same chat:\n${checks}\n\nDo not start the assignment yet and do not change external state. Reply with only one JSON object in this form: {"connectors":[{"name":"exact name","status":"ready","payload":"one concise readiness fact"}]}. Include exactly one entry for every listed connector. For an instruction plugin explicitly marked above, exact pill selection is sufficient and must be reported as ready without tool discovery. If any other connector is unavailable or does not return a usable result, set its status to "blocked" and explain the blocker in payload.`;
+}
+
+function connectorPreflightDetail(name: string): string {
+	switch (name.toLowerCase()) {
+		case "compound engineering":
+			return "this is an instruction plugin, not a callable tool; the exact selected connector pill is the readiness proof, so do not search for or call tools and report status ready with payload \"exact connector pill selected\"";
+		case "zenbox":
+			return "make one harmless read-only health call, such as computer_overview, and include one returned fact";
+		case "github":
+			return "make one harmless read-only call and include one returned account or repository fact";
+		default:
+			return "make one harmless read-only health call and include one returned fact";
+	}
 }
 
 function parseConnectorPreflight(
@@ -2605,15 +2784,18 @@ function parseConnectorPreflight(
 			return { ok: false, reason: "Required connector preflight contained a malformed connector result." };
 		}
 		const record = entry as { name?: unknown; status?: unknown; payload?: unknown };
-		if (typeof record.name !== "string" || !names.includes(record.name) || seen.has(record.name)) {
+		const connectorName = typeof record.name === "string" && record.name.startsWith("@")
+			? record.name.slice(1)
+			: record.name;
+		if (typeof connectorName !== "string" || !names.includes(connectorName) || seen.has(connectorName)) {
 			return { ok: false, reason: "Required connector preflight returned a missing, duplicate, or unexpected connector name." };
 		}
-		seen.add(record.name);
+		seen.add(connectorName);
 		const usablePayload = typeof record.payload === "string"
 			? record.payload.trim().length > 0
 			: Boolean(record.payload && typeof record.payload === "object" && !Array.isArray(record.payload) && Object.keys(record.payload).length > 0);
 		if (record.status !== "ready" || !usablePayload) {
-			return { ok: false, reason: `Required connector @${record.name} did not report a usable ready payload.` };
+			return { ok: false, reason: `Required connector @${connectorName} did not report a usable ready payload.` };
 		}
 	}
 	return { ok: true };
@@ -2643,6 +2825,7 @@ function publicPolicy(policy: OperatorPolicy): Record<string, unknown> {
 		maxPromptBytes: policy.maxPromptBytes,
 		maxActiveGenerations: policy.maxActiveGenerations,
 		maxConcurrentWorkers: policy.maxConcurrentWorkers,
+		activeTurnGraceMs: policy.activeTurnGraceMs,
 		activeDiagnosticsAllowed: policy.allowActiveDiagnostics,
 		providerTurnAbandonmentConfigured: Boolean(policy.providerTurnAbandonmentTokenHash),
 		fingerprint: policy.fingerprint,

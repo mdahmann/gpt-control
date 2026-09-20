@@ -12,6 +12,7 @@ import {
 	closeSession,
 	createSession,
 	fillPrompt,
+	fillPromptWithConnectorMentions,
 	navigateSession,
 	providerConversationIdentity,
 	readChatPageObservation,
@@ -25,6 +26,7 @@ import {
 	setSessionState,
 	showSession,
 	tabIdFromSession,
+	tabIdsFromSession,
 	tabUrl,
 	verifyChatGptModelBeforeSend,
 	openChat,
@@ -41,6 +43,7 @@ import {
 	type ModelVerification,
 } from "./chatgpt";
 import { nowIso, type ChatGptModel, type RecoveryAttempt } from "./domain";
+import { BridgeCommandError, readString } from "./json";
 import { probeBridge, resolveBridgeLauncher, splitCommandLine, type Launcher } from "./transport";
 import type { Exec } from "./types";
 import { sanitizeBrowserDriverEnv } from "../scripts/driver-env.mjs";
@@ -113,6 +116,7 @@ export interface WebChatDriver {
 	navigate(session: DriverSession, url: string, signal?: AbortSignal): Promise<DriverSession>;
 	upload(session: DriverSession, files: readonly string[], signal?: AbortSignal): Promise<void>;
 	fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void>;
+	fillWithConnectorMentions?(session: DriverSession, prompt: string, connectorNames: readonly string[], signal?: AbortSignal): Promise<void>;
 	discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog>;
 	discoverProjects(session: DriverSession, signal?: AbortSignal): Promise<ChatGptProjectCatalog>;
 	findConversations?(request: ChatGptConversationFindRequest, signal?: AbortSignal): Promise<ChatGptConversationCatalog>;
@@ -124,7 +128,7 @@ export interface WebChatDriver {
 	observe(session: DriverSession, signal?: AbortSignal): Promise<ChatPageObservation>;
 	recover(session: DriverSession, action: DriverRecoveryAction, signal?: AbortSignal): Promise<void>;
 	setState(sessionId: string, state: DriverSessionState, signal?: AbortSignal): Promise<void>;
-	close(sessionId: string, signal?: AbortSignal): Promise<void>;
+	close(sessionId: string, signal?: AbortSignal, expectedPageId?: DriverPageId): Promise<void>;
 	screenshot(session: DriverSession, outputPath: string, signal?: AbortSignal): Promise<string | undefined>;
 }
 
@@ -218,12 +222,17 @@ export async function waitForCompletedDriverTurn(
 		providerTurnIdentityPersisted?: boolean;
 		onRateLimit?: (message: string) => Promise<void>;
 		onProviderSafety?: (reason: "suspicious_activity" | "human_verification", message: string) => Promise<void>;
+		activeTurnGraceMs?: number;
+		activeDeadlineAt?: string;
+		onActiveTurnGrace?: (receipt: { deadlineAt: string; observedAt: string; stateSummary: string }) => Promise<void>;
 	},
 ): Promise<DriverCompletionOutcome> {
 	const intervalMs = options.intervalMs ?? browserPollIntervalMs();
 	const stableRounds = options.stableRounds ?? 3;
 	const maxRecoveryCycles = options.maxRecoveryCycles ?? 3;
-	const deadline = Date.now() + options.timeoutMs;
+	const ordinaryDeadline = Date.now() + options.timeoutMs;
+	let activeDeadline = parseOptionalDeadline(options.activeDeadlineAt);
+	let activeGraceGranted = options.activeDeadlineAt !== undefined;
 	const recoveryAttempts: RecoveryAttempt[] = [];
 	const suppliedIdentity = options.conversationUrl ? providerConversationIdentity(options.conversationUrl) : undefined;
 	if (options.conversationUrl && !suppliedIdentity) {
@@ -240,6 +249,7 @@ export async function waitForCompletedDriverTurn(
 	let lastObservedUrl: string | undefined;
 	let lastObservedUiState: string | undefined;
 	let recoveryCycles = 0;
+	let lastExactObservation: ChatPageObservation | undefined;
 	const validateObservedTurn = async (
 		session: DriverSession,
 		observation: ChatPageObservation,
@@ -257,8 +267,31 @@ export async function waitForCompletedDriverTurn(
 		return "approved";
 	};
 
-	while (Date.now() < deadline) {
-		await abortableSleep(intervalMs, options.signal);
+	while (true) {
+		const effectiveDeadline = activeDeadline ?? ordinaryDeadline;
+		if (Date.now() >= effectiveDeadline) {
+			if (lastExactObservation === undefined) {
+				// Setup and provider-issued identity binding can consume a very short
+				// caller deadline. Take one exact observation before deciding whether
+				// the submitted turn is active, settling, or absent.
+			} else if (!activeGraceGranted
+				&& isProviderTurnActiveOrSettling(lastExactObservation, options.baselineCount)
+				&& (options.activeTurnGraceMs ?? 0) > 0) {
+				const observedAt = nowIso();
+				activeDeadline = Math.max(Date.now() + 1, ordinaryDeadline + (options.activeTurnGraceMs ?? 0));
+				activeGraceGranted = true;
+				await options.onActiveTurnGrace?.({
+					deadlineAt: new Date(activeDeadline).toISOString(),
+					observedAt,
+					stateSummary: lastExactObservation?.stateSummary ?? "active",
+				});
+				continue;
+			} else {
+				break;
+			}
+		} else {
+			await abortableSleep(Math.max(1, Math.min(intervalMs, effectiveDeadline - Date.now())), options.signal);
+		}
 		let session = await assertExactDriverSession(driver, expected, options.signal);
 		lastObservedUrl = session.url;
 		const currentIdentity = providerConversationIdentity(session.url);
@@ -326,6 +359,7 @@ export async function waitForCompletedDriverTurn(
 				);
 			}
 			providerTurnIdentityPending = validation === "pending";
+			lastExactObservation = providerTurnIdentityPending ? undefined : observation;
 		} catch (error) {
 			return needsUser(
 				`The observed provider turn identity could not be durably recorded: ${errorMessage(error)}`,
@@ -359,6 +393,7 @@ export async function waitForCompletedDriverTurn(
 					);
 				}
 				providerTurnIdentityPending = validation === "pending";
+				lastExactObservation = providerTurnIdentityPending ? undefined : observation;
 			} catch (error) {
 				return needsUser(
 					`The recovered provider turn identity could not be durably validated: ${errorMessage(error)}`,
@@ -372,6 +407,12 @@ export async function waitForCompletedDriverTurn(
 				exactNeedsUserReason(observation, "Recovery budget exhausted"),
 				latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState,
 			);
+		}
+		if (observation.turnInterruption) {
+			const reason = observation.turnInterruption === "user"
+				? `The exact ChatGPT turn was stopped by the user. GPT-Control will not continue it automatically: ${observation.interruptionMessage ?? "user stop observed"}`
+				: `ChatGPT interrupted the exact provider turn. A supervising Codex agent must inspect the settled transcript before deciding on a specific continuation: ${observation.interruptionMessage ?? "provider interruption observed"}`;
+			return needsUser(reason, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
 		}
 		if (providerTurnIdentityPending) {
 			steady = 0;
@@ -413,10 +454,25 @@ export async function waitForCompletedDriverTurn(
 		}
 	}
 
+	const graceExpired = activeGraceGranted && activeDeadline !== undefined && Date.now() >= activeDeadline;
 	const reason = latest
-		? `Timed out before the exact ChatGPT conversation proved the new assistant turn was final. Last UI state: ${lastObservedUiState ?? "unknown"}.`
+		? `${graceExpired ? "The active grace deadline expired" : "Timed out"} before the exact ChatGPT conversation proved the new assistant turn was final. Last UI state: ${lastObservedUiState ?? "unknown"}.`
 		: `No new assistant turn appeared before the timeout. Last UI state: ${lastObservedUiState ?? "unknown"}.`;
 	return needsUser(reason, latest, conversationId, exactUrl, recoveryAttempts, lastObservedUrl, lastObservedUiState);
+}
+
+function parseOptionalDeadline(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function isProviderTurnActiveOrSettling(observation: ChatPageObservation | undefined, baselineCount: number): boolean {
+	if (!observation || observation.turnInterruption) return false;
+	if (observation.answering || observation.thinking || observation.toolRunning) return true;
+	return observation.snapshot.count > baselineCount
+		&& ((observation.snapshot.hasMarkdown && observation.snapshot.text.trim() !== "")
+			|| observation.snapshot.imageUrls.length > 0);
 }
 
 async function restoreExactDriverConversation(
@@ -628,9 +684,10 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	async probe(signal?: AbortSignal): Promise<DriverProbe> {
 		const result = await probeBridge(this.exec, this.launcher, signal);
 		const secureInput = Boolean(this.launcher.privateRpc);
-		const exactTargetEnforced = secureInput && result.ready
-			? await probeExpectedTargetEnforcement(this.exec, this.launcher, signal)
-			: false;
+		const exactTargetEnforced = secureInput && result.ready && (
+			result.expectedTargetEnforcement === "document-v1"
+			|| await probeExpectedTargetEnforcement(this.exec, this.launcher, signal)
+		);
 		return {
 			ready: result.ready && secureInput && exactTargetEnforced,
 			driver: this.id,
@@ -646,13 +703,19 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 
 	async create(name: string, url: string, signal?: AbortSignal): Promise<DriverSession> {
 		const sessionId = await createSession(this.exec, this.launcher, name, signal);
-		const pageId = await openChat(this.exec, this.launcher, sessionId, url, signal);
-		const created = await this.show(sessionId, signal);
-		if (created.name !== name || String(created.pageId) !== String(pageId)) {
-			await closeSession(this.exec, this.launcher, sessionId, signal).catch(() => undefined);
-			throw new Error("Chrome Bridge did not preserve the newly-created exact session/page identity.");
+		try {
+			const pageId = await openChat(this.exec, this.launcher, sessionId, url, signal);
+			const created = await this.show(sessionId, signal);
+			if (created.name !== name || String(created.pageId) !== String(pageId)) {
+				throw new Error("Chrome Bridge did not preserve the newly-created exact session/page identity.");
+			}
+			return created;
+		} catch (error) {
+			if (!retainsUncertainCreateOwnership(error)) {
+				await closeSession(this.exec, this.launcher, sessionId, signal).catch(() => undefined);
+			}
+			throw error;
 		}
-		return created;
 	}
 
 	async show(sessionId: string, signal?: AbortSignal): Promise<DriverSession> {
@@ -680,6 +743,19 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 	async fill(session: DriverSession, prompt: string, signal?: AbortSignal): Promise<void> {
 		await this.assertActionTarget(session, signal);
 		await fillPrompt(this.exec, this.launcher, numericPageId(session.pageId), prompt, signal, 60_000, exactActionTarget(session));
+	}
+
+	async fillWithConnectorMentions(session: DriverSession, prompt: string, connectorNames: readonly string[], signal?: AbortSignal): Promise<void> {
+		await this.assertActionTarget(session, signal);
+		await fillPromptWithConnectorMentions(
+			this.exec,
+			this.launcher,
+			numericPageId(session.pageId),
+			prompt,
+			connectorNames,
+			signal,
+			exactActionTarget(session),
+		);
 	}
 
 	async discoverModels(session: DriverSession, signal?: AbortSignal): Promise<ChatGptModelCatalog> {
@@ -737,7 +813,17 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		await setSessionState(this.exec, this.launcher, sessionId, state, signal);
 	}
 
-	async close(sessionId: string, signal?: AbortSignal): Promise<void> {
+	async close(sessionId: string, signal?: AbortSignal, expectedPageId?: DriverPageId): Promise<void> {
+		if (expectedPageId !== undefined) {
+			const owned = await showSession(this.exec, this.launcher, sessionId, signal);
+			const pageIds = tabIdsFromSession(owned);
+			if (!pageIds.some((pageId) => String(pageId) === String(expectedPageId))) {
+				throw new Error(`Browser session ${sessionId} no longer owns the recorded page; close refused.`);
+			}
+			if (pageIds.length !== 1) {
+				throw new Error(`Browser session ${sessionId} owns ${pageIds.length} pages; automatic whole-session close refused.`);
+			}
+		}
 		await closeSession(this.exec, this.launcher, sessionId, signal);
 	}
 
@@ -745,6 +831,11 @@ export class ChromeBridgeBrowserDriver implements WebChatDriver {
 		await this.assertActionTarget(session, signal);
 		return captureOwnedScreenshot(this.exec, this.launcher, session.sessionId, numericPageId(session.pageId), outputPath, signal, exactActionTarget(session));
 	}
+}
+
+function retainsUncertainCreateOwnership(error: unknown): boolean {
+	return error instanceof BridgeCommandError
+		&& readString(error.payload, "errorCode") === "uncertain_create_ownership";
 }
 
 function canonicalActionUrl(raw: string): string {
@@ -801,6 +892,8 @@ const ObservationSchema = z.object({
 	rateLimitMessage: z.string().optional(),
 	providerSafetyReason: z.enum(["suspicious_activity", "human_verification"]).optional(),
 	providerSafetyMessage: z.string().optional(),
+	turnInterruption: z.enum(["provider", "user"]).optional(),
+	interruptionMessage: z.string().optional(),
 	errorMessage: z.string().optional(),
 	stateSummary: z.string(),
 }).strict();
@@ -1015,7 +1108,7 @@ export class ExternalCommandBrowserDriver implements WebChatDriver {
 		await this.call("set_state", { sessionId, state }, signal);
 	}
 
-	async close(sessionId: string, signal?: AbortSignal): Promise<void> {
+	async close(sessionId: string, signal?: AbortSignal, _expectedPageId?: DriverPageId): Promise<void> {
 		await this.call("close", { sessionId }, signal);
 	}
 

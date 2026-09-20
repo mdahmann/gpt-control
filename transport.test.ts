@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BROWSER_DRIVER_PROTOCOL_VERSION, ExternalCommandBrowserDriver, type WebChatDriver } from "./src/browser-driver";
+import { BROWSER_DRIVER_PROTOCOL_VERSION, ChromeBridgeBrowserDriver, ExternalCommandBrowserDriver, type WebChatDriver } from "./src/browser-driver";
 import { selectRoute, type Capabilities } from "./src/capability";
 import { GptControlService } from "./src/service";
 import { operatorPolicyFromEnv } from "./src/policy";
@@ -49,6 +49,39 @@ const driver: WebChatDriver = {
 };
 
 describe("secure browser routing", () => {
+	test("accepts the bridge readiness attestation without opening a probe tab", async () => {
+		const calls: string[][] = [];
+		const launcher: Launcher = {
+			command: "chrome-bridge",
+			args: [],
+			origin: "test",
+			privateRpc: {
+				command: "python3",
+				args: [],
+				clientScript: "/private/test_client.py",
+				origin: "private",
+			},
+		};
+		const exec: Exec = async (_command, args) => {
+			calls.push([...args]);
+			return {
+				stdout: JSON.stringify({
+					ready: true,
+					endpointStatus: "reachable",
+					extension: "connected",
+					expectedTargetEnforcement: "document-v1",
+				}),
+				stderr: "",
+				code: 0,
+				killed: false,
+			};
+		};
+		const probe = await new ChromeBridgeBrowserDriver(exec, launcher).probe();
+		expect(probe).toMatchObject({ ready: true, secureInput: true });
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toContain("ready");
+	});
+
 	test("uses only a ready secure protocol-v2 driver", () => {
 		const capabilities: Capabilities = { browser: { driver, probe: readyProbe, source: "test" } };
 		expect(selectRoute(capabilities)).toEqual({ kind: "browser", driver });

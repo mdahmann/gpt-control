@@ -63,6 +63,46 @@ export interface ChatGptSelection {
 	effort?: string;
 }
 
+export function isChatGptWorkExperience(html: string): boolean {
+	const root = parse(html);
+	const prompt = root.querySelector("#prompt-textarea") ?? root.querySelector('div[contenteditable="true"]');
+	const promptLabel = prompt
+		? [prompt.getAttribute("placeholder"), prompt.getAttribute("aria-label"), prompt.structuredText]
+			.filter((value): value is string => Boolean(value))
+			.join(" ")
+			.replace(/\s+/g, " ")
+			.trim()
+		: "";
+	if (/\bWork on anything\b/i.test(promptLabel)) return true;
+
+	const selectedWorkToggle = root.querySelectorAll('button,[role="tab"]').some((node) => {
+		if (nodeLabel(node).toLowerCase() !== "work") return false;
+		return node.getAttribute("aria-selected") === "true"
+			|| node.getAttribute("aria-pressed") === "true"
+			|| node.getAttribute("data-state") === "active";
+	});
+	if (selectedWorkToggle) return true;
+
+	return root.querySelectorAll('header,[class*="page-header"],[data-testid*="header"]').some((node) =>
+		/\s·\sWork\s*$/i.test(node.structuredText.replace(/\s+/g, " ").trim()));
+}
+
+function assertChatGptChatExperience(html: string): void {
+	if (isChatGptWorkExperience(html)) {
+		throw new Error("ChatGPT Work is selected. GPT-Control requires Chat mode for this route. No prompt was sent.");
+	}
+}
+
+export function extractComposerSelection(html: string): ChatGptSelection | undefined {
+	const root = parse(html);
+	const composer = composerContainer(root);
+	if (!composer) return undefined;
+	const observations = composer.querySelectorAll("button").map(splitModelEffortFromButton)
+		.filter((value): value is Required<ChatGptSelection> => Boolean(value));
+	if (observations.length > 1) throw new Error("Composer model selector is ambiguous.");
+	return observations[0];
+}
+
 export interface ChatGptCatalogOption {
 	label: string;
 	note?: string;
@@ -123,6 +163,8 @@ export interface ChatPageObservation {
 	rateLimitMessage?: string;
 	providerSafetyReason?: "suspicious_activity" | "human_verification";
 	providerSafetyMessage?: string;
+	turnInterruption?: "provider" | "user";
+	interruptionMessage?: string;
 	errorMessage?: string;
 	stateSummary: string;
 }
@@ -260,14 +302,22 @@ export async function probeExpectedTargetEnforcement(
 }
 
 export function tabIdFromSession(session: Record<string, unknown>): number | undefined {
+	return tabIdsFromSession(session)[0];
+}
+
+export function tabIdsFromSession(session: Record<string, unknown>): number[] {
 	const tabs = session.tabIds ?? session.tabs;
-	if (!Array.isArray(tabs)) return undefined;
+	if (!Array.isArray(tabs)) return [];
+	const ids: number[] = [];
 	for (const entry of tabs) {
-		if (typeof entry === "number") return entry;
+		if (typeof entry === "number") {
+			ids.push(entry);
+			continue;
+		}
 		const id = readNumber(entry, "id") ?? readNumber(entry, "tabId");
-		if (id !== undefined) return id;
+		if (id !== undefined) ids.push(id);
 	}
-	return undefined;
+	return ids;
 }
 
 function resultOf(payload: Record<string, unknown>): unknown {
@@ -391,6 +441,127 @@ export async function fillPrompt(
 		if (Date.now() >= deadline || signal?.aborted) throw new Error(`Could not fill the ChatGPT prompt. Last error: ${lastError}`);
 		await sleep(Math.min(pollIntervalMs(), 250 * 2 ** attempt, 2000));
 	}
+}
+
+function normalizeComposerText(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
+}
+
+function selectedConnectorMentions(html: string): string[] {
+	const root = parse(html);
+	const composer = root.querySelector("#prompt-textarea") ?? root.querySelector('div[contenteditable="true"]');
+	if (!composer) return [];
+	return composer.querySelectorAll("[data-inline-selection-pill]")
+		.map((node) => normalizeComposerText(node.getAttribute("data-keyword") ?? node.structuredText))
+		.filter(Boolean);
+}
+
+function hasExactConnectorSuggestion(html: string, name: string): boolean {
+	const root = parse(html);
+	const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) =>
+		node.querySelectorAll("span").some((span) => normalizeComposerText(span.structuredText) === name));
+	return matches.length === 1;
+}
+
+async function typePromptText(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	text: string,
+	signal: AbortSignal | undefined,
+	expectedTarget: ExactBrowserActionTarget,
+): Promise<void> {
+	let lastError = "the composer never accepted typed text";
+	for (const selector of PROMPT_SELECTORS) {
+		try {
+			// Chrome Bridge does not yet bind `type` atomically to expectedTarget.
+			// Keep the prompt off argv while proving the exact owned document
+			// immediately before and after the single private type action.
+			await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+			await privateBridgeJson(exec, launcher, "type", { tabId, selector, text }, signal, 60_000);
+			await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
+			return;
+		} catch (error) {
+			const translated = translatePolicyDenial(error);
+			if (translated instanceof PolicyDeniedError) throw translated;
+			lastError = translated instanceof Error ? translated.message : String(translated);
+			if (/expectedTarget/.test(lastError) || !isTransient(lastError)) throw translated;
+		}
+	}
+	throw new Error(`Could not type into the ChatGPT prompt. Last error: ${lastError}`);
+}
+
+async function waitForConnectorComposerState(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	predicate: (html: string) => boolean,
+	what: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const deadline = Date.now() + 15_000;
+	let html = "";
+	while (Date.now() < deadline && !signal?.aborted) {
+		html = await readPageHtml(exec, launcher, tabId, signal);
+		if (predicate(html)) return html;
+		await sleep(100);
+	}
+	throw new Error(`Could not ${what}.`);
+}
+
+export async function fillPromptWithConnectorMentions(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	prompt: string,
+	connectorNames: readonly string[],
+	signal: AbortSignal | undefined,
+	expectedTarget: ExactBrowserActionTarget,
+): Promise<void> {
+	await fillPrompt(exec, launcher, tabId, "", signal, 60_000, expectedTarget);
+	for (const [index, name] of connectorNames.entries()) {
+		if (index > 0) await typePromptText(exec, launcher, tabId, " ", signal, expectedTarget);
+		await typePromptText(exec, launcher, tabId, `@${name}`, signal, expectedTarget);
+		await waitForConnectorComposerState(
+			exec,
+			launcher,
+			tabId,
+			(html) => hasExactConnectorSuggestion(html, name),
+			`find one exact ChatGPT connector suggestion for @${name}`,
+			signal,
+		);
+		await privateOrBridgeAction(exec, launcher, "press", {
+			tabId,
+			selector: PROMPT_SELECTORS[0],
+			key: "Enter",
+		}, signal, expectedTarget);
+		await waitForConnectorComposerState(
+			exec,
+			launcher,
+			tabId,
+			(html) => selectedConnectorMentions(html).includes(name),
+			`verify the selected @${name} connector pill`,
+			signal,
+		);
+	}
+
+	await typePromptText(exec, launcher, tabId, `\n\n${prompt}`, signal, expectedTarget);
+	const expectedPrompt = normalizeComposerText(prompt);
+	await waitForConnectorComposerState(
+		exec,
+		launcher,
+		tabId,
+		(html) => {
+			const root = parse(html);
+			const composer = root.querySelector("#prompt-textarea") ?? root.querySelector('div[contenteditable="true"]');
+			const selected = selectedConnectorMentions(html);
+			return connectorNames.every((name) => selected.includes(name))
+				&& selected.length === connectorNames.length
+				&& Boolean(composer && normalizeComposerText(composer.structuredText).includes(expectedPrompt));
+		},
+		"verify the exact connector pills and preflight prompt before send",
+		signal,
+	);
 }
 
 export async function clickSend(
@@ -582,11 +753,15 @@ export function extractComposerModel(html: string): ComposerModelObservation | u
 				const aria = (button.getAttribute("aria-label") ?? "").toLowerCase();
 				const testId = (button.getAttribute("data-testid") ?? "").toLowerCase();
 				const visibleModel = normalizeModelLabel(cleanModelLabel(nodeLabel(button)));
+				const compactVisibleModel = visibleModel.replaceAll(" ", "");
 				return button.getAttribute("aria-haspopup") === "menu"
 					&& (aria.includes("model")
 						|| aria.includes("intelligence")
 						|| testId.includes("model")
-						|| ["pro", "auto", "instant", "medium", "high", "extra high", "thinking"].includes(visibleModel));
+						|| button.querySelectorAll("span").some((span) =>
+							(span.getAttribute("class") ?? "").includes("SliderTriggerModelLabel"))
+						|| ["pro", "auto", "instant", "medium", "high", "extra high", "thinking"].includes(visibleModel)
+						|| /^\d+(?:\.\d+)?(?:pro|auto|instant|medium|high|extrahigh|thinking)$/.test(compactVisibleModel));
 			});
 		}
 	}
@@ -608,24 +783,34 @@ export async function discoverChatGptModels(
 	timeoutMs = 30_000,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ChatGptModelCatalog> {
+	assertChatGptChatExperience(await readPageHtml(exec, launcher, tabId, signal));
 	const state = await openAdvancedPicker(exec, launcher, tabId, Date.now() + timeoutMs, signal, expectedTarget);
-	const models = state.modelSelector
-		? await openPickerOptions(exec, launcher, tabId, state.modelSelector, Date.now() + timeoutMs, signal, expectedTarget)
-		: [];
-	if (models.length > 0) {
+	const modelObservations = state.inlineModelOptions ?? (state.modelSelector
+		? await openPickerOptionObservations(exec, launcher, tabId, state.modelSelector, Date.now() + timeoutMs, signal, expectedTarget)
+		: []);
+	const models = modelObservations.map(({ label, note }) => ({ label, ...(note ? { note } : {}) }));
+	const selectedModel = modelObservations.find((option) => option.selected)?.label;
+	if (models.length > 0 && !state.inlineModelOptions) {
 		// Radix keeps the model submenu over the sibling effort trigger. ArrowLeft
 		// closes only that nested menu and returns focus to its parent row.
 		await pressPickerKey(exec, launcher, tabId, "ArrowLeft", signal, expectedTarget);
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	let effortState = state;
-	let efforts = effortState.effortSelector
+	let efforts: ChatGptCatalogOption[] = [];
+	if (effortState.powerSlider) {
+		const powerCatalog = discoverPowerSliderOptions(effortState);
+		effortState = powerCatalog.state;
+		efforts = powerCatalog.options;
+	} else {
+		efforts = effortState.effortSelector
 		? await openPickerOptions(
 			exec, launcher, tabId, effortState.effortSelector,
 			Date.now() + Math.min(timeoutMs, 5_000), signal, expectedTarget,
 		)
 		: [];
-	if (efforts.length === 0 && state.effortSelector) {
+	}
+	if (efforts.length === 0 && state.effortSelector && !state.powerSlider) {
 		// Fresh pages can briefly leave the model submenu over the effort row.
 		// Reopen the complete picker only after the normal direct hover failed.
 		await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
@@ -639,7 +824,7 @@ export async function discoverChatGptModels(
 		throw new Error("ChatGPT model and effort options are unavailable in the live composer picker.");
 	}
 	return {
-		currentModel: effortState.currentModel ?? state.currentModel,
+		currentModel: effortState.currentModel ?? state.currentModel ?? selectedModel,
 		currentEffort: effortState.currentEffort ?? state.currentEffort,
 		models,
 		efforts,
@@ -817,16 +1002,18 @@ export async function selectAndVerifyChatGptModel(
 	timeoutMs = 30_000,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	const initialHtml = await readPageHtml(exec, launcher, tabId, signal);
+	assertChatGptChatExperience(initialHtml);
 	if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
-		return selectAndVerifyDynamicSelection(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, timeoutMs, expectedTarget);
+		return selectAndVerifyDynamicSelection(exec, launcher, tabId, normalizeRequestedSelection(requested), initialHtml, signal, timeoutMs, expectedTarget);
 	}
 	const requestedPreset = "pro";
 	const deadline = Date.now() + timeoutMs;
-	let observed: ComposerModelObservation | undefined;
+	let observed = extractComposerModel(initialHtml);
 	for (;;) {
-		observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 		if (observed || Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
+		observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
 	}
 	if (!observed) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
 	if (observed.normalized !== requestedPreset) {
@@ -897,11 +1084,13 @@ export async function verifyChatGptModelBeforeSend(
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	const html = await readPageHtml(exec, launcher, tabId, signal);
+	assertChatGptChatExperience(html);
 	if (typeof requested !== "string" || requested.toLowerCase() !== "pro") {
-		return verifyDynamicSelectionBeforeSend(exec, launcher, tabId, normalizeRequestedSelection(requested), signal, expectedTarget);
+		return verifyDynamicSelectionBeforeSend(exec, launcher, tabId, normalizeRequestedSelection(requested), html, signal, expectedTarget);
 	}
 	const requestedPreset = "pro";
-	const observed = extractComposerModel(await readPageHtml(exec, launcher, tabId, signal));
+	const observed = extractComposerModel(html);
 	if (!observed) throw new Error("ChatGPT composer model selector disappeared before send. No prompt was sent.");
 	if (observed.normalized !== requestedPreset) {
 		throw new Error(
@@ -931,10 +1120,15 @@ async function selectAndVerifyDynamicSelection(
 	launcher: Launcher,
 	tabId: number,
 	requested: ChatGptSelection,
+	initialHtml: string,
 	signal?: AbortSignal,
 	timeoutMs = 30_000,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	const direct = extractComposerSelection(initialHtml);
+	if (direct && selectionMatches(requested, direct)) {
+		return verifiedDynamicSelection(requested, direct);
+	}
 	const catalog = await discoverChatGptModels(exec, launcher, tabId, signal, timeoutMs, expectedTarget);
 	const requestedModel = requested.model ? exactCatalogLabel(catalog.models, requested.model, "model") : undefined;
 	const requestedEffort = requested.effort ? exactCatalogLabel(catalog.efforts, requested.effort, "effort") : undefined;
@@ -951,7 +1145,7 @@ async function selectAndVerifyDynamicSelection(
 	assertSelectionReadback(requestedModel, requestedEffort, observedModel, observedEffort, "read-back mismatch");
 	await closeAdvancedPicker(exec, launcher, tabId, signal, expectedTarget);
 	return {
-		requestedModel: requestedModel ?? observedModel ?? "current live model",
+		requestedModel: requested.model ?? observedModel ?? "current live model",
 		observedModel: observedModel ?? "current live model",
 		...(requestedEffort ? { requestedEffort } : {}),
 		...(observedEffort ? { observedEffort } : {}),
@@ -966,9 +1160,32 @@ async function verifyDynamicSelectionBeforeSend(
 	launcher: Launcher,
 	tabId: number,
 	requested: ChatGptSelection,
+	html: string,
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ModelVerification> {
+	if (requested.model && isGpt6Request(requested.model)) {
+		const catalog = await discoverChatGptModels(exec, launcher, tabId, signal, 10_000, expectedTarget);
+		const resolvedModel = exactCatalogLabel(catalog.models, requested.model, "model");
+		assertSelectionReadback(
+			resolvedModel, requested.effort,
+			catalog.currentModel, catalog.currentEffort,
+			"changed before send",
+		);
+		return {
+			requestedModel: requested.model,
+			observedModel: catalog.currentModel ?? "current live model",
+			...(requested.effort ? { requestedEffort: requested.effort } : {}),
+			...(catalog.currentEffort ? { observedEffort: catalog.currentEffort } : {}),
+			modelVerified: true,
+			modelEvidenceKind: "composer_selector",
+			modelVerifiedAt: nowIso(),
+		};
+	}
+	const direct = extractComposerSelection(html);
+	if (direct && selectionMatches(requested, direct)) {
+		return verifiedDynamicSelection(requested, direct);
+	}
 	const deadline = Date.now() + 10_000;
 	const current = await readAdvancedPickerState(exec, launcher, tabId, deadline, signal, expectedTarget);
 	try {
@@ -987,6 +1204,23 @@ async function verifyDynamicSelectionBeforeSend(
 	};
 }
 
+function selectionMatches(requested: ChatGptSelection, observed: ChatGptSelection): boolean {
+	return (!requested.model || normalizePickerLabel(requested.model) === normalizePickerLabel(observed.model))
+		&& (!requested.effort || normalizePickerLabel(requested.effort) === normalizePickerLabel(observed.effort));
+}
+
+function verifiedDynamicSelection(requested: ChatGptSelection, observed: ChatGptSelection): ModelVerification {
+	return {
+		requestedModel: requested.model ?? observed.model ?? "current live model",
+		observedModel: observed.model ?? "current live model",
+		...(requested.effort ? { requestedEffort: requested.effort } : {}),
+		...(observed.effort ? { observedEffort: observed.effort } : {}),
+		modelVerified: true,
+		modelEvidenceKind: "composer_selector",
+		modelVerifiedAt: nowIso(),
+	};
+}
+
 async function readAdvancedPickerState(
 	exec: Exec,
 	launcher: Launcher,
@@ -995,7 +1229,16 @@ async function readAdvancedPickerState(
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<AdvancedPickerState> {
-	return openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+	const state = await openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+	if (state.currentModel || !state.modelSelector) return state;
+	const options = await openPickerOptionObservations(
+		exec, launcher, tabId, state.modelSelector, deadline, signal, expectedTarget,
+	);
+	const selected = options.filter((option) => option.selected);
+	if (selected.length > 1) throw new Error("ChatGPT exposes multiple selected models in the live selector. No prompt was sent.");
+	await pressPickerKey(exec, launcher, tabId, "ArrowLeft", signal, expectedTarget);
+	await sleep(Math.min(pollIntervalMs(), 200));
+	return { ...state, currentModel: selected[0]?.label };
 }
 
 async function selectAdvancedPickerValue(
@@ -1009,6 +1252,28 @@ async function selectAdvancedPickerValue(
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<void> {
 	const state = await openAdvancedPicker(exec, launcher, tabId, deadline, signal, expectedTarget);
+	if (kind === "model" && state.inlineModelOptions) {
+		const matches = state.inlineModelOptions
+			.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+		if (matches.length > 1) throw new Error(`Requested ChatGPT model ${requested} is ambiguous in the live selector. No prompt was sent.`);
+		if (matches.length === 1) {
+			await pickerAction(exec, launcher, "click", tabId, matches[0].selector, signal, expectedTarget);
+			return;
+		}
+	}
+	if (kind === "effort" && state.powerSlider) {
+		const catalog = discoverPowerSliderOptions(state);
+		const matches = catalog.indexedOptions
+			.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+		if (matches.length > 1) throw new Error(`Requested ChatGPT effort ${requested} is ambiguous in the live Power slider. No prompt was sent.`);
+		if (matches.length === 1) {
+			await movePowerSliderTo(
+				exec, launcher, tabId, catalog.state, matches[0].index,
+				Math.max(deadline, Date.now() + 5_000), signal, expectedTarget,
+			);
+			return;
+		}
+	}
 	const rowSelector = kind === "model" ? state.modelSelector : state.effortSelector;
 	if (!rowSelector) throw new Error(`ChatGPT ${kind} picker is unavailable. No prompt was sent.`);
 	await pickerAction(exec, launcher, "click", tabId, rowSelector, signal, expectedTarget);
@@ -1027,7 +1292,26 @@ async function selectAdvancedPickerValue(
 }
 
 function exactCatalogLabel(options: ChatGptCatalogOption[], requested: string, kind: "model" | "effort"): string {
-	const matches = options.filter((option) => normalizePickerLabel(option.label) === normalizePickerLabel(requested));
+	const normalizedRequested = normalizePickerLabel(requested);
+	const matches: ChatGptCatalogOption[] = [];
+	let latest: ChatGptCatalogOption | undefined;
+	let latestCount = 0;
+	let latestAdvertisesGpt6 = false;
+	let hasGpt56Sol = false;
+	for (const option of options) {
+		const label = normalizePickerLabel(option.label);
+		if (label === normalizedRequested) matches.push(option);
+		if (kind === "model" && label === "latest") {
+			latest = option;
+			latestCount += 1;
+			latestAdvertisesGpt6 = latestAdvertisesGpt6 || advertisesGpt6(option);
+		}
+		if (kind === "model" && label === "gpt-5.6 sol") hasGpt56Sol = true;
+	}
+	if (matches.length === 0 && kind === "model" && isGpt6Request(requested)
+		&& latest && latestCount === 1 && (latestAdvertisesGpt6 || hasGpt56Sol)) {
+		return latest.label;
+	}
 	if (matches.length === 0) {
 		const observed = options.length > 0 ? options.map((option) => option.label).join(", ") : "none";
 		throw new Error(`Requested ChatGPT ${kind} ${requested} is unavailable in the live selector (observed: ${observed}). No prompt was sent.`);
@@ -1049,6 +1333,16 @@ function assertSelectionReadback(
 	if (requestedEffort && normalizePickerLabel(requestedEffort) !== normalizePickerLabel(observedEffort)) {
 		throw new Error(`ChatGPT effort ${reason}: requested ${requestedEffort}, observed ${observedEffort ?? "unreadable"}. No prompt was sent.`);
 	}
+}
+
+function isGpt6Request(value: string): boolean {
+	const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	return normalized === "6" || normalized === "gpt 6" || normalized === "gpt 6 astra";
+}
+
+function advertisesGpt6(option: ChatGptCatalogOption): boolean {
+	const searchable = `${option.label} ${option.note ?? ""}`.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	return /(?:^| )gpt 6(?: |$)/.test(searchable);
 }
 
 function normalizePickerLabel(value: string | undefined): string {
@@ -1158,6 +1452,20 @@ export async function waitForCompletedAssistantTurn(
 				lastObservedUiState,
 			};
 		}
+		if (observation.turnInterruption) {
+			return {
+				terminalStatus: "needs_user",
+				reason: observation.turnInterruption === "user"
+					? `The exact ChatGPT turn was stopped by the user. GPT-Control will not continue it automatically: ${observation.interruptionMessage ?? "user stop observed"}`
+					: `ChatGPT interrupted the exact provider turn. A supervising Codex agent must inspect the settled transcript before deciding on a specific continuation: ${observation.interruptionMessage ?? "provider interruption observed"}`,
+				snapshot: latest,
+				providerConversationId: conversationId,
+				providerConversationUrl: conversationUrl,
+				recoveryAttempts,
+				lastObservedUrl,
+				lastObservedUiState,
+			};
+		}
 
 		if (observation.snapshot.count <= options.baselineCount) {
 			steady = 0;
@@ -1225,7 +1533,7 @@ export async function waitForNewAssistantTurn(
 		const observation = extractChatPageObservation(await readPageHtml(exec, launcher, tabId, options.signal));
 		if (observation.snapshot.count <= options.baselineCount) continue;
 		latest = observation.snapshot;
-		if (!observation.snapshot.hasMarkdown || observation.answering || observation.thinking || observation.toolRunning
+		if (!observation.snapshot.hasMarkdown || observation.answering || observation.thinking || observation.toolRunning || observation.turnInterruption
 			|| observation.errorMessage || observation.retryAvailable || observation.continueAvailable) {
 			steady = 0;
 			previous = undefined;
@@ -1407,6 +1715,8 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		...root.querySelectorAll('[data-testid*="thinking"]'),
 		...root.querySelectorAll('[data-testid*="tool"]'),
 		...root.querySelectorAll('[data-testid*="error"]'),
+		...root.querySelectorAll('[data-testid*="interrupted"]'),
+		...root.querySelectorAll('[data-testid*="stopped"]'),
 		...root.querySelectorAll('[data-testid*="captcha"]'),
 		...root.querySelectorAll('[data-testid*="challenge"]'),
 	]);
@@ -1419,7 +1729,13 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	const providerSafety = statusTexts.map(providerSafetyFromText).find(Boolean);
 	const thinking = statusTexts.some((text) => /^(?:pro\s+)?thinking\b|\breasoning\b|\bworking on it\b/i.test(text));
 	const toolRunning = statusTexts.some((text) => /\b(?:running|using|calling|waiting for) (?:a )?tool\b|\bsearching\b|\bbrowsing\b/i.test(text));
-	const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|interrupted|stopped thinking|generation stopped|connection lost/i.test(text));
+	const userInterruption = statusTexts.find((text) => /\byou (?:stopped|interrupted) (?:this |the )?(?:response|generation|answer)\b/i.test(text));
+	const providerInterruption = userInterruption ? undefined : statusTexts.find((text) => /\b(?:chatgpt |the response |the generation )?(?:stopped thinking|stopped generating|was interrupted|got interrupted|generation stopped|response interrupted)\b/i.test(text));
+	const turnInterruption = stopControl || thinking || toolRunning
+		? undefined
+		: userInterruption ? "user" as const : providerInterruption ? "provider" as const : undefined;
+	const interruptionMessage = turnInterruption ? (userInterruption ?? providerInterruption) : undefined;
+	const errorText = statusTexts.find((text) => /network error|something went wrong|failed tool|tool (?:call )?failed|connection lost/i.test(text));
 	const states = [
 		stopControl ? "answering" : "idle",
 		thinking ? "thinking" : undefined,
@@ -1428,6 +1744,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		continueAvailable ? "continue" : undefined,
 		rateLimitMessage ? "rate_limited" : undefined,
 		providerSafety ? `provider_safety:${providerSafety.reason}` : undefined,
+		turnInterruption ? `interrupted:${turnInterruption}` : undefined,
 		errorText ? `error:${errorText.slice(0, 160)}` : undefined,
 		`snapshot:${snapshot.count}:${snapshot.hasMarkdown ? "markdown" : snapshot.imageUrls.length > 0 ? "image" : "transient"}`,
 	].filter(Boolean);
@@ -1447,6 +1764,8 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 		rateLimitMessage,
 		providerSafetyReason: providerSafety?.reason,
 		providerSafetyMessage: providerSafety?.message,
+		turnInterruption,
+		interruptionMessage,
 		errorMessage: errorText,
 		stateSummary: states.join(","),
 	};
@@ -1742,6 +2061,8 @@ function exactNeedsUserReason(observation: ChatPageObservation, prefix: string):
 interface ModelOptionObservation {
 	label: string;
 	selector: string;
+	note?: string;
+	selected?: boolean;
 }
 
 interface AdvancedPickerState {
@@ -1749,6 +2070,12 @@ interface AdvancedPickerState {
 	currentEffort?: string;
 	modelSelector?: string;
 	effortSelector?: string;
+	inlineModelOptions?: ModelOptionObservation[];
+	powerSlider?: {
+		currentIndex: number;
+		maxIndex: number;
+		selector: string;
+	};
 	composerSelector: string;
 }
 
@@ -1762,6 +2089,8 @@ async function openAdvancedPicker(
 ): Promise<AdvancedPickerState> {
 	let html = await readPageHtml(exec, launcher, tabId, signal);
 	throwIfRateLimited(html);
+	let state = extractOpenAdvancedPickerState(html);
+	if (state) return state;
 	let composer = extractComposerModel(html);
 	while (!composer && Date.now() < deadline) {
 		await sleep(Math.min(pollIntervalMs(), 200));
@@ -1770,7 +2099,7 @@ async function openAdvancedPicker(
 		composer = extractComposerModel(html);
 	}
 	if (!composer) throw new Error("ChatGPT composer model selector is absent or unreadable. No prompt was sent.");
-	let state = extractAdvancedPickerState(html, composer.selector);
+	state = extractAdvancedPickerState(html, composer.selector);
 	if (!state) {
 		await pickerAction(exec, launcher, "click", tabId, composer.selector, signal, expectedTarget);
 	}
@@ -1778,7 +2107,7 @@ async function openAdvancedPicker(
 		html = await readPageHtml(exec, launcher, tabId, signal);
 		throwIfRateLimited(html);
 		state = extractAdvancedPickerState(html, composer.selector);
-		if (state?.modelSelector || state?.effortSelector) return state;
+		if (state?.modelSelector || state?.effortSelector || state?.inlineModelOptions?.length || state?.powerSlider) return state;
 		const controls = extractCurrentEffortPickerControls(html);
 		if (controls?.advancedSelector) {
 			await pickerAction(exec, launcher, "click", tabId, controls.advancedSelector, signal, expectedTarget);
@@ -1787,6 +2116,21 @@ async function openAdvancedPicker(
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	throw new Error("ChatGPT advanced model picker is unavailable. No prompt was sent.");
+}
+
+function extractOpenAdvancedPickerState(html: string): AdvancedPickerState | undefined {
+	const root = parse(html);
+	const composer = composerContainer(root);
+	if (!composer) return undefined;
+	const states = composer.querySelectorAll('button[aria-haspopup="menu"][aria-expanded="true"]')
+		.map((button) => exactNodeSelector(button))
+		.filter((selector): selector is string => Boolean(selector))
+		.map((selector) => extractAdvancedPickerState(html, selector))
+		.filter((state): state is AdvancedPickerState => Boolean(
+			state && (state.modelSelector || state.effortSelector || state.inlineModelOptions?.length || state.powerSlider),
+		));
+	if (states.length > 1) throw new Error("ChatGPT exposes multiple open composer model pickers. No prompt was sent.");
+	return states[0];
 }
 
 function throwIfRateLimited(html: string): void {
@@ -1840,10 +2184,25 @@ async function openPickerOptions(
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
 ): Promise<ChatGptCatalogOption[]> {
+	const options = await openPickerOptionObservations(
+		exec, launcher, tabId, selector, deadline, signal, expectedTarget,
+	);
+	return options.map(({ label, note }) => ({ label, ...(note ? { note } : {}) }));
+}
+
+async function openPickerOptionObservations(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	selector: string,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<ModelOptionObservation[]> {
 	await pickerAction(exec, launcher, "click", tabId, selector, signal, expectedTarget);
 	for (;;) {
 		const options = extractPickerRadioOptions(await readPageHtml(exec, launcher, tabId, signal), selector);
-		if (options.length > 0) return options.map(({ label, note }) => ({ label, ...(note ? { note } : {}) }));
+		if (options.length > 0) return options;
 		if (Date.now() >= deadline) break;
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
@@ -1889,8 +2248,13 @@ async function pressPickerKey(
 	key: string,
 	signal?: AbortSignal,
 	expectedTarget?: ExactBrowserActionTarget,
+	selector?: string,
 ): Promise<void> {
 	if (expectedTarget) {
+		if (selector) {
+			await privateBridgeJson(exec, launcher, "press", { tabId, key, selector, expectedTarget }, signal);
+			return;
+		}
 		// Chrome Bridge cannot bind keyboard actions atomically. This key only
 		// changes picker focus and cannot submit data, so prove the exact owned
 		// document immediately before and after it.
@@ -1899,7 +2263,90 @@ async function pressPickerKey(
 		await privateBridgeJson(exec, launcher, "ping", { tabId, expectedTarget }, signal);
 		return;
 	}
+	if (selector) {
+		await privateBridgeJson(exec, launcher, "press", { tabId, key, selector }, signal);
+		return;
+	}
 	await bridgeJson(exec, launcher, ["press", String(tabId), key], signal);
+}
+
+const CHATGPT_POWER_SLIDER_LEVELS = ["Instant", "Medium", "High", "Extra High", "Pro"] as const;
+
+function discoverPowerSliderOptions(initial: AdvancedPickerState): {
+	options: ChatGptCatalogOption[];
+	indexedOptions: Array<{ label: string; index: number }>;
+	state: AdvancedPickerState;
+} {
+	const power = initial.powerSlider;
+	if (!power || !initial.currentEffort) {
+		throw new Error("ChatGPT Power slider state is incomplete. No prompt was sent.");
+	}
+	if (power.maxIndex !== CHATGPT_POWER_SLIDER_LEVELS.length - 1
+		|| power.currentIndex < 0
+		|| power.currentIndex >= CHATGPT_POWER_SLIDER_LEVELS.length) {
+		throw new Error("ChatGPT Power slider does not match the supported five-level contract. No prompt was sent.");
+	}
+	const expectedCurrent = CHATGPT_POWER_SLIDER_LEVELS[power.currentIndex];
+	if (normalizePickerLabel(initial.currentEffort) !== normalizePickerLabel(expectedCurrent)) {
+		throw new Error(`ChatGPT Power slider index ${power.currentIndex} does not match its visible label. No prompt was sent.`);
+	}
+	// Catalog reads must not walk the slider. ChatGPT persists synthetic slider
+	// changes asynchronously, so traversing and restoring it can save the
+	// penultimate value after the temporary discovery tab closes.
+	const indexedOptions = CHATGPT_POWER_SLIDER_LEVELS.map((label, index) => ({ label, index }));
+	return {
+		options: indexedOptions.map(({ label }) => ({ label })),
+		indexedOptions,
+		state: initial,
+	};
+}
+
+async function movePowerSliderTo(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	initial: AdvancedPickerState,
+	targetIndex: number,
+	deadline: number,
+	signal?: AbortSignal,
+	expectedTarget?: ExactBrowserActionTarget,
+): Promise<AdvancedPickerState> {
+	let current = initial;
+	const initialPower = current.powerSlider;
+	if (!initialPower || targetIndex < 0 || targetIndex > initialPower.maxIndex) {
+		throw new Error("Requested ChatGPT Power slider index is invalid. No prompt was sent.");
+	}
+	while (current.powerSlider?.currentIndex !== targetIndex) {
+		const currentIndex = current.powerSlider?.currentIndex;
+		if (currentIndex === undefined) throw new Error("ChatGPT Power slider disappeared during selection. No prompt was sent.");
+		const direction = currentIndex < targetIndex ? "ArrowRight" : "ArrowLeft";
+		const expected = currentIndex + (direction === "ArrowRight" ? 1 : -1);
+		await pressPickerKey(
+			exec, launcher, tabId, direction, signal, expectedTarget, current.powerSlider!.selector,
+		);
+		current = await waitForPowerSliderIndex(
+			exec, launcher, tabId, initial.composerSelector, expected, deadline, signal,
+		);
+	}
+	return current;
+}
+
+async function waitForPowerSliderIndex(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	composerSelector: string,
+	expectedIndex: number,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<AdvancedPickerState> {
+	for (;;) {
+		const state = extractAdvancedPickerState(await readPageHtml(exec, launcher, tabId, signal), composerSelector);
+		if (state?.powerSlider?.currentIndex === expectedIndex && state.currentEffort) return state;
+		if (Date.now() >= deadline) break;
+		await sleep(Math.min(pollIntervalMs(), 200));
+	}
+	throw new Error(`ChatGPT Power slider did not reach verified index ${expectedIndex}. No prompt was sent.`);
 }
 
 async function pickerAction(
@@ -1930,14 +2377,70 @@ function extractAdvancedPickerState(html: string, composerSelector: string): Adv
 	const rows = active.querySelectorAll('[role="menuitem"]');
 	const model = rows.find((node) => /^Model(?:\s|$)/i.test(nodeLabel(node)));
 	const effort = rows.find((node) => /^Effort(?:\s|$)/i.test(nodeLabel(node)));
-	if (!model && !effort) return undefined;
+	if (model || effort) {
+		return {
+			currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
+			currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
+			modelSelector: model ? pickerSubmenuOwnerSelector(model) : undefined,
+			effortSelector: effort ? pickerSubmenuOwnerSelector(effort) : undefined,
+			composerSelector,
+		};
+	}
+
+	// The current ChatGPT composer exposes one flat menu: a Select model row,
+	// a keyboard-controlled Power slider, and the underlying model choices as
+	// direct radio items. The slider's aria-describedby announcement is the
+	// authoritative effort label and index (for example, "Pro, 5 of 5.").
+	const selectModel = rows.find((node) => /^Select model$/i.test(node.getAttribute("aria-label") ?? ""));
+	const power = rows.find((node) => /^Power$/i.test(node.getAttribute("aria-label") ?? ""));
+	if (!selectModel && !power) return undefined;
+	const inlineModelNodes = uniqueElements([
+		...active.querySelectorAll('[role="menuitemradio"]'),
+		...active.querySelectorAll('[role="option"]'),
+	]);
+	const inlineModelOptions = inlineModelNodes
+		.map(pickerRadioOptionFromNode)
+		.filter((option): option is ModelOptionObservation => Boolean(option));
+	const selectedModel = inlineModelOptions.find((option) => option.selected)?.label;
+	const powerSelector = power ? exactNodeSelector(power) : undefined;
+	const powerObservation = power && powerSelector ? extractPowerSliderObservation(root, power) : undefined;
+	if (power && (!powerSelector || !powerObservation)) return undefined;
+	const powerSlider = powerObservation && powerSelector ? {
+		currentIndex: powerObservation.currentIndex,
+		maxIndex: powerObservation.maxIndex,
+		selector: powerSelector,
+	} : undefined;
 	return {
-		currentModel: model ? pickerRowValue(nodeLabel(model), "Model") : undefined,
-		currentEffort: effort ? pickerRowValue(nodeLabel(effort), "Effort") : undefined,
-		modelSelector: model ? pickerSubmenuOwnerSelector(model) : undefined,
-		effortSelector: effort ? pickerSubmenuOwnerSelector(effort) : undefined,
+		currentModel: selectedModel,
+		currentEffort: powerObservation?.label,
+		modelSelector: selectModel ? exactNodeSelector(selectModel) : undefined,
+		...(inlineModelOptions.length > 0 ? { inlineModelOptions } : {}),
+		...(powerSlider ? { powerSlider } : {}),
 		composerSelector,
 	};
+}
+
+function extractPowerSliderObservation(
+	root: HTMLElement,
+	power: HTMLElement,
+): { label?: string; currentIndex: number; maxIndex: number } | undefined {
+	const slider = power.querySelector('[role="slider"]');
+	const currentIndex = Number.parseInt(slider?.getAttribute("aria-valuenow") ?? "", 10);
+	const maxIndex = Number.parseInt(slider?.getAttribute("aria-valuemax") ?? "", 10);
+	if (!Number.isInteger(currentIndex) || !Number.isInteger(maxIndex)
+		|| currentIndex < 0 || maxIndex < 0 || currentIndex > maxIndex || maxIndex > 20) return undefined;
+	const descriptions = (power.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean)
+		.map((id) => root.querySelector(`[id="${cssString(id)}"]`))
+		.filter((node): node is HTMLElement => Boolean(node))
+		.map(nodeLabel);
+	const announcement = descriptions
+		.map((description) => /^(.+?),\s*(\d+)\s+of\s+(\d+)\.?$/i.exec(description))
+		.find((match) => Boolean(match));
+	if (!announcement) return { currentIndex, maxIndex };
+	const announcedIndex = Number.parseInt(announcement[2], 10) - 1;
+	const announcedMax = Number.parseInt(announcement[3], 10) - 1;
+	if (announcedIndex !== currentIndex || announcedMax !== maxIndex) return undefined;
+	return { label: announcement[1].trim(), currentIndex, maxIndex };
 }
 
 function pickerSubmenuOwnerSelector(node: HTMLElement): string | undefined {
@@ -1960,17 +2463,27 @@ function extractPickerRadioOptions(html: string, ownerSelector?: string): Array<
 	]).filter((node) => {
 		if (!ownerId) return true;
 		return node.closest('[role="menu"]')?.getAttribute("aria-labelledby") === ownerId;
-	}).map((node) => {
-		const lines = (node.structuredText ?? "").split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
-		const label = cleanPickerOptionLabel(node.getAttribute("aria-label") ?? lines[0] ?? nodeLabel(node));
-		const full = nodeLabel(node);
-		const note = lines.slice(1).join(" ") || (full.startsWith(label) ? full.slice(label.length).trim() : "");
-		return {
-			label,
-			selector: exactNodeSelector(node) ?? "",
-			...(note ? { note } : {}),
-		};
-	}).filter((option) => Boolean(option.label && option.selector));
+	}).map(pickerRadioOptionFromNode)
+		.filter((option): option is ModelOptionObservation => Boolean(option));
+}
+
+function pickerRadioOptionFromNode(node: HTMLElement): ModelOptionObservation | undefined {
+	const lines = (node.structuredText ?? "").split(/\n+/)
+		.map((line) => line.replace(/\s+/g, " ").trim())
+		.filter(Boolean);
+	const label = cleanPickerOptionLabel(node.getAttribute("aria-label") ?? lines[0] ?? nodeLabel(node));
+	const selector = exactNodeSelector(node);
+	if (!label || !selector) return undefined;
+	const full = nodeLabel(node);
+	const note = lines.slice(1).join(" ") || (full.startsWith(label) ? full.slice(label.length).trim() : "");
+	return {
+		label,
+		selector,
+		...(note ? { note } : {}),
+		...((node.getAttribute("aria-checked") === "true"
+			|| node.getAttribute("aria-selected") === "true"
+			|| node.getAttribute("data-state") === "checked") ? { selected: true } : {}),
+	};
 }
 
 function extractChatGptProjects(html: string): string[] {
@@ -2413,7 +2926,8 @@ function exactNodeSelector(node: HTMLElement): string | undefined {
 }
 
 function modelObservationFromNode(node: HTMLElement): ComposerModelObservation | undefined {
-	const raw = node.getAttribute("data-selected-model")
+	const split = splitModelEffortFromButton(node);
+	const raw = split ? `${split.model} ${split.effort}` : node.getAttribute("data-selected-model")
 		?? node.getAttribute("data-model")
 		?? node.structuredText
 		?? node.getAttribute("title")
@@ -2432,6 +2946,15 @@ function modelObservationFromNode(node: HTMLElement): ComposerModelObservation |
 				? `[id="${cssString(id)}"]`
 				: `text=${label}`;
 	return { label, normalized, selector };
+}
+
+function splitModelEffortFromButton(button: HTMLElement): Required<ChatGptSelection> | undefined {
+	const spans = button.querySelectorAll("span");
+	const model = spans.find((span) => (span.getAttribute("class") ?? "").includes("SliderTriggerModelLabel"));
+	const effort = spans.find((span) => (span.getAttribute("class") ?? "").includes("SliderTriggerEffortLabel"));
+	const modelLabel = model ? nodeLabel(model) : "";
+	const effortLabel = effort ? nodeLabel(effort) : "";
+	return modelLabel && effortLabel ? { model: modelLabel, effort: effortLabel } : undefined;
 }
 
 function cleanModelLabel(raw: string): string {

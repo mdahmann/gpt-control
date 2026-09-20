@@ -724,6 +724,7 @@ export function publicRun(run: RunRecord): Record<string, unknown> {
 		providerTurnPending: run.providerTurnPending,
 		providerStopRequested: run.providerStopRequested,
 		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
+		providerActiveDeadlineAt: run.providerActiveDeadlineAt,
 		submissionState: run.submissionState,
 		resultText: run.resultText,
 		report: run.result,
@@ -746,7 +747,16 @@ function connectorVerification(run: RunRecord): Record<string, unknown> | undefi
 	if (!run.connectorIntent) return undefined;
 	const preflight = run.connectorPreflight;
 	if (run.connectorIntent.mode !== "require") {
-		return { status: "unverified", evidenceKind: "provider_prompt_intent_only", note: "Preferred connector intent was not preflighted. Verify connected-tool results independently." };
+		if (run.connectorSelection?.status === "verified") {
+			return {
+				status: "selection_verified",
+				evidenceKind: "selected_connector_pills",
+				names: run.connectorSelection.names,
+				verifiedAt: run.connectorSelection.verifiedAt,
+				note: "Exact connector pills were selected in the main assignment. No separate readiness turn was sent; verify connected-tool results independently.",
+			};
+		}
+		return { status: "unverified", evidenceKind: "none", note: "Inline connector selection was not verified. The assignment must not be treated as connector-enabled." };
 	}
 	if (preflight?.status === "passed") {
 		return {

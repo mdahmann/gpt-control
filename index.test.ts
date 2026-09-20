@@ -41,11 +41,11 @@ describe("public extension contract", () => {
 			interface: { defaultPrompt: string[] };
 		};
 		const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")) as { version: string };
-		expect(plugin.version).toBe(packageJson.version);
+		expect(plugin.version.split("+", 1)[0]).toBe(packageJson.version);
 		expect(plugin.interface.defaultPrompt).toEqual([
 			"Start a GPT Chat and send this exact message.",
 			"Start a GPT Worker for this bounded task with GPT-5.6 Sol at High effort.",
-			"Start a GPT Sub-agent that keeps working with one ChatGPT conversation until this goal is complete.",
+			"Start a GPT Sub-agent in Goal Mode using one ChatGPT conversation until this goal is verified complete.",
 		]);
 		expect(plugin.interface.defaultPrompt.every((prompt) => prompt.length <= 128)).toBeTrue();
 	});
@@ -61,6 +61,14 @@ describe("public extension contract", () => {
 		expect(operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "10" }, common).maxConcurrentWorkers).toBe(10);
 		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_PRO_WORKERS: "11" }, common)).toThrow("maxActiveGenerations");
 		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_MAX_ACTIVE_GENERATIONS: "11" }, common)).toThrow("maxActiveGenerations");
+	});
+
+	test("uses a trusted bounded grace window for visibly active provider turns", () => {
+		const root = scratch();
+		const common = { workspaceRoot: root, storageRoot: join(root, "state") };
+		expect(operatorPolicyFromEnv({}, common).activeTurnGraceMs).toBe(30 * 60_000);
+		expect(operatorPolicyFromEnv({ GPT_CONTROL_ACTIVE_TURN_GRACE_MS: "120000" }, common).activeTurnGraceMs).toBe(120_000);
+		expect(() => operatorPolicyFromEnv({ GPT_CONTROL_ACTIVE_TURN_GRACE_MS: "7200001" }, common)).toThrow("activeTurnGraceMs");
 	});
 
 	test("operator abandonment token rotation does not change execution policy identity", () => {

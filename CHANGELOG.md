@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.5.0-alpha.10] - 2026-09-19
+
+### Changed
+
+- Use Chrome Bridge's passive exact-document capability attestation during
+  startup. Current bridge installs no longer create and close a temporary
+  ChatGPT tab merely to prove that guard; older bridges retain the bounded live
+  probe fallback.
+- Override vulnerable transitive URL, HTTP, and query-parser releases with
+  patched compatible versions; the production dependency audit is clean.
+- Close terminal GPT Worker browser sessions automatically once provider work
+  is resolved, retry stale terminal cleanup at startup, preserve reusable GPT
+  Chat tabs, and refuse whole-session cleanup when a group contains extra pages.
+- Make routine `connector_mode=prefer` Workers select and verify the exact
+  connector pills in the real assignment, with no separate model-visible
+  readiness turn.
+- Keep `connector_mode=require` as the explicit two-turn health-preflight mode.
+- Require literal `@Connector` mentions in both modes and expose a durable
+  `selection_verified` receipt for the one-turn route.
+
+### Verification
+
+- Deterministic service and public MCP tests prove exact pill selection, one
+  submitted assignment, durable receipt persistence, and fail-closed mention
+  validation.
+
+## [0.5.0-alpha.9] - 2026-08-25
+
+### Added
+
+- Define Goal Mode as the supervised multi-turn contract for a native Codex GPT
+  Sub-agent. The child retains one exact GPT-Control conversation, accepts
+  queued parent steering, and sends only specific goal-directed follow-ups.
+- Classify provider-side interruption separately from a user-requested Stop and
+  expose that distinction through passive conversation status.
+
+### Changed
+
+- Give an exact provider turn that is still visibly answering, thinking, or
+  running a tool at its ordinary deadline one trusted, durable, non-renewable
+  grace window. The watcher sends no status prompt during that window.
+- Keep Chat Manager outside the live completion loop and use it only for
+  recovery when the durable exact-chat mapping or older history is unavailable.
+
+### Verification
+
+- All behavior in this release can be verified with deterministic local browser
+  fixtures. No live ChatGPT message is required for the release gate.
+
 ## [0.5.0-alpha.8] - 2026-08-24
 
 ### Changed

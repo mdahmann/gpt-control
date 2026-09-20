@@ -45,7 +45,7 @@ const SubagentSchema = {
 	chatgpt_model: ChatGptModelSchema.optional(),
 	chatgpt_effort: ChatGptEffortSchema.optional(),
 	connectors: z.array(ConnectorNameSchema).max(8).optional(),
-	connector_mode: ConnectorModeSchema.optional(),
+	connector_mode: ConnectorModeSchema.describe("prefer selects connector pills in the single assignment; require sends a separate readiness preflight first.").optional(),
 	timeout_ms: z.number().int().positive().max(60 * 60_000).optional(),
 };
 
@@ -963,7 +963,10 @@ async function monitorTask(
 ): Promise<void> {
 	const initial = await service.getRun(runId);
 	await emitProgress?.(0.45, "Watching the owned ChatGPT conversation without resubmitting or model-visible polling.");
-	let run = await service.waitForRun(runId, (initial.timeoutMs ?? 600_000) + 120_000);
+	let run = await service.waitForRun(
+		runId,
+		(initial.timeoutMs ?? 600_000) + service.policy.activeTurnGraceMs + 120_000,
+	);
 	if (run.status === "queued" || run.status === "running") {
 		run = await service.markNeedsUser(runId, "The GPT Worker exceeded its bounded monitor deadline. The owned browser conversation and conversation identity were retained; the prompt was not resent.");
 	}
@@ -1005,6 +1008,10 @@ export async function resumeDurableSubagents(
 	const stopRecovery = await service.retryRequestedProviderStops();
 	if (stopRecovery.blocked.length > 0) {
 		console.error(`GPT-Control could not recheck ${stopRecovery.blocked.length} cancelled provider turn(s); a later restart will retry.`);
+	}
+	const workerCleanup = await service.cleanupTerminalWorkerConversations();
+	if (workerCleanup.blocked.length > 0) {
+		console.error(`GPT-Control could not close ${workerCleanup.blocked.length} terminal GPT Worker browser session(s); a later restart will retry.`);
 	}
 	let bindings = await taskStore.listBindings();
 	const claimedRuns = new Map(
@@ -1112,6 +1119,7 @@ function publicRun(run: RunRecord): Record<string, unknown> {
 		providerTurnPending: run.providerTurnPending,
 		providerStopRequested: run.providerStopRequested,
 		providerTurnAbandonedAt: run.providerTurnAbandonedAt,
+		providerActiveDeadlineAt: run.providerActiveDeadlineAt,
 		connectorIntent: run.connectorIntent,
 		connectorVerification: connectorVerification(run),
 		providerRunId: run.providerRunId,
@@ -1140,10 +1148,19 @@ function connectorVerification(run: RunRecord): Record<string, unknown> | undefi
 	if (!run.connectorIntent) return undefined;
 	const preflight = run.connectorPreflight;
 	if (run.connectorIntent.mode !== "require") {
+		if (run.connectorSelection?.status === "verified") {
+			return {
+				status: "selection_verified",
+				evidenceKind: "selected_connector_pills",
+				names: run.connectorSelection.names,
+				verifiedAt: run.connectorSelection.verifiedAt,
+				note: "Exact connector pills were selected in the main assignment. No separate readiness turn was sent; verify connected-tool results independently.",
+			};
+		}
 		return {
 			status: "unverified",
-			evidenceKind: "provider_prompt_intent_only",
-			note: "Preferred connector intent was not preflighted. Verify connected-tool results independently.",
+			evidenceKind: "none",
+			note: "Inline connector selection was not verified. The assignment must not be treated as connector-enabled.",
 		};
 	}
 	if (preflight?.status === "passed") {

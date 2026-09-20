@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXPECTED_BASE=${GPT_CONTROL_EXPECTED_UPSTREAM_BASE:-37390634844c8b9fc0dc73894b6b72a04f05826c}
 umask 077
 
-LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.8-verification}
+LOG_PREFIX=${GPT_CONTROL_VERIFY_LOG_DIR:-${TMPDIR:-/tmp}/gpt-control-0.5.0-alpha.10-verification}
 LOG_DIR=$(mktemp -d "${LOG_PREFIX%/}.XXXXXX")
 
 if [[ -n "${GPT_CONTROL_BUN:-}" ]]; then
@@ -76,7 +76,7 @@ run_gate mcp-json python3 -m json.tool .mcp.json
 # Bun preserves whitespace inside dependency template literals because removing
 # it can change runtime strings. Check every authored file and verify the
 # generated bundle separately through byte-for-byte reproducibility above.
-run_gate diff-check git diff --check HEAD -- . ':(exclude)dist/gpt-control-desktop-driver.js' ':(exclude)dist/gpt-control-desktop-pool-driver.js'
+run_gate diff-check git diff --check HEAD -- . ':(exclude)dist/gpt-control-mcp.js' ':(exclude)dist/gpt-control-desktop-driver.js' ':(exclude)dist/gpt-control-desktop-pool-driver.js'
 
 secret_found=0
 : > "$LOG_DIR/secret-scan.log"
