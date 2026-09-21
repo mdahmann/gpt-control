@@ -35063,24 +35063,46 @@ function approvedImageUrl(raw) {
 function finalAssistantContent(node) {
   return node.querySelectorAll(ASSISTANT_CONTENT_SELECTOR).at(-1);
 }
+function assistantContentText(content) {
+  if (!content)
+    return "";
+  const clone2 = content.clone();
+  const citations = clone2.querySelectorAll("[data-file-citation-group-identity]");
+  for (const citation of citations)
+    citation.remove();
+  if (citations.length > 0) {
+    const hasNarrativeBody = clone2.querySelectorAll("p, li, pre, blockquote, table").some((node) => node.structuredText.trim().length > 0);
+    if (!hasNarrativeBody)
+      return "";
+  }
+  return clone2.structuredText.replace(/[ \t]+\n/g, `
+`).replace(/\n{3,}/g, `
+
+`).trim();
+}
 function extractConversationTurns(html, limit = 10) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 20)
     throw new Error("Conversation read limit must be 1-20.");
   const root = parse6(html);
-  const turns = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`).map((node) => {
+  const nodes = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`);
+  const turns = [];
+  for (let index = nodes.length - 1;index >= 0 && turns.length < limit; index -= 1) {
+    const node = nodes[index];
     const assistant = node.getAttribute("data-message-author-role") === "assistant" || (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
     const content = assistant ? finalAssistantContent(node) : USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
-    const text = (content?.structuredText ?? node.structuredText ?? "").replace(/[ \t]+\n/g, `
+    const text = assistant ? assistantContentText(content ?? undefined) : (content?.structuredText ?? node.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
 
 `).trim();
-    return {
+    if (text.length === 0)
+      continue;
+    turns.push({
       role: assistant ? "assistant" : "user",
       text,
       messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
-    };
-  }).filter((turn) => turn.text.length > 0);
-  return turns.slice(-limit);
+    });
+  }
+  return turns.reverse();
 }
 function extractAssistantTurn(html) {
   const root = parse6(html);
@@ -35101,10 +35123,7 @@ function extractAssistantTurn(html) {
     imageUrls.push(url2.href);
   }
   const content = finalAssistantContent(node);
-  const text = (content?.structuredText ?? "").replace(/[ \t]+\n/g, `
-`).replace(/\n{3,}/g, `
-
-`).trim();
+  const text = assistantContentText(content);
   return {
     text,
     imageUrls,

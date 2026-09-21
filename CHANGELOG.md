@@ -8,6 +8,9 @@
   pills under the same literal-mention and authority rules as GPT Workers.
 - Read the final assistant response after a connector tool card instead of
   returning the card's earlier Markdown content.
+- Exclude interactive file-citation labels from assistant text and fail closed
+  when ChatGPT exposes only a heading plus citation controls without an answer
+  body.
 - Release idempotency locks after durable run binding, before browser work or
   synchronous waiting. Concurrent restart recovery now defers on a live lock
   owner instead of incorrectly terminalizing the active run.

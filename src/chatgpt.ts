@@ -1586,26 +1586,50 @@ function finalAssistantContent(node: HTMLElement): HTMLElement | undefined {
 	return node.querySelectorAll(ASSISTANT_CONTENT_SELECTOR).at(-1);
 }
 
+function assistantContentText(content: HTMLElement | undefined): string {
+	if (!content) return "";
+	const clone = content.clone() as HTMLElement;
+	const citations = clone.querySelectorAll("[data-file-citation-group-identity]");
+	for (const citation of citations) citation.remove();
+	if (citations.length > 0) {
+		const hasNarrativeBody = clone.querySelectorAll("p, li, pre, blockquote, table")
+			.some((node) => node.structuredText.trim().length > 0);
+		// A citation-only renderer shell exposes control labels, not the answer.
+		// Do not let a heading plus those labels become a trusted completion.
+		if (!hasNarrativeBody) return "";
+	}
+	return clone.structuredText
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
 export function extractConversationTurns(html: string, limit = 10): ChatGptConversationTurn[] {
 	if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
 	const root = parse(html);
-	const turns = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`).map((node) => {
+	const nodes = root.querySelectorAll(`${USER_TURN_SELECTOR}, ${ASSISTANT_TURN_SELECTOR}`);
+	const turns: ChatGptConversationTurn[] = [];
+	for (let index = nodes.length - 1; index >= 0 && turns.length < limit; index -= 1) {
+		const node = nodes[index];
 		const assistant = node.getAttribute("data-message-author-role") === "assistant"
 			|| (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
 		const content = assistant
 			? finalAssistantContent(node)
 			: USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
-		const text = (content?.structuredText ?? node.structuredText ?? "")
-			.replace(/[ \t]+\n/g, "\n")
-			.replace(/\n{3,}/g, "\n\n")
-			.trim();
-		return {
+		const text = assistant
+			? assistantContentText(content ?? undefined)
+			: (content?.structuredText ?? node.structuredText ?? "")
+				.replace(/[ \t]+\n/g, "\n")
+				.replace(/\n{3,}/g, "\n\n")
+				.trim();
+		if (text.length === 0) continue;
+		turns.push({
 			role: assistant ? "assistant" as const : "user" as const,
 			text,
 			messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined,
-		};
-	}).filter((turn) => turn.text.length > 0);
-	return turns.slice(-limit);
+		});
+	}
+	return turns.reverse();
 }
 
 export function extractAssistantTurn(html: string): AssistantTurn {
@@ -1624,10 +1648,7 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 		imageUrls.push(url.href);
 	}
 	const content = finalAssistantContent(node);
-	const text = (content?.structuredText ?? "")
-		.replace(/[ \t]+\n/g, "\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
+	const text = assistantContentText(content);
 	return {
 		text,
 		imageUrls,

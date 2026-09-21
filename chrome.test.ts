@@ -1220,6 +1220,51 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		}]);
 	});
 
+	test("omits file-citation controls from assistant prose", () => {
+		const html = `<main>
+			<div data-message-author-role="assistant" data-message-id="assistant-with-citation">
+				<div class="markdown">
+					<p>Use the portable helper.
+						<span data-content-reference-start="24" data-content-reference-end="34">
+							<span data-file-citation-group-identity="fixture"><button><p class="not-prose">source.ts</p></button></span>
+						</span>
+					</p>
+				</div>
+			</div>
+		</main>`;
+		expect(extractChatPageObservation(html).snapshot.text).toBe("Use the portable helper.");
+		expect(extractConversationTurns(html)).toEqual([{
+			role: "assistant",
+			text: "Use the portable helper.",
+			messageId: "assistant-with-citation",
+		}]);
+	});
+
+	test("fails closed when ChatGPT renders only a heading and file-citation controls", () => {
+		const html = `<main>
+			<div data-message-author-role="assistant" data-message-id="citation-only-assistant">
+				<div class="markdown">
+					<h2 data-start="0" data-end="14">Disposition</h2>
+					<p data-start="16" data-end="737">
+						<span data-content-reference-start="350" data-content-reference-end="379">
+							<span data-file-citation-group-identity="fixture-a"><button><p class="not-prose">portable-repair…</p></button></span>
+						</span>
+						<span data-content-reference-start="787" data-content-reference-end="816">
+							<span data-file-citation-group-identity="fixture-b"><button><p class="not-prose">VERIFICATION</p></button></span>
+						</span>
+					</p>
+				</div>
+			</div>
+		</main>`;
+		expect(extractChatPageObservation(html).snapshot).toMatchObject({
+			count: 1,
+			text: "",
+			hasMarkdown: true,
+			messageId: "citation-only-assistant",
+		});
+		expect(extractConversationTurns(html)).toEqual([]);
+	});
+
 	test("uses the native ChatGPT Desktop Send control", async () => {
 		const attempts: string[] = [];
 		const exec = async (_command: string, args: string[]) => {
