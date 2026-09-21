@@ -1,5 +1,12 @@
 # GPT-Control
 
+`gpt_chat` and `gpt_consult` accept `connectors` and `connector_mode`, like
+GPT Workers. Include each literal `@Connector` mention in the prompt. With
+`connectors: ["Zenbox"]` and `connector_mode: "prefer"`, GPT-Control selects
+and verifies the Zenbox pill before sending the assignment. Repeat these fields
+for follow-ups that need the connector. A selected pill is not proof of access
+or completed edits; verify the destination state separately.
+
 GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
 signed-in ChatGPT website through one secure browser-driver protocol. Version
 0.5.0-alpha.10 adds verified one-turn connector selection for routine Workers.

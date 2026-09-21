@@ -7,7 +7,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer, resumeDurableSubagents } from "./src/mcp";
 import { CHATGPT_ORIGIN } from "./src/chatgpt";
-import { idempotencyKeyHash } from "./src/store";
+import { idempotencyKeyHash, LiveLockOwnerError } from "./src/store";
 import { DurableTaskStore } from "./src/task_store";
 import { FakeChromeBridge, makeChromeService, TEST_OPERATOR_ABANDON_TOKEN } from "./test_helpers";
 import type { Exec } from "./src/types";
@@ -268,6 +268,61 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual(["deferred index"]);
 	});
 
+	test("releases the idempotency lock before waiting for a provider turn", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(root, workspace, bridge);
+		const second = makeChromeService(root, workspace, bridge);
+		const key = "synchronous-live-recovery";
+		const pending = first.service.start({
+			kind: "chat",
+			prompt: "[slow] synchronous live recovery",
+			idempotencyKey: key,
+			timeoutMs: 2000,
+		});
+		await waitUntil(() => bridge.submittedPrompts.length === 1);
+
+		let lockAcquired = false;
+		await second.store.withIdempotencyHashLock(idempotencyKeyHash(key), async () => {
+			lockAcquired = true;
+		});
+		expect(lockAcquired).toBe(true);
+		const recovery = await second.service.recoverActiveRuns();
+		expect(recovery.blocked).toEqual([]);
+
+		bridge.release();
+		const completed = await pending;
+		await second.service.waitForRun(completed.run.id, 1000);
+		expect(completed.run.status).toBe("completed");
+		expect(bridge.submittedPrompts).toEqual(["[slow] synchronous live recovery"]);
+	});
+
+	test("defers recovery when a live owner holds an idempotency lock", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const { service, store } = makeChromeService(root, workspace, bridge);
+		const key = "defer-live-idempotency-owner";
+		const prepared = await service.start({
+			kind: "chat",
+			prompt: "defer a live lock",
+			idempotencyKey: key,
+			wait: false,
+			timeoutMs: 1000,
+		}, { deferExecution: true });
+		await store.updateRun(prepared.run.id, { executionReady: true });
+		rmSync(join(root, "idempotency", `${idempotencyKeyHash(key)}.json`));
+		store.withIdempotencyHashLock = async () => {
+			throw new LiveLockOwnerError(`idempotency-${idempotencyKeyHash(key)}`);
+		};
+
+		const recovery = await service.recoverActiveRuns();
+		expect(recovery).toEqual({ resumed: [], blocked: [], deferred: [prepared.run.id] });
+		expect((await service.getRun(prepared.run.id)).status).toBe("queued");
+		expect(bridge.submittedPrompts).toEqual([]);
+	});
+
 	test("deletes replay-capable plaintext when a deferred worker is cancelled", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service, store } = makeChromeService(scratch(), scratch(), bridge);
@@ -496,12 +551,12 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.privateRequests.filter((request) => request.action === "ping").length).toBeGreaterThanOrEqual(connectorTypeRequests.length * 2);
 	});
 
-	test("selects preferred connector pills in the single main assignment", async () => {
+	test.each(["subagent", "chat"] as const)("selects preferred connector pills in the single %s assignment", async (kind) => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const assignment = "Use @Zenbox and @Compound Engineering to review the plan.";
 		const value = await service.start({
-			kind: "subagent",
+			kind,
 			prompt: assignment,
 			idempotencyKey: "inline-connector-selection",
 			connectors: ["Zenbox", "Compound Engineering"],
@@ -573,11 +628,11 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts[1]).toBe(assignment);
 	});
 
-	test.each(["prefer", "require"] as const)("blocks %s connectors before browser allocation when literal mentions are missing", async (connectorMode) => {
+	test.each(["subagent", "chat"] as const)("blocks %s connectors before browser allocation when literal mentions are missing", async (kind) => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
-		await expect(service.start({
-			kind: "subagent",
+		for (const connectorMode of ["prefer", "require"] as const) await expect(service.start({
+			kind,
 			prompt: "Inspect the repository evidence.",
 			connectors: ["GitHub", "Zenbox"],
 			connectorMode,
@@ -585,7 +640,7 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.activeTabs()).toEqual([]);
 	});
 
-	test("stops before the assignment when a same-conversation connector preflight is blocked", async () => {
+	test.each(["subagent", "chat"] as const)("stops %s before the assignment when a same-conversation connector preflight is blocked", async (kind) => {
 		const bridge = new FakeChromeBridge({
 			responseForPrompt: (prompt) => prompt.includes("Before we start the assignment")
 				? JSON.stringify({ connectors: [{ name: "Zenbox", status: "blocked", payload: "connector unavailable" }] })
@@ -593,8 +648,8 @@ describe("bounded GPT Worker scheduler", () => {
 		});
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
 		const value = await service.start({
-			kind: "subagent",
 			prompt: "Use @Zenbox to inspect the host.",
+			kind,
 			connectors: ["Zenbox"],
 			connectorMode: "require",
 			timeoutMs: 1000,
@@ -605,10 +660,24 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts[0]).toContain("@Zenbox");
 	});
 
-	test("rejects connector intent on ordinary chats and unsafe connector names", async () => {
+	test("reselects connector pills on an exact chat follow-up without creating a new conversation", async () => {
 		const bridge = new FakeChromeBridge();
 		const { service } = makeChromeService(scratch(), scratch(), bridge);
-		await expect(service.start({ kind: "chat", prompt: "no", connectors: ["GitHub"] })).rejects.toThrow("only for independent GPT Workers");
+		const first = await service.start({ kind: "chat", prompt: "Inspect @Zenbox.", connectors: ["Zenbox"], timeoutMs: 1000 });
+		const second = await service.start({ kind: "chat", conversationId: first.conversation.id,
+			prompt: "Check the assigned file with @Zenbox.", connectors: ["Zenbox"], timeoutMs: 1000 });
+		expect(second.run.status).toBe("completed");
+		expect(second.conversation.id).toBe(first.conversation.id);
+		expect(second.run.receipt.providerConversationId).toBe(first.run.receipt.providerConversationId);
+		expect(second.run.connectorSelection).toMatchObject({ status: "verified", names: ["Zenbox"] });
+		expect(bridge.activeTabs()).toHaveLength(1);
+		expect(bridge.submittedPrompts).toHaveLength(2);
+	});
+
+	test("rejects connector intent on images and unsafe connector names", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		await expect(service.start({ kind: "image", prompt: "no", connectors: ["GitHub"] })).rejects.toThrow("not supported for images");
 		await expect(service.start({ kind: "subagent", prompt: "no", connectors: ["GitHub\nmalice"] })).rejects.toThrow("Connector names");
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
@@ -2141,11 +2210,11 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		}
 	});
 
-	test("reports verified inline connector selection through the public MCP result", async () => {
+	test.each(["gpt_worker_run", "gpt_chat"])("reports verified inline connector selection through %s", async (name) => {
 		const harness = await connectMcp({ taskSupport: false, clientTasks: false });
 		try {
 			const result = await harness.client.callTool({
-				name: "gpt_worker_run",
+				name,
 				arguments: {
 					prompt: "Use @Zenbox for the single-turn assignment.",
 					idempotency_key: "inline-connector-public-result",

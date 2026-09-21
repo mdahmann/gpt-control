@@ -623,6 +623,8 @@ function commonParameters(Type: TypeBuilder): Record<string, Record<string, unkn
 		chatgpt_model: Type.Optional(Type.String({ description: "Exact live model label. Call gpt_models to discover current choices. Legacy value pro selects the Pro preset." })),
 		chatgpt_effort: Type.Optional(Type.String({ description: "Exact live effort label, such as High. Call gpt_models to discover current choices." })),
 		pin_chat: Type.Optional(Type.Boolean({ description: "Pin the exact provider conversation after its first message is submitted and identified." })),
+		connectors: Type.Optional(Type.Array(Type.String({ description: "Exact connector names; include each @mention in the prompt. Selection does not grant access." }))),
+		connector_mode: Type.Optional(Type.Union([Type.Literal("prefer"), Type.Literal("require")])),
 		idempotency_key: Type.Optional(Type.String()),
 		wait: Type.Optional(Type.Boolean({ description: "Default true. False returns durable ids while local monitoring continues." })),
 		timeout_ms: Type.Optional(Type.Integer()),

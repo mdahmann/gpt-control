@@ -92,6 +92,11 @@ def main() -> int:
     required = {"gpt_diagnose", "gpt_provider_resume", "gpt_worker_run", "gpt_worker_get", "gpt_worker_cancel"}
     if not required.issubset(names):
         fail(f"required tools missing: {sorted(required - names)}", process)
+    for name in ("gpt_chat", "gpt_consult"):
+        tool = next((tool for tool in tools if tool.get("name") == name), {})
+        properties = tool.get("inputSchema", {}).get("properties", {})
+        if not {"connectors", "connector_mode"}.issubset(properties):
+            fail(f"{name} connector selection fields missing", process)
     worker = next(tool for tool in tools if tool.get("name") == "gpt_worker_run")
     if worker.get("execution", {}).get("taskSupport") != "optional":
         fail(f"worker taskSupport is not optional: {worker.get('execution')}", process)

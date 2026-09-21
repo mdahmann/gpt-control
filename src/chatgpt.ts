@@ -1581,6 +1581,11 @@ export function approvedImageUrl(raw: string): URL | undefined {
 	return IMAGE_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url : undefined;
 }
 
+function finalAssistantContent(node: HTMLElement): HTMLElement | undefined {
+	// Tool-call cards can contain Markdown before the final assistant response.
+	return node.querySelectorAll(ASSISTANT_CONTENT_SELECTOR).at(-1);
+}
+
 export function extractConversationTurns(html: string, limit = 10): ChatGptConversationTurn[] {
 	if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
 	const root = parse(html);
@@ -1588,7 +1593,7 @@ export function extractConversationTurns(html: string, limit = 10): ChatGptConve
 		const assistant = node.getAttribute("data-message-author-role") === "assistant"
 			|| (node.getAttribute("data-content-search-unit-key") ?? "").endsWith(":assistant");
 		const content = assistant
-			? node.querySelector(ASSISTANT_CONTENT_SELECTOR)
+			? finalAssistantContent(node)
 			: USER_PROMPT_CONTENT_SELECTORS.map((selector) => node.querySelector(selector)).find(Boolean);
 		const text = (content?.structuredText ?? node.structuredText ?? "")
 			.replace(/[ \t]+\n/g, "\n")
@@ -1618,7 +1623,7 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 		seen.add(url.href);
 		imageUrls.push(url.href);
 	}
-	const content = node.querySelector(ASSISTANT_CONTENT_SELECTOR);
+	const content = finalAssistantContent(node);
 	const text = (content?.structuredText ?? "")
 		.replace(/[ \t]+\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")

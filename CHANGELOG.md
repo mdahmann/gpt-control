@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Allow `gpt_chat` and `gpt_consult` to select and verify requested connector
+  pills under the same literal-mention and authority rules as GPT Workers.
+- Read the final assistant response after a connector tool card instead of
+  returning the card's earlier Markdown content.
+- Release idempotency locks after durable run binding, before browser work or
+  synchronous waiting. Concurrent restart recovery now defers on a live lock
+  owner instead of incorrectly terminalizing the active run.
+
+### Verification
+
+- Cross-process regression tests prove one prompt submission while a second
+  broker recovers the live run and prove live-owner contention remains queued
+  instead of becoming `needs_user`.
+
 ## [0.5.0-alpha.10] - 2026-09-19
 
 ### Changed

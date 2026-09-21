@@ -41,6 +41,12 @@ Use the smallest route that matches what the user asked for:
 - **GPT Chat** is one direct question, message, or ongoing exchange with
   ChatGPT. Use `gpt_chat`. Send the user's actual message. Do not wrap it in a
   meta-task that tells ChatGPT to message GPT; ChatGPT is already the recipient.
+  For connected work, pass `connectors: ["Zenbox"]` and include `@Zenbox` in
+  the prompt. The default `connector_mode: "prefer"` selects and verifies the
+  actual pill before sending. Text alone is not connector-selection proof.
+  Repeat the connector fields on each same-conversation follow-up that needs
+  them. Verify actual connector access and edits independently; pill selection
+  does not grant repository authority.
 - **GPT Worker** is one durable background ChatGPT assignment. Use
   `gpt_worker_start`, or `gpt_worker_start_many` for two through ten independent
   jobs. These tools return durable handles immediately. ChatGPT does each

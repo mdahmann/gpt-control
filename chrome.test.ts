@@ -1203,6 +1203,23 @@ describe("honest terminal state and owned-tab boundaries", () => {
 		]);
 	});
 
+	test("reads the final assistant answer after a connector tool card", () => {
+		const html = `<main>
+			<div data-message-author-role="assistant" data-message-id="assistant-tool-result">
+				<div data-testid="tool-result-card"><div class="markdown"><p>{</p></div></div>
+				<div class="markdown"><p>{"connectors":[{"name":"Zenbox","status":"ready","payload":"canonical home is /home/miles"}]}</p></div>
+			</div>
+		</main>`;
+		expect(extractChatPageObservation(html).snapshot.text).toBe(
+			'{"connectors":[{"name":"Zenbox","status":"ready","payload":"canonical home is /home/miles"}]}',
+		);
+		expect(extractConversationTurns(html)).toEqual([{
+			role: "assistant",
+			text: '{"connectors":[{"name":"Zenbox","status":"ready","payload":"canonical home is /home/miles"}]}',
+			messageId: "assistant-tool-result",
+		}]);
+	});
+
 	test("uses the native ChatGPT Desktop Send control", async () => {
 		const attempts: string[] = [];
 		const exec = async (_command: string, args: string[]) => {

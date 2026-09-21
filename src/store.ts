@@ -295,6 +295,13 @@ export interface LockOptions {
 	pollMs?: number;
 }
 
+export class LiveLockOwnerError extends Error {
+	constructor(readonly lockName: string) {
+		super(`Lock ${lockName} is held by a live owner.`);
+		this.name = "LiveLockOwnerError";
+	}
+}
+
 export function storageRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return resolve(env.GPT_CONTROL_HOME ?? resolve(homedir(), ".gpt-control", "v3"));
 }
@@ -872,7 +879,7 @@ export class RunStore {
 				if (!isAlreadyExists(error)) throw error;
 				const recovered = await recoverDeadOwner(lock, staleMs);
 				if (recovered) continue;
-				if (Date.now() >= deadline) throw new Error(`Lock ${name} is held by a live owner.`);
+				if (Date.now() >= deadline) throw new LiveLockOwnerError(name);
 				await sleep(pollMs);
 			}
 		}

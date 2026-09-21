@@ -123,6 +123,11 @@ describe("public extension contract", () => {
 		expect(subagentProperties).toHaveProperty("chatgpt_effort");
 		expect(subagentProperties).toHaveProperty("connectors");
 		expect(subagentProperties).toHaveProperty("connector_mode");
+		for (const name of ["gpt_chat", "gpt_consult"]) {
+			const properties = (tools.find((tool) => tool.name === name)!.parameters as { properties: Record<string, SchemaNode> }).properties;
+			expect(properties).toHaveProperty("connectors");
+			expect(properties).toHaveProperty("connector_mode");
+		}
 		expect(subagentProperties).not.toHaveProperty("conversation_id");
 		expect(subagentProperties).not.toHaveProperty("transport");
 	});
@@ -181,6 +186,11 @@ describe("MCP plugin contract", () => {
 		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 		try {
 			const listed = await client.listTools();
+			for (const name of ["gpt_chat", "gpt_consult"]) {
+				const properties = listed.tools.find((tool) => tool.name === name)?.inputSchema.properties;
+				expect(properties).toHaveProperty("connectors");
+				expect(properties).toHaveProperty("connector_mode");
+			}
 			const subagent = listed.tools.find((tool) => tool.name === "gpt_worker_run");
 			expect(subagent?.execution?.taskSupport).toBe("optional");
 			expect(subagent?.inputSchema.required).toContain("idempotency_key");

@@ -56,7 +56,13 @@ import {
 	type OperatorPolicy,
 } from "./policy";
 import { buildReviewPrompt, parseReviewReport } from "./review";
-import { idempotencyKeyHash, RunStore, type DurableRunRequest, type MaintenanceReceipt } from "./store";
+import {
+	idempotencyKeyHash,
+	LiveLockOwnerError,
+	RunStore,
+	type DurableRunRequest,
+	type MaintenanceReceipt,
+} from "./store";
 import { passiveTransportDiscovery } from "./transport";
 import type { Exec } from "./types";
 
@@ -612,11 +618,12 @@ export class GptControlService {
 		if (options.deferExecution && normalized.wait) throw new Error("Deferred execution requires wait=false.");
 		await this.store.init();
 		const requestHash = startRequestHash(normalized);
+		let prepared: StartResult;
 		if (normalized.idempotencyKey) {
 			const scopedIdempotencyKey = options.mcpSessionId
 				? `mcp-${sha256(options.mcpSessionId)}:${normalized.idempotencyKey}`
 				: normalized.idempotencyKey;
-			return this.store.withIdempotencyLock(scopedIdempotencyKey, async (keyHash) => {
+			prepared = await this.store.withIdempotencyLock(scopedIdempotencyKey, async (keyHash) => {
 				let binding = await this.store.getIdempotencyByHash(keyHash);
 				if (!binding) {
 					const prepared = await this.store.findRunsByIdempotencyKeyHash(keyHash);
@@ -633,24 +640,22 @@ export class GptControlService {
 				}
 				if (binding) {
 					if (binding.requestHash !== requestHash) throw new Error("Idempotency key was already used for a different request.");
-					return this.finishStart({
+					return {
 						conversation: await this.store.getConversation(binding.conversationId),
 						run: await this.store.getRun(binding.runId),
-					}, normalized, options);
+					};
 				}
 				const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution, options.mcpSessionId);
 				await this.store.putIdempotency({
 					version: STORAGE_VERSION, keyHash, requestHash, runId: created.run.id,
 					conversationId: created.conversation.id, createdAt: nowIso(),
 				});
-				return this.finishStart(created, normalized, options);
+				return created;
 			});
+		} else {
+			prepared = await this.createPrepared(normalized, undefined, undefined, !options.deferExecution, options.mcpSessionId);
 		}
-		return this.finishStart(
-			await this.createPrepared(normalized, undefined, undefined, !options.deferExecution, options.mcpSessionId),
-			normalized,
-			options,
-		);
+		return this.finishStart(prepared, normalized, options);
 	}
 
 	async schedulePreparedRun(runId: string): Promise<RunRecord> {
@@ -1017,12 +1022,16 @@ export class GptControlService {
 			try {
 				if (run.idempotencyKeyHash) {
 					if (!run.idempotencyRequestHash) throw new Error("Idempotent run is missing its durable request hash.");
-					await this.store.withIdempotencyHashLock(run.idempotencyKeyHash, async (keyHash) => {
-						const existing = await this.store.getIdempotencyByHash(keyHash);
-						if (existing && (existing.runId !== run.id || existing.requestHash !== run.idempotencyRequestHash)) {
+					const existing = await this.store.getIdempotencyByHash(run.idempotencyKeyHash);
+					if (existing && (existing.runId !== run.id || existing.requestHash !== run.idempotencyRequestHash)) {
+						throw new Error("Idempotency index conflicts with the durable run.");
+					}
+					if (!existing) await this.store.withIdempotencyHashLock(run.idempotencyKeyHash, async (keyHash) => {
+						const locked = await this.store.getIdempotencyByHash(keyHash);
+						if (locked && (locked.runId !== run.id || locked.requestHash !== run.idempotencyRequestHash)) {
 							throw new Error("Idempotency index conflicts with the durable run.");
 						}
-						if (!existing) await this.store.putIdempotency({
+						if (!locked) await this.store.putIdempotency({
 							version: STORAGE_VERSION, keyHash, requestHash: run.idempotencyRequestHash!,
 							runId: run.id, conversationId: run.conversationId, createdAt: run.createdAt,
 						});
@@ -1034,6 +1043,10 @@ export class GptControlService {
 				this.scheduleRun(run.id, true);
 				resumed.push(run.id);
 			} catch (error) {
+				if (error instanceof LiveLockOwnerError) {
+					deferred.push(run.id);
+					continue;
+				}
 				await this.markNeedsUser(run.id, `Durable recovery payload unavailable: ${errorMessage(error)}`);
 				blocked.push(run.id);
 			}
@@ -2658,8 +2671,8 @@ function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): N
 	const title = request.kind === "subagent" && request.title !== undefined
 		? normalizeWorkerTitle(request.title, projectId)
 		: undefined;
-	if (request.kind !== "subagent" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
-		throw new Error("Connector intent is supported only for independent GPT Workers.");
+	if (request.kind === "image" && ((request.connectors?.length ?? 0) > 0 || request.connectorMode)) {
+		throw new Error("Connector intent is not supported for images.");
 	}
 	const connectorNames = [...new Set((request.connectors ?? []).map((name) => name.trim()))];
 	if (connectorNames.length > 8 || connectorNames.some((name) => !/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}$/.test(name))) {
