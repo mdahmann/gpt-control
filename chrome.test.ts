@@ -15,6 +15,7 @@ import {
 	extractConversationTurns,
 	extractComposerModel,
 	extractComposerSelection,
+	hasExactConnectorSuggestion,
 	isChatGptWorkExperience,
 	fillPrompt,
 	openChat,
@@ -52,6 +53,18 @@ async function readyFake(options: ConstructorParameters<typeof FakeChromeBridge>
 }
 
 describe("observed Chrome failures", () => {
+	test("accepts one actionable exact connector picker row", () => {
+		const html = `<div data-composer-plugin-impression-id="asdk_app_zenbox"><div tabindex="0" data-fill=""><span>Zenbox</span><span>Willow's VM</span></div></div>`;
+		expect(hasExactConnectorSuggestion(html, "Zenbox")).toBe(true);
+	});
+
+	test("rejects stale or ambiguous connector picker rows", () => {
+		const stale = `<div data-composer-plugin-impression-id="stale"><span>Zenbox</span></div>`;
+		const ambiguous = `<div data-composer-plugin-impression-id="one"><div data-fill=""><span>Zenbox</span></div></div><div data-composer-plugin-impression-id="two"><div data-fill=""><span>Zenbox</span></div></div>`;
+		expect(hasExactConnectorSuggestion(stale, "Zenbox")).toBe(false);
+		expect(hasExactConnectorSuggestion(ambiguous, "Zenbox")).toBe(false);
+	});
+
 	test("persists a visible ChatGPT rate limit and never dismisses or retries it", async () => {
 		const bridge = new FakeChromeBridge({
 			rateLimitNotice: true,

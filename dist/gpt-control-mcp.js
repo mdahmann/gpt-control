@@ -34407,7 +34407,10 @@ function selectedConnectorMentions(html) {
 }
 function hasExactConnectorSuggestion(html, name) {
   const root = parse6(html);
-  const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) => node.querySelectorAll("span").some((span) => normalizeComposerText(span.structuredText) === name));
+  const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) => {
+    const rows = node.querySelectorAll("[data-fill]");
+    return rows.length === 1 && rows[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
+  });
   return matches.length === 1;
 }
 async function typePromptText(exec, launcher, tabId, text, signal, expectedTarget) {

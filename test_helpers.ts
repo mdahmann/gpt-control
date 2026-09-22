@@ -690,7 +690,7 @@ export class FakeChromeBridge {
 		const modelSelectorDelayed = tab.htmlReads <= (this.options.modelSelectorDelayReads ?? 0);
 		const connectorPills = tab.selectedConnectors.map((name) => `<span data-inline-selection-pill="" data-keyword="${escapeHtml(name)}"><span>${escapeHtml(name)}</span></span>`).join(" ");
 		const connectorSuggestion = tab.pendingConnectorMention
-			? `<div data-composer-plugin-impression-id="fake-${escapeHtml(tab.pendingConnectorMention)}"><span>${escapeHtml(tab.pendingConnectorMention)}</span><span>Fake connector</span></div>`
+			? `<div data-composer-plugin-impression-id="fake-${escapeHtml(tab.pendingConnectorMention)}"><div data-fill=""><span>${escapeHtml(tab.pendingConnectorMention)}</span><span>Fake connector</span></div></div>`
 			: "";
 		const promptBody = `${connectorPills}${escapeHtml(tab.filled)}`;
 		const composer = this.options.composerAbsent ? "" : this.options.modelSelectorAbsent

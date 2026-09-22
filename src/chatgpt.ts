@@ -456,10 +456,18 @@ function selectedConnectorMentions(html: string): string[] {
 		.filter(Boolean);
 }
 
-function hasExactConnectorSuggestion(html: string, name: string): boolean {
+/**
+ * A connector name can also appear in stale picker rows or descriptive text.
+ * Accept only one current impression that owns one actionable picker row with
+ * one exact visible connector label.
+ */
+export function hasExactConnectorSuggestion(html: string, name: string): boolean {
 	const root = parse(html);
-	const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) =>
-		node.querySelectorAll("span").some((span) => normalizeComposerText(span.structuredText) === name));
+	const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) => {
+		const rows = node.querySelectorAll("[data-fill]");
+		return rows.length === 1
+			&& rows[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
+	});
 	return matches.length === 1;
 }
 
