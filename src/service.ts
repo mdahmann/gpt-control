@@ -1280,6 +1280,9 @@ export class GptControlService {
 			const current = await this.store.getRun(runId);
 			if (TERMINAL.has(current.status)) return current;
 			if (controller.signal.reason instanceof RestartSuspension) return current;
+			// Another scheduler still owns this conversation. Contention is not a
+			// provider failure and must not stop or terminalize the owner's run.
+			if (error instanceof LiveLockOwnerError) return current;
 			const terminal = await this.store.updateRun(runId, {
 				status: current.submissionState === "submitting" || current.submissionState === "submitted" ? "needs_user" : "failed",
 				providerStopRequested: current.providerTurnPending ? true : current.providerStopRequested,

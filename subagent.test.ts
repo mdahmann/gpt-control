@@ -298,6 +298,70 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(bridge.submittedPrompts).toEqual(["[slow] synchronous live recovery"]);
 	});
 
+	test("leaves a submitted live conversation owner running after recovery lock contention", async () => {
+		const root = scratch();
+		const workspace = scratch();
+		const bridge = new FakeChromeBridge();
+		const first = makeChromeService(root, workspace, bridge);
+		const second = makeChromeService(root, workspace, bridge);
+		const started = await first.service.start({
+			kind: "chat", prompt: "[slow] live conversation owner", wait: false, timeoutMs: 2000,
+		});
+		await waitUntil(async () => (await first.service.getRun(started.run.id)).submissionState === "submitted");
+		const withConversationLock = second.store.withConversationLock.bind(second.store);
+		let lockContended = false;
+		second.store.withConversationLock = async (conversationId, work) => {
+			try {
+				return await withConversationLock(conversationId, work, { timeoutMs: 10, pollMs: 1 });
+			} catch (error) {
+				if (error instanceof LiveLockOwnerError) lockContended = true;
+				throw error;
+			}
+		};
+
+		try {
+			await second.service.recoverActiveRuns();
+			await waitUntil(() => lockContended);
+			const observed = await second.service.waitForRun(started.run.id, 50);
+			expect(observed).toMatchObject({
+				status: "running", submissionState: "submitted",
+				providerTurnPending: true, providerStopRequested: false,
+			});
+			expect(observed.error).toBeUndefined();
+			expect(observed.completedAt).toBeUndefined();
+			expect(bridge.stopClicks).toEqual([]);
+		} finally {
+			bridge.release();
+			await first.service.waitForRun(started.run.id, 2000);
+		}
+
+		const completed = await first.service.getRun(started.run.id);
+		expect(completed.status).toBe("completed");
+		expect(completed.resultText).toBeTruthy();
+		expect(completed.providerRunId).toBeDefined();
+		expect(completed.providerTurnPending).toBe(false);
+		expect(bridge.stopClicks).toEqual([]);
+		expect(bridge.submittedPrompts).toEqual(["[slow] live conversation owner"]);
+		expect(bridge.activeTabs()).toHaveLength(1);
+	});
+
+	test("still fails a run for a genuine conversation lock error", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service, store } = makeChromeService(scratch(), scratch(), bridge);
+		const prepared = await service.start({
+			kind: "chat", prompt: "unavailable conversation storage", wait: false, timeoutMs: 1000,
+		}, { deferExecution: true });
+		store.withConversationLock = async () => {
+			throw new Error("conversation storage unavailable");
+		};
+		await service.schedulePreparedRun(prepared.run.id);
+		const failed = await service.waitForRun(prepared.run.id, 1000);
+		expect(failed.status).toBe("failed");
+		expect(failed.error).toBe("conversation storage unavailable");
+		expect(bridge.submittedPrompts).toEqual([]);
+		expect(bridge.stopClicks).toEqual([]);
+	});
+
 	test("defers recovery when a live owner holds an idempotency lock", async () => {
 		const root = scratch();
 		const workspace = scratch();
