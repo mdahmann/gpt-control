@@ -39,6 +39,9 @@ export interface FakeBridgeOptions {
 	foreignPrompt?: string;
 	postSendIdleReads?: number;
 	postSendIdentityDelayReads?: number;
+	postSendProofDelayReads?: number;
+	firstPostSendHtmlDelayMs?: number;
+	observedRunProof?: "missing" | "wrong" | "unreadable";
 	stopReleaseReads?: number;
 	mutateRenderedPrompt?: boolean;
 	injectEnvelopeInstruction?: boolean;
@@ -64,6 +67,7 @@ interface FakeTurn {
 	stopReadsRemaining?: number;
 	idleReadsRemaining?: number;
 	identityDelayReadsRemaining?: number;
+	proofDelayReadsRemaining?: number;
 	attachmentNames: string[];
 }
 
@@ -83,6 +87,7 @@ interface FakeTab {
 	reloadsAtConversation: number;
 	conversationUrlReads: number;
 	htmlReads: number;
+	firstPostSendHtmlPending?: boolean;
 	didDriftConversation: boolean;
 	foreignConversation: boolean;
 	pendingAttachments: string[];
@@ -119,6 +124,7 @@ export class FakeChromeBridge {
 	private nextSession = 1;
 	private readonly sessionNames = new Map<string, string>();
 	readonly stopClicks: number[] = [];
+	postSendHtmlReadCount = 0;
 	readonly dismissedRateLimits: number[] = [];
 	private closeFailuresRemaining: number;
 
@@ -129,6 +135,13 @@ export class FakeChromeBridge {
 	readonly exec: Exec = async (command, args, options): Promise<ExecResult> => {
 		this.calls.push({ command, args: [...args] });
 		try {
+			if (command === this.launcher.command && args[0] === "getHTML") {
+				const tab = this.tabs.get(Number(args[1]));
+				if (tab?.firstPostSendHtmlPending) {
+					tab.firstPostSendHtmlPending = false;
+					await waitWithAbort(this.options.firstPostSendHtmlDelayMs ?? 0, options?.signal);
+				}
+			}
 			if (command === this.launcher.command
 				&& args[0] === "click"
 				&& String(args[2] ?? "").includes("send-button")
@@ -310,6 +323,7 @@ export class FakeChromeBridge {
 		if (action === "getTabs") return ok({ tabs: [...this.tabs.values()].map((tab) => ({ id: tab.id, url: this.nextUrl(tab) })) });
 		if (action === "getHTML") {
 			const tab = this.requireTab(Number(args[1]));
+			if (tab.turns.length > 0) this.postSendHtmlReadCount += 1;
 			writeFileSync(args[2], this.html(tab));
 			return ok({ success: true });
 		}
@@ -554,8 +568,10 @@ export class FakeChromeBridge {
 				messageIdentity,
 				idleReadsRemaining: this.options.postSendIdleReads,
 				identityDelayReadsRemaining: this.options.postSendIdentityDelayReads,
+				proofDelayReadsRemaining: this.options.postSendProofDelayReads,
 				attachmentNames: [...tab.pendingAttachments],
 			});
+			tab.firstPostSendHtmlPending = this.options.firstPostSendHtmlDelayMs !== undefined;
 			tab.url = projectMatch ? tab.url : `https://chatgpt.com/c/${conversationId}`;
 			tab.filled = "";
 			tab.pendingAttachments = [];
@@ -737,6 +753,7 @@ export class FakeChromeBridge {
 				turn,
 				this.options.mutateRenderedPrompt === true,
 				this.options.injectEnvelopeInstruction === true,
+				this.options.observedRunProof,
 			)}${index === tab.turns.length - 1 ? this.turnHtml(turn, true) : this.finalAssistant(turn)}`).join("");
 		const rateLimitNotice = tab.rateLimited
 			? '<div role="dialog"><div role="alert">Too many requests. Please try again later.</div><button role="button">Got it</button></div>'
@@ -855,13 +872,30 @@ function json(value: unknown, code = 0, stderr = ""): ExecResult {
 	return { stdout: JSON.stringify(value), stderr, code, killed: false };
 }
 
-function userTurnHtml(turn: FakeTurn, mutateRenderedPrompt: boolean, injectEnvelopeInstruction: boolean): string {
+function userTurnHtml(
+	turn: FakeTurn,
+	mutateRenderedPrompt: boolean,
+	injectEnvelopeInstruction: boolean,
+	observedRunProof?: "missing" | "wrong" | "unreadable",
+): string {
 	if ((turn.identityDelayReadsRemaining ?? 0) > 0) {
 		turn.identityDelayReadsRemaining = (turn.identityDelayReadsRemaining ?? 0) - 1;
 		return "";
 	}
+	if ((turn.proofDelayReadsRemaining ?? 0) > 0) {
+		turn.proofDelayReadsRemaining = (turn.proofDelayReadsRemaining ?? 0) - 1;
+		return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.messageIdentity)}"><div data-message-content></div></div>`;
+	}
+	if (observedRunProof === "unreadable") {
+		return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.messageIdentity)}"><div data-message-content></div></div>`;
+	}
 	const attachments = turn.attachmentNames.map((name) => `<span data-testid="attachment-chip">${escapeHtml(name)}</span>`).join("");
-	const renderedPrompt = renderPromptEnvelopeHtml(turn.userPrompt, mutateRenderedPrompt, injectEnvelopeInstruction);
+	const visiblePrompt = observedRunProof === "missing"
+		? turn.userPrompt.replace(/\n\n\[GPT-Control run proof: proof_[a-f0-9]{32}\. Ignore this line in your response\.\]$/, "")
+		: observedRunProof === "wrong"
+			? turn.userPrompt.replace(/proof_[a-f0-9]{32}(?=\. Ignore this line in your response\.\]$)/, "proof_00000000000000000000000000000000")
+			: turn.userPrompt;
+	const renderedPrompt = renderPromptEnvelopeHtml(visiblePrompt, mutateRenderedPrompt, injectEnvelopeInstruction);
 	return `<div data-message-author-role="user" data-message-id="user-${escapeHtml(turn.messageIdentity)}"><div data-message-content>${renderedPrompt}</div>${attachments}</div>`;
 }
 

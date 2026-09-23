@@ -416,6 +416,15 @@ describe("bounded GPT Worker scheduler", () => {
 		expect(await service.listRuns()).toEqual([]);
 	});
 
+	test("counts the proof suffix against the trusted prompt byte limit before send", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge, { maxPromptBytes: 128 });
+		await expect(service.start({ kind: "chat", prompt: "x".repeat(64), timeoutMs: 1000 }))
+			.rejects.toThrow(/Prompt exceeds trusted 128-byte limit/);
+		expect(bridge.activeTabs()).toEqual([]);
+		expect(await service.listRuns()).toEqual([]);
+	});
+
 	test("does not let unactivated deferred runs consume global worker slots", async () => {
 		const root = scratch();
 		const workspace = scratch();
@@ -1877,6 +1886,109 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect(completed.run.providerTurnPending).toBe(false);
 		expect(bridge.stopClicks).toEqual([]);
 	});
+
+	test("binds the exact turn after a slow first post-send read renders no user identity", async () => {
+		const bridge = new FakeChromeBridge({
+			firstPostSendHtmlDelayMs: 15_100,
+			postSendIdentityDelayReads: 1,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "slow first identity read",
+			idempotencyKey: "slow-first-identity-read",
+			timeoutMs: 30_000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerUserMessageId).toMatch(/^user-fake-/);
+		expect(bridge.submittedPrompts).toEqual(["slow first identity read"]);
+		expect(bridge.stopClicks).toEqual([]);
+	}, 25_000);
+
+	test("waits one more bounded read when a slow first page has a user ID but no marker yet", async () => {
+		const bridge = new FakeChromeBridge({
+			firstPostSendHtmlDelayMs: 15_100,
+			postSendProofDelayReads: 1,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "marker renders after the message ID",
+			idempotencyKey: "marker-after-user-id",
+			timeoutMs: 30_000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.providerUserMessageId).toMatch(/^user-fake-/);
+		expect(bridge.submittedPrompts).toEqual(["marker renders after the message ID"]);
+		expect(bridge.stopClicks).toEqual([]);
+	}, 25_000);
+
+	test("does not adopt a later answer when two post-send reads lack first-user proof", async () => {
+		const bridge = new FakeChromeBridge({
+			firstPostSendHtmlDelayMs: 15_100,
+			postSendIdentityDelayReads: 2,
+		});
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "subagent",
+			prompt: "late answer without first-user proof",
+			idempotencyKey: "late-answer-without-proof",
+			timeoutMs: 30_000,
+		});
+		expect(result.run.status).toBe("needs_user");
+		expect(result.run.providerUserMessageId).toBeUndefined();
+		expect(result.run.providerTurnPending).toBe(true);
+		expect(bridge.postSendHtmlReadCount).toBe(2);
+		expect(bridge.submittedPrompts).toEqual(["late answer without first-user proof"]);
+		expect(bridge.stopClicks).toEqual([]);
+	}, 25_000);
+
+	test("binds a current text run to its unique visible proof marker", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({ kind: "chat", prompt: "Check one disposable class.", timeoutMs: 1000 });
+		expect(result.run.status).toBe("completed");
+		expect(result.run.promptProofToken).toMatch(/^proof_[a-f0-9]{32}$/);
+		expect(result.run.providerUserMessageId).toMatch(/^user-fake-/);
+		expect(bridge.submittedPrompts).toEqual(["Check one disposable class."]);
+		expect(bridge.privateRequests.some(({ payload }) =>
+			String(payload.text ?? "").includes(`[GPT-Control run proof: ${result.run.promptProofToken}. Ignore this line in your response.]`),
+		)).toBe(true);
+	});
+
+	test("binds a Zenbox selected-pill run with a task-local proof marker", async () => {
+		const bridge = new FakeChromeBridge();
+		const { service } = makeChromeService(scratch(), scratch(), bridge);
+		const result = await service.start({
+			kind: "chat",
+			prompt: "Use @Zenbox to inspect the Sequence class-generation repair in its assigned worktree.",
+			connectors: ["Zenbox"],
+			timeoutMs: 1000,
+		});
+		expect(result.run.status).toBe("completed");
+		expect(result.run.promptProofToken).toMatch(/^proof_[a-f0-9]{32}$/);
+		expect(result.run.providerUserMessageId).toMatch(/^user-fake-/);
+		expect(result.run.connectorSelection).toMatchObject({ status: "verified", names: ["Zenbox"] });
+		expect(bridge.submittedPrompts).toHaveLength(1);
+		expect(bridge.privateRequests.some(({ payload }) =>
+			String(payload.text ?? "").includes(`[GPT-Control run proof: ${result.run.promptProofToken}. Ignore this line in your response.]`),
+		)).toBe(true);
+	});
+
+	test.each(["missing", "wrong", "unreadable"] as const)(
+		"refuses a first user turn with %s broker proof",
+		async (observedRunProof) => {
+			const bridge = new FakeChromeBridge({ observedRunProof });
+			const { service } = makeChromeService(scratch(), scratch(), bridge);
+			const result = await service.start({ kind: "chat", prompt: "Exact marker required.", timeoutMs: 1000 });
+			expect(result.run.status).toBe("needs_user");
+			expect(result.run.providerUserMessageId).toBeUndefined();
+			expect(result.run.providerTurnPending).toBe(true);
+			expect(bridge.submittedPrompts).toEqual(["Exact marker required."]);
+			expect(bridge.stopClicks).toEqual([]);
+			if (observedRunProof === "wrong") expect(bridge.postSendHtmlReadCount).toBe(1);
+		},
+	);
 
 	test("provider completion that wins the durable race is not discarded by late task cancellation", async () => {
 		const root = scratch();

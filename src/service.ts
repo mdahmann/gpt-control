@@ -24,7 +24,6 @@ import {
 	CHATGPT_ORIGIN,
 	ChatGptProviderSafetyError,
 	ChatGptRateLimitError,
-	canonicalPromptObservationText,
 	providerConversationIdentity,
 	type ChatGptModelCatalog,
 	type ChatGptProjectCatalog,
@@ -1179,7 +1178,7 @@ export class GptControlService {
 	): Promise<RunRecord> {
 		const timestamp = nowIso();
 		const id = opaqueId("run");
-		const { prompt, promptProofToken, promptSha256, promptObservationSha256 } = preparedPrompt;
+		const { prompt, promptProofToken, promptSha256 } = preparedPrompt;
 		const chatgptModel = request.chatgptModel ?? this.policy.defaultChatGptModel;
 		const chatgptEffort = request.chatgptEffort;
 		const receipt: ReviewReceipt = {
@@ -1209,7 +1208,6 @@ export class GptControlService {
 			providerTurnPending: false,
 			providerStopRequested: false,
 			promptSha256,
-			promptObservationSha256,
 			promptProofToken,
 			attachmentManifest: manifest,
 			submissionState: "not_submitted",
@@ -1249,14 +1247,15 @@ export class GptControlService {
 		const promptBody = request.kind === "consult"
 			? buildReviewPrompt(request.prompt, manifest)
 			: request.prompt;
-		const prompt = promptBody;
+		const promptProofToken = `proof_${randomUUID().replaceAll("-", "")}`;
+		const prompt = `${promptBody}\n\n[GPT-Control run proof: ${promptProofToken}. Ignore this line in your response.]`;
 		if (Buffer.byteLength(prompt, "utf8") > this.policy.maxPromptBytes) {
 			throw new Error(`Prompt exceeds trusted ${this.policy.maxPromptBytes}-byte limit.`);
 		}
 		return {
 			prompt,
+			promptProofToken,
 			promptSha256: sha256(prompt),
-			promptObservationSha256: sha256(canonicalPromptObservationText(promptBody)),
 		};
 	}
 
@@ -1761,12 +1760,47 @@ export class GptControlService {
 					Number.isFinite(runDeadline) ? runDeadline : identityStartedAt + 15_000,
 				),
 			);
+			// An irreversible send can precede the caller deadline. Bound the
+			// in-flight identity read and its one slow-read follow-up independently.
+			const identityObservationSignal = AbortSignal.any([signal, AbortSignal.timeout(180_000)]);
 			let submittedIdentity: { id: string; url: string } | undefined;
 			let persisted: { conversation: ConversationRecord; run: RunRecord } | undefined;
 			let firstNewProviderUserMessageId: string | undefined;
-			while (Date.now() < identityDeadline) {
-				const submittedSession = await assertExactDriverSession(driver, expected, signal);
-				const observation = await driver.observe(submittedSession, signal);
+			let firstObservedConversationUrl: string | undefined;
+			const expectedIdentity = conversation.providerConversationUrl
+				? providerConversationIdentity(conversation.providerConversationUrl)
+				: undefined;
+			let observationCount = 0;
+			let oneSlowReadRetry = false;
+			while (Date.now() < identityDeadline || oneSlowReadRetry) {
+				const submittedSession = await assertExactDriverSession(driver, expected, identityObservationSignal);
+				const observationStartedAt = Date.now();
+				if (observationStartedAt >= identityDeadline && !oneSlowReadRetry) break;
+				const observation = await driver.observe(submittedSession, identityObservationSignal);
+				observationCount += 1;
+				const observedIdentity = providerConversationIdentity(submittedSession.url);
+				if (expectedIdentity && observedIdentity && expectedIdentity.url !== observedIdentity.url) {
+					return browserNeedsUser(
+						"The owned page changed from the recorded provider conversation during send-boundary identity observation. Completion was not attributed to this run.",
+						conversation, run,
+					);
+				}
+				if (firstObservedConversationUrl && observedIdentity?.url !== firstObservedConversationUrl) {
+					return browserNeedsUser(
+						"The owned page changed provider conversations during send-boundary identity observation. Completion was not attributed to this run.",
+						conversation, run,
+					);
+				}
+				firstObservedConversationUrl ??= observedIdentity?.url;
+				// A slow first page read can outlast the identity grace while the
+				// provider is still rendering the new user turn. Permit one more
+				// exact-page read, bounded by the overall observation timeout.
+				oneSlowReadRetry = observationCount === 1
+					&& observationStartedAt < identityDeadline
+					&& Date.now() >= identityDeadline
+					&& (!observation.latestUserMessageId
+						|| !observedIdentity
+						|| Boolean(run.promptProofToken && !observation.latestUserPromptProofToken));
 				const observedUserMessageId = observation.latestUserMessageId;
 				if (observedUserMessageId && observedUserMessageId !== preSendObservation.latestUserMessageId) {
 					if (firstNewProviderUserMessageId && firstNewProviderUserMessageId !== observedUserMessageId) {
@@ -1776,19 +1810,22 @@ export class GptControlService {
 						);
 					}
 					firstNewProviderUserMessageId = observedUserMessageId;
-					if (run.promptProofToken && !this.observationProvesPrompt(run, observation)) {
+					if (run.promptProofToken && observation.latestUserPromptProofToken
+						&& !this.observationProvesPrompt(run, observation)) {
 						return browserNeedsUser(
-							"The first new provider user turn did not match the legacy broker-owned send-boundary proof. Completion was not attributed to this run.",
+							"The first new provider user turn did not match the broker-owned send-boundary proof. Completion was not attributed to this run.",
 							conversation, run,
 						);
 					}
-					submittedIdentity = providerConversationIdentity(submittedSession.url);
-					if (submittedIdentity) {
-						persisted = await this.persistObservedProviderTurnIdentity(conversation, run, submittedIdentity, observation, true);
-						if (persisted) break;
+					if (!run.promptProofToken || observation.latestUserPromptProofToken) {
+						submittedIdentity = observedIdentity;
+						if (submittedIdentity) {
+							persisted = await this.persistObservedProviderTurnIdentity(conversation, run, submittedIdentity, observation, true);
+							if (persisted) break;
+						}
 					}
 				}
-				await abortableSleep(100, signal);
+				if (!oneSlowReadRetry) await abortableSleep(100, identityObservationSignal);
 			}
 			if (persisted) {
 				run = persisted.run;
@@ -2485,10 +2522,12 @@ export class GptControlService {
 	}
 
 	private observationProvesPrompt(run: RunRecord, observation: ChatPageObservation): boolean {
+		// New runs bind the random marker; older envelope runs also bind their
+		// persisted task-body hash.
 		return Boolean(run.promptProofToken
-			&& run.promptObservationSha256
 			&& observation.latestUserPromptProofToken === run.promptProofToken
-			&& observation.latestUserPromptSha256 === run.promptObservationSha256);
+			&& (!run.promptObservationSha256
+				|| observation.latestUserPromptSha256 === run.promptObservationSha256));
 	}
 
 	private scheduleProviderStopReconciliation(runId: string): void {
@@ -2624,9 +2663,8 @@ interface NormalizedStartRequest {
 
 interface PreparedRunPrompt {
 	prompt: string;
-	promptProofToken?: string;
+	promptProofToken: string;
 	promptSha256: string;
-	promptObservationSha256: string;
 }
 
 function normalizeStartRequest(request: StartRequest, policy: OperatorPolicy): NormalizedStartRequest {
