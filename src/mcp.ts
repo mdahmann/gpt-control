@@ -1016,6 +1016,7 @@ export async function resumeDurableSubagents(
 		console.error(`GPT-Control could not close ${workerCleanup.blocked.length} terminal GPT Worker browser session(s); a later restart will retry.`);
 	}
 	let bindings = await taskStore.listBindings();
+	const deferredTasks = new Set<string>();
 	const claimedRuns = new Map(
 		(await service.store.listRuns({ limit: null }))
 			.filter((run) => run.mcpTaskId)
@@ -1025,13 +1026,16 @@ export async function resumeDurableSubagents(
 		if (binding.runId) continue;
 		const claimed = claimedRuns.get(binding.task.taskId);
 		if (!claimed) continue;
-		if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
-			if (claimed.status !== "completed" && claimed.status !== "failed") {
-				await service.cancelRun(claimed.id);
+		const owned = await service.withRunRecoveryOwnership(claimed.id, async () => {
+			if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
+				if (claimed.status !== "completed" && claimed.status !== "failed") {
+					await service.cancelRun(claimed.id);
+				}
+				return;
 			}
-			continue;
-		}
-		await taskStore.bindRun(binding.task.taskId, claimed.id);
+			await taskStore.bindRun(binding.task.taskId, claimed.id);
+		});
+		if (!owned) deferredTasks.add(binding.task.taskId);
 	}
 	bindings = await taskStore.listBindings();
 	// Reconcile durable task authority before recovering runnable work. This also
@@ -1039,14 +1043,19 @@ export async function resumeDurableSubagents(
 	// before run cancellation and then crashed between those writes.
 	for (const binding of bindings) {
 		if (!binding.runId || !["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
-		const run = await service.getRun(binding.runId);
-		if (run.status === "queued" || run.status === "running" || run.status === "cancelled") await service.cancelRun(binding.runId);
+		const runId = binding.runId;
+		await service.withRunRecoveryOwnership(runId, async () => {
+			const run = await service.getRun(runId);
+			if (run.status === "queued" || run.status === "running" || run.status === "cancelled") await service.cancelRun(runId);
+		});
 	}
 	await service.recoverActiveRuns();
 	for (const binding of bindings) {
+		if (deferredTasks.has(binding.task.taskId)) continue;
 		if (["completed", "failed", "cancelled"].includes(binding.task.status)) continue;
 		const runId = binding.runId;
 		if (!runId) {
+			if (Date.now() - Date.parse(binding.task.createdAt) < 5 * 60_000) continue;
 			await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("GPT Worker task has no durable run binding; no prompt was resubmitted.", {
 				taskId: binding.task.taskId,
 				status: "failed",
@@ -1054,8 +1063,10 @@ export async function resumeDurableSubagents(
 			}, true));
 			continue;
 		}
-		await service.schedulePreparedRun(runId);
-		startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
+		await service.withRunRecoveryOwnership(runId, async () => {
+			await service.schedulePreparedRun(runId);
+			startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
+		});
 	}
 }
 

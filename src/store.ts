@@ -288,6 +288,11 @@ interface LockOwner {
 	heartbeatAt: string;
 }
 
+export interface NamedLease {
+	token: string;
+	release(): Promise<void>;
+}
+
 export interface LockOptions {
 	timeoutMs?: number;
 	staleMs?: number;
@@ -853,6 +858,32 @@ export class RunStore {
 	}
 
 	private async withNamedLock<T>(name: string, work: () => Promise<T>, options: LockOptions): Promise<T> {
+		const lease = await this.acquireNamedLease(name, options);
+		try {
+			return await work();
+		} finally {
+			await lease.release();
+		}
+	}
+
+	async namedLeaseIsLive(name: string, options: Pick<LockOptions, "staleMs"> = {}): Promise<boolean> {
+		if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`Invalid lock name: ${name}`);
+		const lock = confinedPath(this.root, "locks", `${name}.lock`);
+		let info;
+		try {
+			info = await lstat(lock);
+		} catch (error) {
+			if (isMissing(error)) return false;
+			throw error;
+		}
+		if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Refused unsafe lock path: ${lock}`);
+		const owner = await readOwner(lock);
+		const heartbeatAt = owner ? Date.parse(owner.heartbeatAt) : info.mtimeMs;
+		return Date.now() - heartbeatAt <= (options.staleMs ?? 120_000)
+			|| Boolean(owner && await ownerIsAlive(owner));
+	}
+
+	async acquireNamedLease(name: string, options: LockOptions = {}): Promise<NamedLease> {
 		await this.init();
 		if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`Invalid lock name: ${name}`);
 		const lock = confinedPath(this.root, "locks", `${name}.lock`);
@@ -888,12 +919,13 @@ export class RunStore {
 			void heartbeatOwner(lock, owner).catch(() => undefined);
 		}, heartbeatMs);
 		heartbeat.unref?.();
-		try {
-			return await work();
-		} finally {
-			clearInterval(heartbeat);
-			await releaseOwnedLock(lock, owner.token);
-		}
+		return {
+			token: owner.token,
+			release: async () => {
+				clearInterval(heartbeat);
+				await releaseOwnedLock(lock, owner.token);
+			},
+		};
 	}
 }
 

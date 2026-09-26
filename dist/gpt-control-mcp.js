@@ -37885,6 +37885,32 @@ class RunStore {
     return this.withNamedLock(`provider-conversation-${identityHash}`, work, { timeoutMs: 30000 });
   }
   async withNamedLock(name, work, options) {
+    const lease = await this.acquireNamedLease(name, options);
+    try {
+      return await work();
+    } finally {
+      await lease.release();
+    }
+  }
+  async namedLeaseIsLive(name, options = {}) {
+    if (!/^[A-Za-z0-9._-]+$/.test(name))
+      throw new Error(`Invalid lock name: ${name}`);
+    const lock = confinedPath(this.root, "locks", `${name}.lock`);
+    let info;
+    try {
+      info = await lstat(lock);
+    } catch (error51) {
+      if (isMissing(error51))
+        return false;
+      throw error51;
+    }
+    if (info.isSymbolicLink() || !info.isDirectory())
+      throw new Error(`Refused unsafe lock path: ${lock}`);
+    const owner = await readOwner(lock);
+    const heartbeatAt = owner ? Date.parse(owner.heartbeatAt) : info.mtimeMs;
+    return Date.now() - heartbeatAt <= (options.staleMs ?? 120000) || Boolean(owner && await ownerIsAlive(owner));
+  }
+  async acquireNamedLease(name, options = {}) {
     await this.init();
     if (!/^[A-Za-z0-9._-]+$/.test(name))
       throw new Error(`Invalid lock name: ${name}`);
@@ -37924,12 +37950,13 @@ class RunStore {
       });
     }, heartbeatMs);
     heartbeat.unref?.();
-    try {
-      return await work();
-    } finally {
-      clearInterval(heartbeat);
-      await releaseOwnedLock(lock, owner.token);
-    }
+    return {
+      token: owner.token,
+      release: async () => {
+        clearInterval(heartbeat);
+        await releaseOwnedLock(lock, owner.token);
+      }
+    };
   }
 }
 async function safeRead(path) {
@@ -38577,6 +38604,9 @@ class GptControlService {
   dependencies;
   activeRuns = new Map;
   activeStopReconciliations = new Map;
+  runOwnerLeases = new Map;
+  runRecoveryScopes = new Map;
+  pendingOwnerReleases = new Set;
   cancellationIntents = new Set;
   providerSlots;
   constructor(exec, store = new RunStore, policy, dependencies = {}) {
@@ -38883,14 +38913,19 @@ class GptControlService {
           };
         }
         const created = await this.createPrepared(normalized, keyHash, requestHash, !options.deferExecution, options.mcpSessionId);
-        await this.store.putIdempotency({
-          version: STORAGE_VERSION,
-          keyHash,
-          requestHash,
-          runId: created.run.id,
-          conversationId: created.conversation.id,
-          createdAt: nowIso()
-        });
+        try {
+          await this.store.putIdempotency({
+            version: STORAGE_VERSION,
+            keyHash,
+            requestHash,
+            runId: created.run.id,
+            conversationId: created.conversation.id,
+            createdAt: nowIso()
+          });
+        } catch (error51) {
+          await this.releaseIdleRunOwnership(created.run.id);
+          throw error51;
+        }
         return created;
       });
     } else {
@@ -38898,18 +38933,82 @@ class GptControlService {
     }
     return this.finishStart(prepared, normalized, options);
   }
-  async schedulePreparedRun(runId) {
-    let run = await this.store.getRun(runId);
-    if (TERMINAL2.has(run.status))
-      return run;
-    const conversation = await this.store.getConversation(run.conversationId);
-    if (conversation.policyFingerprint !== this.policy.fingerprint) {
-      return this.markNeedsUser(runId, "Trusted operator policy changed before deferred execution; the worker was not started.");
+  async withRunRecoveryOwnership(runId, work) {
+    const alreadyOwned = this.runOwnerLeases.has(runId);
+    this.runRecoveryScopes.set(runId, (this.runRecoveryScopes.get(runId) ?? 0) + 1);
+    let owned = false;
+    try {
+      owned = await this.claimRunForRecovery(runId);
+      if (!owned)
+        return false;
+      await work();
+      return true;
+    } finally {
+      const remaining = this.runRecoveryScopes.get(runId) - 1;
+      if (remaining)
+        this.runRecoveryScopes.set(runId, remaining);
+      else
+        this.runRecoveryScopes.delete(runId);
+      if (owned && !alreadyOwned || this.pendingOwnerReleases.has(runId)) {
+        await this.releaseIdleRunOwnership(runId);
+      }
     }
-    if (!run.executionReady)
-      run = await this.store.updateRun(runId, { executionReady: true });
-    this.scheduleRun(runId, false);
-    return run;
+  }
+  async claimRunForRecovery(runId) {
+    let pending = this.runOwnerLeases.get(runId);
+    if (!pending) {
+      pending = this.store.acquireNamedLease(`run-owner-${runId}`, {
+        timeoutMs: 0,
+        staleMs: 120000,
+        heartbeatMs: 20000
+      });
+      this.runOwnerLeases.set(runId, pending);
+    }
+    try {
+      await pending;
+      return true;
+    } catch (error51) {
+      if (this.runOwnerLeases.get(runId) === pending)
+        this.runOwnerLeases.delete(runId);
+      if (error51 instanceof LiveLockOwnerError)
+        return false;
+      throw error51;
+    }
+  }
+  async releaseRunOwnership(runId) {
+    const pending = this.runOwnerLeases.get(runId);
+    this.pendingOwnerReleases.delete(runId);
+    if (!pending)
+      return;
+    this.runOwnerLeases.delete(runId);
+    await (await pending).release();
+  }
+  async releaseIdleRunOwnership(runId) {
+    if (this.activeRuns.has(runId))
+      return;
+    if (this.runRecoveryScopes.has(runId)) {
+      this.pendingOwnerReleases.add(runId);
+      return;
+    }
+    await this.releaseRunOwnership(runId);
+  }
+  async schedulePreparedRun(runId) {
+    await this.withRunRecoveryOwnership(runId, async () => {
+      const run = await this.store.getRun(runId);
+      if (TERMINAL2.has(run.status)) {
+        await this.releaseIdleRunOwnership(runId);
+        return;
+      }
+      const conversation = await this.store.getConversation(run.conversationId);
+      if (conversation.policyFingerprint !== this.policy.fingerprint) {
+        await this.markNeedsUser(runId, "Trusted operator policy changed before deferred execution; the worker was not started.");
+        return;
+      }
+      if (!run.executionReady)
+        await this.store.updateRun(runId, { executionReady: true });
+      this.scheduleRun(runId, false);
+    });
+    return this.store.getRun(runId);
   }
   async getRun(runId) {
     return this.store.getRun(runId);
@@ -38948,6 +39047,8 @@ class GptControlService {
     for (const value of active)
       value.controller.abort(new RestartSuspension);
     await Promise.allSettled(active.map((value) => value.promise));
+    for (const runId of this.runOwnerLeases.keys())
+      await this.releaseIdleRunOwnership(runId);
   }
   async cancelPreparedRunUnlessOwnedByAnotherTask(runId, taskId) {
     return this.store.withRunTaskBindingLock(runId, async () => {
@@ -38982,6 +39083,7 @@ class GptControlService {
         });
       }
       this.cancellationIntents.delete(runId);
+      await this.releaseIdleRunOwnership(runId);
       return this.store.getRun(runId);
     }
     const cancelled = await this.persistCancellation(runId);
@@ -38995,12 +39097,15 @@ class GptControlService {
     }
     if (!this.activeRuns.has(runId))
       this.cancellationIntents.delete(runId);
+    await this.releaseIdleRunOwnership(runId);
     return cancelled;
   }
   async markNeedsUser(runId, reason) {
     const run = await this.store.getRun(runId);
-    if (TERMINAL2.has(run.status))
+    if (TERMINAL2.has(run.status)) {
+      await this.releaseIdleRunOwnership(runId);
       return run;
+    }
     const blocked = await this.store.updateRun(runId, {
       status: "needs_user",
       providerStopRequested: run.providerTurnPending ? true : run.providerStopRequested,
@@ -39012,6 +39117,7 @@ class GptControlService {
       this.scheduleProviderStopReconciliation(runId);
     }
     this.activeRuns.get(runId)?.controller.abort(new Error(reason));
+    await this.releaseIdleRunOwnership(runId);
     return blocked;
   }
   async abandonPendingProviderTurn(runId, confirmation, operatorToken) {
@@ -39178,24 +39284,26 @@ class GptControlService {
       const explicitStopRequest = run.providerTurnPending === true && run.providerStopRequested === true;
       if (!explicitStopRequest && !legacyStopRequest)
         continue;
-      attempted.push(run.id);
-      try {
-        const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
-        if (isDefinitivePreSendFailure(stopRun)) {
-          await this.store.clearProviderTurnState(run.id);
-          stopped.push(run.id);
-          continue;
-        }
-        if (await this.stopOwnedBrowserRun(stopRun))
-          stopped.push(run.id);
-        else {
-          blocked.push({ runId: run.id, reason: "The exact provider turn did not prove it was inactive." });
+      await this.withRunRecoveryOwnership(run.id, async () => {
+        attempted.push(run.id);
+        try {
+          const stopRun = legacyStopRequest ? await this.store.requestProviderStop(run.id) : run;
+          if (isDefinitivePreSendFailure(stopRun)) {
+            await this.store.clearProviderTurnState(run.id);
+            stopped.push(run.id);
+            return;
+          }
+          if (await this.stopOwnedBrowserRun(stopRun))
+            stopped.push(run.id);
+          else {
+            blocked.push({ runId: run.id, reason: "The exact provider turn did not prove it was inactive." });
+            this.scheduleProviderStopReconciliation(run.id);
+          }
+        } catch (error51) {
+          blocked.push({ runId: run.id, reason: errorMessage2(error51) });
           this.scheduleProviderStopReconciliation(run.id);
         }
-      } catch (error51) {
-        blocked.push({ runId: run.id, reason: errorMessage2(error51) });
-        this.scheduleProviderStopReconciliation(run.id);
-      }
+      });
     }
     return { attempted, stopped, blocked };
   }
@@ -39210,16 +39318,18 @@ class GptControlService {
         continue;
       if (activeConversationIds.has(run.conversationId) || inspectedConversationIds.has(run.conversationId))
         continue;
-      inspectedConversationIds.add(run.conversationId);
-      try {
-        const conversation = await this.store.getConversation(run.conversationId);
-        if (conversation.closedAt)
-          continue;
-        await this.store.withConversationOwnershipLock(run.conversationId, () => this.closeOwnedConversationSession(run.conversationId));
-        closed.push(run.conversationId);
-      } catch (error51) {
-        blocked.push({ runId: run.id, reason: errorMessage2(error51) });
-      }
+      await this.withRunRecoveryOwnership(run.id, async () => {
+        inspectedConversationIds.add(run.conversationId);
+        try {
+          const conversation = await this.store.getConversation(run.conversationId);
+          if (conversation.closedAt)
+            return;
+          await this.store.withConversationOwnershipLock(run.conversationId, () => this.closeOwnedConversationSession(run.conversationId));
+          closed.push(run.conversationId);
+        } catch (error51) {
+          blocked.push({ runId: run.id, reason: errorMessage2(error51) });
+        }
+      });
     }
     return { closed, blocked };
   }
@@ -39229,18 +39339,25 @@ class GptControlService {
     const resumed = [];
     const blocked = [];
     const deferred = [];
-    for (const run of runs) {
+    for (let run of runs) {
       if (!run.executionReady) {
         deferred.push(run.id);
         continue;
       }
-      const conversation = await this.store.getConversation(run.conversationId);
-      if (conversation.policyFingerprint !== this.policy.fingerprint) {
-        await this.markNeedsUser(run.id, "Trusted operator policy changed while the run was inactive; recovery refused.");
-        blocked.push(run.id);
+      if (!await this.claimRunForRecovery(run.id)) {
+        deferred.push(run.id);
         continue;
       }
       try {
+        run = await this.store.getRun(run.id);
+        if (TERMINAL2.has(run.status))
+          continue;
+        const conversation = await this.store.getConversation(run.conversationId);
+        if (conversation.policyFingerprint !== this.policy.fingerprint) {
+          await this.markNeedsUser(run.id, "Trusted operator policy changed while the run was inactive; recovery refused.");
+          blocked.push(run.id);
+          continue;
+        }
         if (run.idempotencyKeyHash) {
           if (!run.idempotencyRequestHash)
             throw new Error("Idempotent run is missing its durable request hash.");
@@ -39277,6 +39394,8 @@ class GptControlService {
         }
         await this.markNeedsUser(run.id, `Durable recovery payload unavailable: ${errorMessage2(error51)}`);
         blocked.push(run.id);
+      } finally {
+        await this.releaseIdleRunOwnership(run.id);
       }
     }
     return { resumed, blocked, deferred };
@@ -39440,13 +39559,16 @@ class GptControlService {
       timeoutMs: request.timeoutMs,
       createdAt: timestamp
     };
-    await this.store.putRunRequest(durableRequest);
+    if (!await this.claimRunForRecovery(id))
+      throw new LiveLockOwnerError(`run-owner-${id}`);
     try {
+      await this.store.putRunRequest(durableRequest);
       await this.store.putRun(run);
     } catch (error51) {
       await this.store.deleteRunRequest(run.id).catch(() => {
         return;
       });
+      await this.releaseRunOwnership(id);
       throw error51;
     }
     return run;
@@ -39472,6 +39594,8 @@ class GptControlService {
       return existing.promise;
     const controller = new AbortController;
     const promise3 = (async () => {
+      if (!await this.claimRunForRecovery(runId))
+        throw new LiveLockOwnerError(`run-owner-${runId}`);
       const run = await this.store.getRun(runId);
       const work = () => this.store.withConversationLock(run.conversationId, () => this.executeRun(runId, controller.signal, recovery), { timeoutMs: Math.max(30000, (run.timeoutMs ?? 600000) + 60000) });
       const admitted = await this.waitForGlobalProviderTurn(runId, controller.signal);
@@ -39501,7 +39625,7 @@ class GptControlService {
       }
       return terminal;
     }).then(async (terminal) => {
-      if (!this.canCloseTerminalWorkerConversation(terminal))
+      if (!this.runOwnerLeases.has(runId) || !this.canCloseTerminalWorkerConversation(terminal))
         return terminal;
       try {
         await this.closeTerminalWorkerConversation(terminal);
@@ -39519,9 +39643,10 @@ class GptControlService {
           }
         });
       }
-    }).finally(() => {
+    }).finally(async () => {
       this.activeRuns.delete(runId);
       this.cancellationIntents.delete(runId);
+      await this.releaseIdleRunOwnership(runId);
     });
     this.activeRuns.set(runId, { controller, promise: promise3 });
     promise3.catch(() => {
@@ -42540,6 +42665,7 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map, co
     console.error(`GPT-Control could not close ${workerCleanup.blocked.length} terminal GPT Worker browser session(s); a later restart will retry.`);
   }
   let bindings = await taskStore.listBindings();
+  const deferredTasks = new Set;
   const claimedRuns = new Map((await service.store.listRuns({ limit: null })).filter((run) => run.mcpTaskId).map((run) => [run.mcpTaskId, run]));
   for (const binding of bindings) {
     if (binding.runId)
@@ -42547,28 +42673,39 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map, co
     const claimed = claimedRuns.get(binding.task.taskId);
     if (!claimed)
       continue;
-    if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
-      if (claimed.status !== "completed" && claimed.status !== "failed") {
-        await service.cancelRun(claimed.id);
+    const owned = await service.withRunRecoveryOwnership(claimed.id, async () => {
+      if (["completed", "failed", "cancelled"].includes(binding.task.status)) {
+        if (claimed.status !== "completed" && claimed.status !== "failed") {
+          await service.cancelRun(claimed.id);
+        }
+        return;
       }
-      continue;
-    }
-    await taskStore.bindRun(binding.task.taskId, claimed.id);
+      await taskStore.bindRun(binding.task.taskId, claimed.id);
+    });
+    if (!owned)
+      deferredTasks.add(binding.task.taskId);
   }
   bindings = await taskStore.listBindings();
   for (const binding of bindings) {
     if (!binding.runId || !["completed", "failed", "cancelled"].includes(binding.task.status))
       continue;
-    const run = await service.getRun(binding.runId);
-    if (run.status === "queued" || run.status === "running" || run.status === "cancelled")
-      await service.cancelRun(binding.runId);
+    const runId = binding.runId;
+    await service.withRunRecoveryOwnership(runId, async () => {
+      const run = await service.getRun(runId);
+      if (run.status === "queued" || run.status === "running" || run.status === "cancelled")
+        await service.cancelRun(runId);
+    });
   }
   await service.recoverActiveRuns();
   for (const binding of bindings) {
+    if (deferredTasks.has(binding.task.taskId))
+      continue;
     if (["completed", "failed", "cancelled"].includes(binding.task.status))
       continue;
     const runId = binding.runId;
     if (!runId) {
+      if (Date.now() - Date.parse(binding.task.createdAt) < 5 * 60000)
+        continue;
       await taskStore.storeTaskResult(binding.task.taskId, "failed", toolPayload("GPT Worker task has no durable run binding; no prompt was resubmitted.", {
         taskId: binding.task.taskId,
         status: "failed",
@@ -42576,8 +42713,10 @@ async function resumeDurableSubagents(service, taskStore, monitors = new Map, co
       }, true));
       continue;
     }
-    await service.schedulePreparedRun(runId);
-    startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
+    await service.withRunRecoveryOwnership(runId, async () => {
+      await service.schedulePreparedRun(runId);
+      startTaskMonitor(service, taskStore, monitors, binding.task.taskId, runId, undefined, codexCallback);
+    });
   }
 }
 function subagentRequest(params, wait) {

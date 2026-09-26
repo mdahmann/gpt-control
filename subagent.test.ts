@@ -308,6 +308,8 @@ describe("bounded GPT Worker scheduler", () => {
 			kind: "chat", prompt: "[slow] live conversation owner", wait: false, timeoutMs: 2000,
 		});
 		await waitUntil(async () => (await first.service.getRun(started.run.id)).submissionState === "submitted");
+		// A legacy scheduler holds the conversation lock but predates run-owner leases.
+		rmSync(join(root, "locks", `run-owner-${started.run.id}.lock`), { recursive: true });
 		const withConversationLock = second.store.withConversationLock.bind(second.store);
 		let lockContended = false;
 		second.store.withConversationLock = async (conversationId, work) => {
@@ -465,6 +467,7 @@ describe("bounded GPT Worker scheduler", () => {
 		};
 		const prepared = await first.service.start(request, { deferExecution: true });
 		rmSync(join(root, "idempotency", `${idempotencyKeyHash(key)}.json`));
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(root, workspace, bridge);
 		const repaired = await second.service.start(request, { deferExecution: true });
 		expect(repaired.run.id).toBe(prepared.run.id);
@@ -515,6 +518,7 @@ describe("bounded GPT Worker scheduler", () => {
 		expect((await first.service.getRun(prepared.run.id)).receipt.localBrowserSessionId).toBeUndefined();
 		expect((await first.service.getRun(prepared.run.id)).receipt.desktopPoolLane).toBeUndefined();
 
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(root, workspace, bridge);
 		await second.service.schedulePreparedRun(prepared.run.id);
 		const terminal = await second.service.waitForRun(prepared.run.id, 2000);
@@ -561,6 +565,7 @@ describe("bounded GPT Worker scheduler", () => {
 			wait: false,
 			timeoutMs: 1000,
 		}, { deferExecution: true });
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(root, workspace, bridge, { maxConcurrentWorkers: 2 });
 		const refused = await second.service.schedulePreparedRun(prepared.run.id);
 		expect(refused.status).toBe("needs_user");
@@ -815,6 +820,7 @@ describe("bounded GPT Worker scheduler", () => {
 		}
 		const expectedOrder = prepared.slice().sort((left, right) =>
 			left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId));
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(root, workspace, bridge, { maxConcurrentWorkers: 3 });
 		const recovery = await second.service.recoverActiveRuns();
 		expect(recovery.resumed).toHaveLength(6);
@@ -1508,6 +1514,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		await first.service.store.claimMcpTask(prepared.run.id, task.taskId);
 		expect(await taskStore.getRunId(task.taskId)).toBeUndefined();
 
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(join(root, "state"), workspace, bridge);
 		await resumeDurableSubagents(second.service, taskStore, new Map());
 		await waitUntil(async () => (await taskStore.getTask(task.taskId))?.status === "completed", 2500);
@@ -1586,6 +1593,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect(await taskStore.listBindings(100)).toHaveLength(100);
 		expect(await taskStore.listBindings()).toHaveLength(101);
 
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(join(root, "state"), workspace, bridge);
 		await resumeDurableSubagents(second.service, taskStore, new Map());
 		expect((await second.service.getRun(prepared.run.id)).status).toBe("cancelled");
@@ -1620,6 +1628,7 @@ describe("MCP cancellation, reconnect, restart, and fallback", () => {
 		expect((await first.service.getRun(started.run.id)).status).toBe("cancelled");
 		expect(bridge.stopClicks).toEqual([]);
 
+		await first.service.suspendActiveRunsForRestart();
 		const second = makeChromeService(join(root, "state"), workspace, bridge);
 		await resumeDurableSubagents(second.service, taskStore, new Map());
 		expect(bridge.stopClicks).toHaveLength(1);
