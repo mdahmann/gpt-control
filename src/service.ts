@@ -286,6 +286,16 @@ class FairSemaphore {
 	}
 }
 
+/**
+ * A recorded provider user-message id matches the observed latest user turn when it
+ * equals the preferred id or any alias the same turn exposes (for example a run
+ * recorded before ChatGPT exposed provider ids on current turn markup).
+ */
+function observationHasUserMessage(observation: ChatPageObservation, id: string | undefined): boolean {
+	if (!id) return false;
+	return observation.latestUserMessageId === id || (observation.latestUserMessageAliases ?? []).includes(id);
+}
+
 export class GptControlService {
 	readonly store: RunStore;
 	readonly policy: OperatorPolicy;
@@ -1969,7 +1979,7 @@ export class GptControlService {
 					: undefined;
 				if (!expectedIdentity || expectedIdentity.url !== identity.url) return "mismatch";
 				if (observation.latestUserMessageId
-					&& observation.latestUserMessageId !== run.providerUserMessageId) return "mismatch";
+					&& !observationHasUserMessage(observation, run.providerUserMessageId)) return "mismatch";
 				if (!observation.latestUserMessageId) return "unavailable";
 				if (run.promptProofToken && (!observation.latestUserPromptProofToken
 					|| !observation.latestUserPromptSha256)) return "unavailable";
@@ -2160,7 +2170,7 @@ export class GptControlService {
 				const exact = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
 				if (!exact || exact.url !== identity.url) return "mismatch";
 				if (!observation.latestUserMessageId) return "unavailable";
-				return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+				return observationHasUserMessage(observation, state.providerUserMessageId) ? "approved" : "mismatch";
 			},
 			onRateLimit: async (message) => {
 				run = await this.recordProviderRateLimit(run, message);
@@ -2482,7 +2492,7 @@ export class GptControlService {
 
 	private observationProvesRun(run: RunRecord, observation: ChatPageObservation): boolean {
 		return Boolean(run.providerUserMessageId
-			&& observation.latestUserMessageId === run.providerUserMessageId
+			&& observationHasUserMessage(observation, run.providerUserMessageId)
 			&& (!run.promptProofToken || this.observationProvesPrompt(run, observation)));
 	}
 
@@ -2498,8 +2508,8 @@ export class GptControlService {
 			? providerConversationIdentity(conversation.providerConversationUrl)
 			: undefined;
 		if (expectedExistingIdentity && expectedExistingIdentity.url !== identity.url) return undefined;
-		if (run.providerUserMessageId && run.providerUserMessageId !== observation.latestUserMessageId) return undefined;
-		if (run.providerUserMessageId === observation.latestUserMessageId
+		if (run.providerUserMessageId && !observationHasUserMessage(observation, run.providerUserMessageId)) return undefined;
+		if (observationHasUserMessage(observation, run.providerUserMessageId)
 			&& run.receipt.providerConversationUrl === identity.url
 			&& conversation.providerConversationUrl === identity.url) {
 			return { conversation, run };

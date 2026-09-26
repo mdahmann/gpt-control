@@ -22,7 +22,8 @@ const FILE_INPUT_SELECTOR = 'input[type="file"]';
 const USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
 const USER_TURN_SELECTOR = '[data-message-author-role="user"], [data-content-search-unit-key$=":user"]';
 const ASSISTANT_TURN_SELECTOR = '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
-const ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"]';
+// Current ChatGPT builds hash the Markdown root as `MarkdownRoot-<hash>` rather than `_MarkdownRoot_<hash>`.
+const ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"], [class*="MarkdownRoot-"]';
 const EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 const TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 
@@ -150,6 +151,8 @@ export interface ExactBrowserActionTarget {
 export interface ChatPageObservation {
 	snapshot: AssistantSnapshot;
 	latestUserMessageId?: string;
+	/** Every identifier the latest user turn exposes, so runs recorded under an older id form still reconcile. */
+	latestUserMessageAliases?: string[];
 	latestUserPromptSha256?: string;
 	latestUserPromptProofToken?: string;
 	composerReady: boolean;
@@ -447,28 +450,86 @@ function normalizeComposerText(value: string): string {
 	return value.replace(/\s+/g, " ").trim();
 }
 
-function selectedConnectorMentions(html: string): string[] {
+export function selectedConnectorMentions(html: string): string[] {
 	const root = parse(html);
 	const composer = root.querySelector("#prompt-textarea") ?? root.querySelector('div[contenteditable="true"]');
 	if (!composer) return [];
-	return composer.querySelectorAll("[data-inline-selection-pill]")
-		.map((node) => normalizeComposerText(node.getAttribute("data-keyword") ?? node.structuredText))
-		.filter(Boolean);
+	const legacy = composer.querySelectorAll("[data-inline-selection-pill]")
+		.map((node) => normalizeComposerText(node.getAttribute("data-keyword") ?? node.structuredText));
+	// Current ChatGPT builds render a selected plugin as an app mention. Files and
+	// folders can share a label, so only app:// mentions count as connector pills.
+	const apps = composer.querySelectorAll("[app-mention-display-name]")
+		.filter((node) => (node.getAttribute("app-mention-path") ?? "").startsWith("app://"))
+		.map((node) => normalizeComposerText(node.getAttribute("app-mention-display-name") ?? node.structuredText));
+	return [...legacy, ...apps].filter(Boolean);
+}
+
+function menuRowLabel(row: HTMLElement): string {
+	const content = row.querySelector("[data-menu-row-content]") ?? row;
+	const label = content.querySelectorAll("span")
+		.find((span) => span.childNodes.every((child) => child.nodeType !== 1) && normalizeComposerText(span.structuredText) !== "");
+	return label ? normalizeComposerText(label.structuredText) : "";
 }
 
 /**
- * A connector name can also appear in stale picker rows or descriptive text.
- * Accept only one current impression that owns one actionable picker row with
- * one exact visible connector label.
+ * A connector name can also appear in stale picker rows, descriptive text, or
+ * same-named files and folders. Legacy builds: accept only one current
+ * impression that owns one actionable picker row with one exact visible
+ * connector label. Current builds group the @-mention menu under headings:
+ * accept only one actionable row in the single "Plugins" group whose label is
+ * exactly the connector name, and only while it is the current row, because
+ * Enter selects the current row.
  */
 export function hasExactConnectorSuggestion(html: string, name: string): boolean {
 	const root = parse(html);
-	const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) => {
-		const rows = node.querySelectorAll("[data-fill]");
-		return rows.length === 1
-			&& rows[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
-	});
-	return matches.length === 1;
+	const impressions = root.querySelectorAll("[data-composer-plugin-impression-id]");
+	if (impressions.length > 0) {
+		const matches = impressions.filter((node) => {
+			const rows = node.querySelectorAll("[data-fill]");
+			return rows.length === 1
+				&& rows[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
+		});
+		return matches.length === 1;
+	}
+	const areas = root.querySelectorAll("[data-mention-list-scroll-area]");
+	if (areas.length !== 1) return false;
+	const pluginGroups = areas[0].childNodes
+		.filter((child): child is HTMLElement => child.nodeType === 1)
+		.filter((group) => {
+			const heading = group.childNodes
+				.filter((child): child is HTMLElement => child.nodeType === 1)
+				.find((child) => child.querySelectorAll("button[data-list-navigation-item]").length === 0
+					&& child.tagName !== "BUTTON");
+			return heading !== undefined && normalizeComposerText(heading.structuredText) === "Plugins";
+		});
+	if (pluginGroups.length !== 1) return false;
+	const rows = pluginGroups[0].querySelectorAll("button[data-list-navigation-item]")
+		.filter((row) => menuRowLabel(row) === name);
+	return rows.length === 1 && rows[0].getAttribute("aria-current") === "true";
+}
+
+/** Press one key in the composer, trying each prompt selector as typing does. */
+async function pressPromptKey(
+	exec: Exec,
+	launcher: Launcher,
+	tabId: number,
+	key: string,
+	signal: AbortSignal | undefined,
+	expectedTarget: ExactBrowserActionTarget,
+): Promise<void> {
+	let lastError = "the composer never accepted the key press";
+	for (const selector of PROMPT_SELECTORS) {
+		try {
+			await privateOrBridgeAction(exec, launcher, "press", { tabId, selector, key }, signal, expectedTarget);
+			return;
+		} catch (error) {
+			const translated = translatePolicyDenial(error);
+			if (translated instanceof PolicyDeniedError) throw translated;
+			lastError = translated instanceof Error ? translated.message : String(translated);
+			if (/expectedTarget/.test(lastError) || !isTransient(lastError)) throw translated;
+		}
+	}
+	throw new Error(`Could not press ${key} in the ChatGPT prompt. Last error: ${lastError}`);
 }
 
 async function typePromptText(
@@ -538,11 +599,7 @@ export async function fillPromptWithConnectorMentions(
 			`find one exact ChatGPT connector suggestion for @${name}`,
 			signal,
 		);
-		await privateOrBridgeAction(exec, launcher, "press", {
-			tabId,
-			selector: PROMPT_SELECTORS[0],
-			key: "Enter",
-		}, signal, expectedTarget);
+		await pressPromptKey(exec, launcher, tabId, "Enter", signal, expectedTarget);
 		await waitForConnectorComposerState(
 			exec,
 			launcher,
@@ -1612,6 +1669,30 @@ function assistantContentText(content: HTMLElement | undefined): string {
 		.trim();
 }
 
+/**
+ * Prefer a provider-issued message id. Current builds carry it in
+ * `data-chatgpt-search-message-ids` on the turn unit (or its nearest holder);
+ * `data-content-search-unit-key` is a render key such as `fallback-turn-0:0:user`
+ * and is only a last resort.
+ */
+function turnMessageId(node: HTMLElement): string | undefined {
+	const direct = node.getAttribute("data-message-id");
+	if (direct) return direct;
+	const holder = node.hasAttribute("data-chatgpt-search-message-ids") ? node : node.closest("[data-chatgpt-search-message-ids]");
+	const first = holder?.getAttribute("data-chatgpt-search-message-ids")?.trim().split(/\s+/)[0];
+	return first || node.getAttribute("data-content-search-unit-key") || undefined;
+}
+
+function turnMessageAliases(node: HTMLElement): string[] {
+	const holder = node.hasAttribute("data-chatgpt-search-message-ids") ? node : node.closest("[data-chatgpt-search-message-ids]");
+	const ids = [
+		node.getAttribute("data-message-id"),
+		...(holder?.getAttribute("data-chatgpt-search-message-ids")?.trim().split(/\s+/) ?? []),
+		node.getAttribute("data-content-search-unit-key"),
+	].filter((value): value is string => Boolean(value));
+	return [...new Set(ids)];
+}
+
 export function extractConversationTurns(html: string, limit = 10): ChatGptConversationTurn[] {
 	if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Conversation read limit must be 1-20.");
 	const root = parse(html);
@@ -1634,7 +1715,7 @@ export function extractConversationTurns(html: string, limit = 10): ChatGptConve
 		turns.push({
 			role: assistant ? "assistant" as const : "user" as const,
 			text,
-			messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined,
+			messageId: turnMessageId(node),
 		});
 	}
 	return turns.reverse();
@@ -1661,7 +1742,7 @@ export function extractAssistantTurn(html: string): AssistantTurn {
 		text,
 		imageUrls,
 		hasMarkdown: Boolean(content),
-		messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined,
+		messageId: turnMessageId(node),
 	};
 }
 
@@ -1670,9 +1751,8 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
 	const userTurns = root.querySelectorAll(USER_TURN_SELECTOR);
 	const latestUser = userTurns.at(-1);
-	const latestUserMessageId = latestUser?.getAttribute("data-message-id")
-		?? latestUser?.getAttribute("data-content-search-unit-key")
-		?? undefined;
+	const latestUserMessageId = latestUser ? turnMessageId(latestUser) : undefined;
+	const latestUserMessageAliases = latestUser ? turnMessageAliases(latestUser) : [];
 	const latestUserPromptNode = latestUser
 		? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean)
 		: undefined;
@@ -1785,6 +1865,7 @@ export function extractChatPageObservation(html: string): ChatPageObservation {
 	return {
 		snapshot,
 		latestUserMessageId,
+		latestUserMessageAliases,
 		latestUserPromptSha256,
 		latestUserPromptProofToken,
 		composerReady,

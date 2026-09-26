@@ -876,6 +876,7 @@ const SnapshotSchema = z.object({
 const ObservationSchema = z.object({
 	snapshot: SnapshotSchema,
 	latestUserMessageId: z.string().min(1).optional(),
+	latestUserMessageAliases: z.array(z.string().min(1)).optional(),
 	latestUserPromptSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 	latestUserPromptProofToken: z.string().regex(/^proof_[a-f0-9]{32}$/).optional(),
 	composerReady: z.boolean(),

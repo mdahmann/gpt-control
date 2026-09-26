@@ -16,6 +16,7 @@ import {
 	extractComposerModel,
 	extractComposerSelection,
 	hasExactConnectorSuggestion,
+	selectedConnectorMentions,
 	isChatGptWorkExperience,
 	fillPrompt,
 	openChat,
@@ -63,6 +64,67 @@ describe("observed Chrome failures", () => {
 		const ambiguous = `<div data-composer-plugin-impression-id="one"><div data-fill=""><span>Zenbox</span></div></div><div data-composer-plugin-impression-id="two"><div data-fill=""><span>Zenbox</span></div></div>`;
 		expect(hasExactConnectorSuggestion(stale, "Zenbox")).toBe(false);
 		expect(hasExactConnectorSuggestion(ambiguous, "Zenbox")).toBe(false);
+	});
+
+	// Observed 2026-09-26: the @-mention menu groups rows under Plugins, Files and Folders,
+	// and a project folder can carry the same label as the plugin.
+	const mentionRow = (label: string, detail: string, current: boolean) =>
+		`<button type="button" data-list-navigation-item="true"${current ? ' aria-current="true"' : ""}><div data-menu-row-content="true"><span><span><span>${label}</span>${detail ? `<span>${detail}</span>` : ""}</span></span></div></button>`;
+	const mentionMenu = (...groups: string[]) =>
+		`<div data-composer-overlay-floating-ui="true"><div><div data-mention-list-scroll-area=""><div>${groups.join("</div><div>")}</div></div></div></div>`;
+	const group = (heading: string, ...rows: string[]) => `<div>${heading}</div>${rows.join("")}`;
+
+	test("accepts the current Plugins row in the grouped mention menu, not a same-named folder", () => {
+		const html = mentionMenu(
+			group("Plugins", mentionRow("Zenbox", "Willow's VM", true)),
+			group("Files", mentionRow("zenbox_mcp_v2_contracts.json", "", false)),
+			group("Folders", mentionRow("Zenbox", "", false)),
+		);
+		expect(hasExactConnectorSuggestion(html, "Zenbox")).toBe(true);
+	});
+
+	test("rejects grouped mention menus without exactly one current Plugins row", () => {
+		const notCurrent = mentionMenu(group("Plugins", mentionRow("Zenbox", "Willow's VM", false)), group("Folders", mentionRow("Zenbox", "", true)));
+		const twoPlugins = mentionMenu(group("Plugins", mentionRow("Zenbox", "Willow's VM", true), mentionRow("Zenbox", "Other VM", false)));
+		const folderOnly = mentionMenu(group("Files", mentionRow("zenbox.md", "", true)), group("Folders", mentionRow("Zenbox", "", false)));
+		const wrongLabel = mentionMenu(group("Plugins", mentionRow("Zenbox MCP", "Willow's VM", true)));
+		expect(hasExactConnectorSuggestion(notCurrent, "Zenbox")).toBe(false);
+		expect(hasExactConnectorSuggestion(twoPlugins, "Zenbox")).toBe(false);
+		expect(hasExactConnectorSuggestion(folderOnly, "Zenbox")).toBe(false);
+		expect(hasExactConnectorSuggestion(wrongLabel, "Zenbox")).toBe(false);
+	});
+
+	// Observed 2026-09-26: turns carry provider ids in data-chatgpt-search-message-ids, the unit key is a
+	// render key (fallback-turn-N:M:role), and the Markdown root class is hashed as MarkdownRoot-<hash>.
+	const currentTurnMarkup = `<main><div data-turn-key="ae118271-9600-4e3e-9b50-c61f509b64b4"><div data-content-search-turn-key="fallback-turn-0">`
+		+ `<div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="ae118271-9600-4e3e-9b50-c61f509b64b4">`
+		+ `<div data-content-search-unit-key="fallback-turn-0:0:user"><div data-user-message-bubble="true"><div class="whitespace-pre-wrap">Check the connectors.</div></div></div></div>`
+		+ `<div data-content-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-message-ids="74b6988d-cddd-46db-89e9-8864b40b0d89 74b6988d-cddd-46db-89e9-8864b40b0d89">`
+		+ `<h4 data-conversation-role="assistant">ChatGPT said:</h4><div data-chatgpt-selection-message-id="74b6988d-cddd-46db-89e9-8864b40b0d89"><div class="MarkdownRoot-rZKhxa"><p>{"connectors":[]}</p></div></div></div>`
+		+ `</div></div></main>`;
+
+	test("reads current turn markup with provider message ids and hashed Markdown roots", () => {
+		expect(extractConversationTurns(currentTurnMarkup)).toEqual([
+			{ role: "user", text: "Check the connectors.", messageId: "ae118271-9600-4e3e-9b50-c61f509b64b4" },
+			{ role: "assistant", text: '{"connectors":[]}', messageId: "74b6988d-cddd-46db-89e9-8864b40b0d89" },
+		]);
+		const observation = extractChatPageObservation(currentTurnMarkup);
+		expect(observation.latestUserMessageId).toBe("ae118271-9600-4e3e-9b50-c61f509b64b4");
+		// Runs recorded under the render-key form must still reconcile with the same turn.
+		expect(observation.latestUserMessageAliases).toEqual(["ae118271-9600-4e3e-9b50-c61f509b64b4", "fallback-turn-0:0:user"]);
+		expect(observation.snapshot.text).toBe('{"connectors":[]}');
+		expect(observation.snapshot.messageId).toBe("74b6988d-cddd-46db-89e9-8864b40b0d89");
+		expect(observation.snapshot.count).toBe(1);
+	});
+
+	test("reads selected plugin pills as app mentions and ignores non-app mentions", () => {
+		const composer = (inner: string) => `<div contenteditable="true"><p>${inner}</p></div>`;
+		const appPill = `<span app-mention-name="zenbox" app-mention-display-name="Zenbox" app-mention-path="app://asdk_app_example" contenteditable="false">Zenbox</span>`;
+		const folderPill = `<span app-mention-name="zenbox" app-mention-display-name="Zenbox" app-mention-path="folder://zenbox" contenteditable="false">Zenbox</span>`;
+		const legacyPill = `<span data-inline-selection-pill="" data-keyword="Exa">Exa</span>`;
+		expect(selectedConnectorMentions(composer(appPill))).toEqual(["Zenbox"]);
+		expect(selectedConnectorMentions(composer(folderPill))).toEqual([]);
+		expect(selectedConnectorMentions(composer(`${legacyPill} ${appPill}`))).toEqual(["Exa", "Zenbox"]);
 	});
 
 	test("persists a visible ChatGPT rate limit and never dismisses or retries it", async () => {

@@ -34143,7 +34143,7 @@ var FILE_INPUT_SELECTOR = 'input[type="file"]';
 var USER_PROMPT_CONTENT_SELECTORS = ["[data-message-content]", ".whitespace-pre-wrap", ".prose"];
 var USER_TURN_SELECTOR = '[data-message-author-role="user"], [data-content-search-unit-key$=":user"]';
 var ASSISTANT_TURN_SELECTOR = '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
-var ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"]';
+var ASSISTANT_CONTENT_SELECTOR = '.markdown, [class*="_MarkdownRoot_"], [class*="MarkdownRoot-"]';
 var EXPLICIT_MODEL_TEST_IDS = ["model-switcher-dropdown-button", "model-selector", "composer-model-selector"];
 var TRANSIENT_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
 function isChatGptWorkExperience(html) {
@@ -34403,15 +34403,53 @@ function selectedConnectorMentions(html) {
   const composer = root.querySelector("#prompt-textarea") ?? root.querySelector('div[contenteditable="true"]');
   if (!composer)
     return [];
-  return composer.querySelectorAll("[data-inline-selection-pill]").map((node) => normalizeComposerText(node.getAttribute("data-keyword") ?? node.structuredText)).filter(Boolean);
+  const legacy = composer.querySelectorAll("[data-inline-selection-pill]").map((node) => normalizeComposerText(node.getAttribute("data-keyword") ?? node.structuredText));
+  const apps = composer.querySelectorAll("[app-mention-display-name]").filter((node) => (node.getAttribute("app-mention-path") ?? "").startsWith("app://")).map((node) => normalizeComposerText(node.getAttribute("app-mention-display-name") ?? node.structuredText));
+  return [...legacy, ...apps].filter(Boolean);
+}
+function menuRowLabel(row) {
+  const content = row.querySelector("[data-menu-row-content]") ?? row;
+  const label = content.querySelectorAll("span").find((span) => span.childNodes.every((child) => child.nodeType !== 1) && normalizeComposerText(span.structuredText) !== "");
+  return label ? normalizeComposerText(label.structuredText) : "";
 }
 function hasExactConnectorSuggestion(html, name) {
   const root = parse6(html);
-  const matches = root.querySelectorAll("[data-composer-plugin-impression-id]").filter((node) => {
-    const rows = node.querySelectorAll("[data-fill]");
-    return rows.length === 1 && rows[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
+  const impressions = root.querySelectorAll("[data-composer-plugin-impression-id]");
+  if (impressions.length > 0) {
+    const matches = impressions.filter((node) => {
+      const rows2 = node.querySelectorAll("[data-fill]");
+      return rows2.length === 1 && rows2[0].querySelectorAll("span").filter((span) => normalizeComposerText(span.structuredText) === name).length === 1;
+    });
+    return matches.length === 1;
+  }
+  const areas = root.querySelectorAll("[data-mention-list-scroll-area]");
+  if (areas.length !== 1)
+    return false;
+  const pluginGroups = areas[0].childNodes.filter((child) => child.nodeType === 1).filter((group) => {
+    const heading = group.childNodes.filter((child) => child.nodeType === 1).find((child) => child.querySelectorAll("button[data-list-navigation-item]").length === 0 && child.tagName !== "BUTTON");
+    return heading !== undefined && normalizeComposerText(heading.structuredText) === "Plugins";
   });
-  return matches.length === 1;
+  if (pluginGroups.length !== 1)
+    return false;
+  const rows = pluginGroups[0].querySelectorAll("button[data-list-navigation-item]").filter((row) => menuRowLabel(row) === name);
+  return rows.length === 1 && rows[0].getAttribute("aria-current") === "true";
+}
+async function pressPromptKey(exec, launcher, tabId, key, signal, expectedTarget) {
+  let lastError = "the composer never accepted the key press";
+  for (const selector of PROMPT_SELECTORS) {
+    try {
+      await privateOrBridgeAction(exec, launcher, "press", { tabId, selector, key }, signal, expectedTarget);
+      return;
+    } catch (error51) {
+      const translated = translatePolicyDenial(error51);
+      if (translated instanceof PolicyDeniedError)
+        throw translated;
+      lastError = translated instanceof Error ? translated.message : String(translated);
+      if (/expectedTarget/.test(lastError) || !isTransient(lastError))
+        throw translated;
+    }
+  }
+  throw new Error(`Could not press ${key} in the ChatGPT prompt. Last error: ${lastError}`);
 }
 async function typePromptText(exec, launcher, tabId, text, signal, expectedTarget) {
   let lastError = "the composer never accepted typed text";
@@ -34450,11 +34488,7 @@ async function fillPromptWithConnectorMentions(exec, launcher, tabId, prompt, co
       await typePromptText(exec, launcher, tabId, " ", signal, expectedTarget);
     await typePromptText(exec, launcher, tabId, `@${name}`, signal, expectedTarget);
     await waitForConnectorComposerState(exec, launcher, tabId, (html) => hasExactConnectorSuggestion(html, name), `find one exact ChatGPT connector suggestion for @${name}`, signal);
-    await privateOrBridgeAction(exec, launcher, "press", {
-      tabId,
-      selector: PROMPT_SELECTORS[0],
-      key: "Enter"
-    }, signal, expectedTarget);
+    await pressPromptKey(exec, launcher, tabId, "Enter", signal, expectedTarget);
     await waitForConnectorComposerState(exec, launcher, tabId, (html) => selectedConnectorMentions(html).includes(name), `verify the selected @${name} connector pill`, signal);
   }
   await typePromptText(exec, launcher, tabId, `
@@ -35083,6 +35117,23 @@ function assistantContentText(content) {
 
 `).trim();
 }
+function turnMessageId(node) {
+  const direct = node.getAttribute("data-message-id");
+  if (direct)
+    return direct;
+  const holder = node.hasAttribute("data-chatgpt-search-message-ids") ? node : node.closest("[data-chatgpt-search-message-ids]");
+  const first = holder?.getAttribute("data-chatgpt-search-message-ids")?.trim().split(/\s+/)[0];
+  return first || node.getAttribute("data-content-search-unit-key") || undefined;
+}
+function turnMessageAliases(node) {
+  const holder = node.hasAttribute("data-chatgpt-search-message-ids") ? node : node.closest("[data-chatgpt-search-message-ids]");
+  const ids = [
+    node.getAttribute("data-message-id"),
+    ...holder?.getAttribute("data-chatgpt-search-message-ids")?.trim().split(/\s+/) ?? [],
+    node.getAttribute("data-content-search-unit-key")
+  ].filter((value) => Boolean(value));
+  return [...new Set(ids)];
+}
 function extractConversationTurns(html, limit = 10) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 20)
     throw new Error("Conversation read limit must be 1-20.");
@@ -35102,7 +35153,7 @@ function extractConversationTurns(html, limit = 10) {
     turns.push({
       role: assistant ? "assistant" : "user",
       text,
-      messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
+      messageId: turnMessageId(node)
     });
   }
   return turns.reverse();
@@ -35131,7 +35182,7 @@ function extractAssistantTurn(html) {
     text,
     imageUrls,
     hasMarkdown: Boolean(content),
-    messageId: node.getAttribute("data-message-id") ?? node.getAttribute("data-content-search-unit-key") ?? undefined
+    messageId: turnMessageId(node)
   };
 }
 function extractChatPageObservation(html) {
@@ -35139,7 +35190,8 @@ function extractChatPageObservation(html) {
   const snapshot = { ...extractAssistantTurn(html), count: countAssistantTurns(html) };
   const userTurns = root.querySelectorAll(USER_TURN_SELECTOR);
   const latestUser = userTurns.at(-1);
-  const latestUserMessageId = latestUser?.getAttribute("data-message-id") ?? latestUser?.getAttribute("data-content-search-unit-key") ?? undefined;
+  const latestUserMessageId = latestUser ? turnMessageId(latestUser) : undefined;
+  const latestUserMessageAliases = latestUser ? turnMessageAliases(latestUser) : [];
   const latestUserPromptNode = latestUser ? USER_PROMPT_CONTENT_SELECTORS.map((selector) => latestUser.querySelector(selector)).find(Boolean) : undefined;
   const latestUserText = (latestUserPromptNode?.structuredText ?? latestUser?.structuredText ?? "").replace(/[ \t]+\n/g, `
 `).replace(/\n{3,}/g, `
@@ -35230,6 +35282,7 @@ ${proofMatch?.[0].trim() ?? ""}`);
   return {
     snapshot,
     latestUserMessageId,
+    latestUserMessageAliases,
     latestUserPromptSha256,
     latestUserPromptProofToken,
     composerReady,
@@ -36669,6 +36722,7 @@ var SnapshotSchema = exports_external.object({
 var ObservationSchema = exports_external.object({
   snapshot: SnapshotSchema,
   latestUserMessageId: exports_external.string().min(1).optional(),
+  latestUserMessageAliases: exports_external.array(exports_external.string().min(1)).optional(),
   latestUserPromptSha256: exports_external.string().regex(/^[a-f0-9]{64}$/).optional(),
   latestUserPromptProofToken: exports_external.string().regex(/^proof_[a-f0-9]{32}$/).optional(),
   composerReady: exports_external.boolean(),
@@ -38510,6 +38564,11 @@ class FairSemaphore {
     }
   }
 }
+function observationHasUserMessage(observation, id) {
+  if (!id)
+    return false;
+  return observation.latestUserMessageId === id || (observation.latestUserMessageAliases ?? []).includes(id);
+}
 
 class GptControlService {
   store;
@@ -40029,7 +40088,7 @@ class GptControlService {
         const expectedIdentity = run.receipt.providerConversationUrl ? providerConversationIdentity(run.receipt.providerConversationUrl) : undefined;
         if (!expectedIdentity || expectedIdentity.url !== identity.url)
           return "mismatch";
-        if (observation.latestUserMessageId && observation.latestUserMessageId !== run.providerUserMessageId)
+        if (observation.latestUserMessageId && !observationHasUserMessage(observation, run.providerUserMessageId))
           return "mismatch";
         if (!observation.latestUserMessageId)
           return "unavailable";
@@ -40207,7 +40266,7 @@ class GptControlService {
           return "mismatch";
         if (!observation.latestUserMessageId)
           return "unavailable";
-        return observation.latestUserMessageId === state.providerUserMessageId ? "approved" : "mismatch";
+        return observationHasUserMessage(observation, state.providerUserMessageId) ? "approved" : "mismatch";
       },
       onRateLimit: async (message) => {
         run = await this.recordProviderRateLimit(run, message);
@@ -40502,7 +40561,7 @@ class GptControlService {
     });
   }
   observationProvesRun(run, observation) {
-    return Boolean(run.providerUserMessageId && observation.latestUserMessageId === run.providerUserMessageId && (!run.promptProofToken || this.observationProvesPrompt(run, observation)));
+    return Boolean(run.providerUserMessageId && observationHasUserMessage(observation, run.providerUserMessageId) && (!run.promptProofToken || this.observationProvesPrompt(run, observation)));
   }
   async persistObservedProviderTurnIdentity(conversation, run, identity, observation, allowUnmarkedInitialTurn = false) {
     if (!observation.latestUserMessageId)
@@ -40510,9 +40569,9 @@ class GptControlService {
     const expectedExistingIdentity = conversation.providerConversationUrl ? providerConversationIdentity(conversation.providerConversationUrl) : undefined;
     if (expectedExistingIdentity && expectedExistingIdentity.url !== identity.url)
       return;
-    if (run.providerUserMessageId && run.providerUserMessageId !== observation.latestUserMessageId)
+    if (run.providerUserMessageId && !observationHasUserMessage(observation, run.providerUserMessageId))
       return;
-    if (run.providerUserMessageId === observation.latestUserMessageId && run.receipt.providerConversationUrl === identity.url && conversation.providerConversationUrl === identity.url) {
+    if (observationHasUserMessage(observation, run.providerUserMessageId) && run.receipt.providerConversationUrl === identity.url && conversation.providerConversationUrl === identity.url) {
       return { conversation, run };
     }
     if (run.promptProofToken) {
