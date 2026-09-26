@@ -2619,9 +2619,20 @@ async function conversationSidebarOptionsSelector(
 ): Promise<string> {
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
-		const matches = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`);
-		if (matches.length > 1) throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
-		if (matches.length === 1) return `a[href$="/c/${cssString(providerConversationId)}"] button[aria-label^="Open conversation options for "]`;
+		const linkSelector = `a[href$="/c/${cssString(providerConversationId)}"]`;
+		const legacySelector = `${linkSelector} button[aria-label^="Open conversation options for "]`;
+		const rowSelector = `[role="group"]:has(${linkSelector}) button[aria-label="Chat actions"]`;
+		const rows = uniqueElements(root.querySelectorAll(linkSelector)
+			.map((link) => link.closest('[role="group"]'))
+			.filter((row): row is HTMLElement => Boolean(row)));
+		const rowButtons = root.querySelectorAll(rowSelector);
+		const matches = root.querySelectorAll(legacySelector);
+		if (rows.length > 1 || rowButtons.length + matches.length > 1) {
+			throw new Error("ChatGPT sidebar exposes duplicate controls for the exact conversation.");
+		}
+		if (rows.length === 1 && rowButtons.length === 1
+			&& rowButtons[0].closest('[role="group"]') === rows[0]) return rowSelector;
+		if (matches.length === 1) return legacySelector;
 		const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
 		const nativeMatches = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
 		if (nativeMatches.length > 1) throw new Error("ChatGPT native sidebar exposes duplicate controls for the exact conversation.");
@@ -2630,6 +2641,18 @@ async function conversationSidebarOptionsSelector(
 		await sleep(Math.min(pollIntervalMs(), 200));
 	}
 	throw new Error("The exact ChatGPT conversation is not present in the live sidebar; rename refused.");
+}
+
+const CONVERSATION_HEADER_OPTIONS_SELECTORS = [
+	'[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]',
+	'[data-testid="app-shell-header-context-menu-surface"] button[aria-label="More"][aria-haspopup="menu"]',
+];
+
+function conversationHeaderOptionsSelector(root: HTMLElement): string | undefined {
+	const buttons = root.querySelectorAll(CONVERSATION_HEADER_OPTIONS_SELECTORS.join(","));
+	if (buttons.length > 1) throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
+	if (buttons.length === 0) return undefined;
+	return CONVERSATION_HEADER_OPTIONS_SELECTORS[buttons[0].getAttribute("aria-label") === "More" ? 1 : 0];
 }
 
 async function openConversationOrganizationMenu(
@@ -2644,8 +2667,8 @@ async function openConversationOrganizationMenu(
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
 		const nativeShell = root.querySelectorAll('[aria-label^="Switch mode, current mode:"]').length > 0;
 		const nativeSidebarButtons = root.querySelectorAll('[aria-current="page"] button[aria-label="Chat actions"]');
-		if (nativeSidebarButtons.length > 1) throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
-		if (nativeSidebarButtons.length === 1) {
+		if (nativeShell && nativeSidebarButtons.length > 1) throw new Error("ChatGPT native sidebar exposes ambiguous current-conversation controls.");
+		if (nativeShell && nativeSidebarButtons.length === 1) {
 			try {
 				await pickerAction(exec, launcher, "click", tabId, '[aria-current="page"] button[aria-label="Chat actions"]', signal, expectedTarget);
 			} catch (error) {
@@ -2658,11 +2681,10 @@ async function openConversationOrganizationMenu(
 			}
 			return;
 		}
-		const nativeHeaderButtons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
-		if (nativeHeaderButtons.length > 1) throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
-		if (nativeHeaderButtons.length === 1 && !nativeShell) {
+		const headerSelector = conversationHeaderOptionsSelector(root);
+		if (headerSelector && !nativeShell) {
 			try {
-				await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+				await pickerAction(exec, launcher, "click", tabId, headerSelector, signal, expectedTarget);
 			} catch (error) {
 				if (!/trusted click.*blocked/i.test(error instanceof Error ? error.message : String(error))
 					|| !hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) throw error;
@@ -2699,11 +2721,10 @@ async function openNativeHeaderConversationMenu(
 ): Promise<void> {
 	for (;;) {
 		const root = parse(await readPageHtml(exec, launcher, tabId, signal));
-		const buttons = root.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]');
-		if (buttons.length > 1) throw new Error("ChatGPT native header exposes ambiguous conversation controls.");
-		if (buttons.length === 1) {
+		const headerSelector = conversationHeaderOptionsSelector(root);
+		if (headerSelector) {
 			try {
-				await pickerAction(exec, launcher, "click", tabId, '[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]', signal, expectedTarget);
+				await pickerAction(exec, launcher, "click", tabId, headerSelector, signal, expectedTarget);
 			} catch (error) {
 				if (!/trusted click.*blocked/i.test(error instanceof Error ? error.message : String(error))) throw error;
 				if (!hasOpenConversationActionMenu(await readPageHtml(exec, launcher, tabId, signal))) {
@@ -2969,11 +2990,18 @@ async function waitForArchiveReadback(
 	throw new Error(`ChatGPT archive read-back failed for ${exactUrl}.`);
 }
 
-function isConversationPinned(html: string, providerConversationId: string): boolean {
+export function isConversationPinned(html: string, providerConversationId: string): boolean {
 	const root = parse(html);
 	const links = root.querySelectorAll(`a[href$="/c/${cssString(providerConversationId)}"]`);
-	return links.some((link) => /pinned conversation/i.test(link.getAttribute("aria-label") ?? "")
-		|| link.querySelectorAll('button[aria-label^="Unpin "]').length > 0);
+	return links.some((link) => {
+		const row = link.closest('[role="group"]');
+		const rowButtons = row?.querySelectorAll('button[aria-label^="Unpin "],button[aria-label="Pin chat"]')
+			.filter((button) => button.closest('[role="group"]') === row) ?? [];
+		if (rowButtons.some((button) => button.getAttribute("aria-label")?.startsWith("Unpin "))) return true;
+		if (rowButtons.length > 0) return false;
+		return /pinned conversation/i.test(link.getAttribute("aria-label") ?? "")
+			|| link.querySelectorAll('button[aria-label^="Unpin "]').length > 0;
+	});
 }
 
 function conversationPinMenuState(html: string): boolean | undefined {

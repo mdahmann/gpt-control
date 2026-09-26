@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse } from "node-html-parser";
 import {
 	CHATGPT_ORIGIN,
 	canonicalPromptObservationText,
@@ -18,6 +19,8 @@ import {
 	hasExactConnectorSuggestion,
 	selectedConnectorMentions,
 	isChatGptWorkExperience,
+	isConversationPinned,
+	manageChatGptConversation,
 	fillPrompt,
 	openChat,
 	providerConversationIdentity,
@@ -798,6 +801,151 @@ describe("truthful composer model provenance", () => {
 		expect(result.run.error).toContain("changed before send");
 		expect(bridge.submittedPrompts).toEqual([]);
 	});
+});
+
+describe("redesigned ChatGPT organization controls", () => {
+	// Observed 2026-09-26. Only the redacted title and conversation id are substituted.
+	const header = `<div data-testid="app-shell-header-context-menu-surface"><div><div><div><span data-state="closed"><button type="button" aria-label="Share"><svg/></button></span><button type="button" aria-label="More" data-state="closed" aria-expanded="false" aria-haspopup="menu"><span><span><svg/></span><span><svg/></span></span></button></div></div></div></div>`;
+	const currentRow = `<div aria-label="<title>" role="group" aria-current="page"><div><div><div><a aria-label="<title>" aria-current="page" href="/c/<ID>"><span><span><span></span></span></span></a></div></div><div></div></div><div><div><div role="presentation"><button type="button" aria-expanded="false" aria-haspopup="menu" aria-label="Chat actions" data-state="closed"><span><svg/></span></button></div><span data-state="closed"><button type="button" aria-label="Pin chat"><span><svg/></span></button></span></div></div></div>`;
+	const pinnedRow = `<div aria-label="<title>" role="group"><div><div><div><a aria-label="<title>" href="/c/<ID>"><span><span><span></span></span></span></a></div></div><div></div></div><div><div><div role="presentation"><button type="button" aria-haspopup="menu" aria-label="Chat actions" data-state="closed"><span><svg/></span></button></div><span data-state="closed"><button type="button" aria-label="Unpin chat"><span><svg/></span></button></span></div></div></div>`;
+	const row = (pinned: boolean, id = "target", title = "Target chat") =>
+		(pinned ? pinnedRow : currentRow).replaceAll("<title>", title).replaceAll("<ID>", id);
+	const target = { tabId: 70, sessionId: "fixture-session", name: "gpt-control:fixture", url: "https://chatgpt.com/c/target" };
+
+	function fixture(options: { header?: string; rows?: string; pinned?: boolean; sidebarReadback?: boolean; ignorePin?: boolean } = {}) {
+		const bridge = new FakeChromeBridge();
+		const clicks: string[] = [];
+		let pinned = options.pinned ?? false;
+		let title = "Target chat";
+		let menu: "header" | "sidebar" | "rename" | undefined;
+		let pinActions = 0;
+		const html = () => (options.header ?? header)
+			+ `<nav>${options.rows ?? row(pinned, "target", title) + row(true, "other")}</nav>`
+			+ (menu === "rename" ? '<input aria-label="Chat title">' : menu
+				? `<div role="menu">${options.sidebarReadback && pinActions > 0 ? "" : `<div role="menuitem">${pinned ? "Unpin" : "Pin"}</div>`}<div role="menuitem">Move to project</div><div role="menuitem">View files in chat</div><div role="menuitem">Archive</div><div role="menuitem">Delete</div>${menu === "sidebar" ? '<div role="menuitem">Rename</div>' : ""}</div>`
+				: "");
+		const exec: typeof bridge.exec = async (command, args) => {
+			if (command === bridge.launcher.command && args[0] === "getHTML") {
+				writeFileSync(args[2], html());
+			} else if (command === bridge.launcher.privateRpc!.command) {
+				const request = JSON.parse(readFileSync(args.at(-1)!, "utf8"));
+				const { action, payload } = request;
+				expect(payload.tabId).toBe(target.tabId);
+				if (action !== "press") expect(payload.expectedTarget).toEqual(target);
+				if (action === "click") {
+					const selector: string = payload.selector;
+					const root = parse(html());
+					const label = /^role=menuitem\[name=(.+)\]$/.exec(selector)?.[1];
+					const matches = label ? root.querySelectorAll('[role="menuitem"]').filter((node) => node.text === label)
+						: root.querySelectorAll(selector);
+					expect(matches).toHaveLength(1);
+					const button = matches[0];
+					clicks.push(selector);
+					if (label === "Pin" || label === "Unpin") {
+						if (!options.ignorePin) pinned = label === "Pin";
+						pinActions += 1;
+						menu = undefined;
+					} else if (label === "Rename") menu = "rename";
+					else if (button.getAttribute("aria-label") === "Chat actions") {
+						expect(button.closest('[role="group"]')?.querySelector('a')?.getAttribute("href")).toBe("/c/target");
+						menu = "sidebar";
+					} else if (["More", "ChatGPT conversation actions"].includes(button.getAttribute("aria-label") ?? "")) menu = "header";
+					else throw new Error(`Unexpected fixture click: ${selector}`);
+				} else if (action === "fill") {
+					expect(menu).toBe("rename");
+					expect(payload.selector).toBe('[aria-label="Chat title"]');
+					title = payload.text;
+				} else if (action === "press") menu = undefined;
+				else if (action !== "ping") throw new Error(`Unexpected fixture action: ${action}`);
+			} else throw new Error(`Unexpected fixture command: ${command}`);
+			return { stdout: JSON.stringify({ success: true }), stderr: "", code: 0, killed: false };
+		};
+		return {
+			clicks,
+			manage: (action: Parameters<typeof manageChatGptConversation>[3]) =>
+				manageChatGptConversation(exec, bridge.launcher, target.tabId, action, undefined, 30, target),
+		};
+	}
+
+	test("opens exactly one header More button and ignores unrelated More buttons", async () => {
+		const fake = fixture({ pinned: true, header: header + '<button aria-label="More" aria-haspopup="menu"></button>' });
+		expect(await fake.manage({ action: "pin" })).toMatchObject({ pinned: true });
+		expect(fake.clicks).toEqual(['[data-testid="app-shell-header-context-menu-surface"] button[aria-label="More"][aria-haspopup="menu"]']);
+	});
+
+	test("refuses duplicate header More buttons and mixed old/new header controls", async () => {
+		for (const label of ["More", "ChatGPT conversation actions"]) {
+			const fake = fixture({ header: header.replace('<button type="button" aria-label="More"', `<button aria-label="${label}" aria-haspopup="menu"></button><button type="button" aria-label="More"`) });
+			await expect(fake.manage({ action: "pin" })).rejects.toThrow("ambiguous conversation controls");
+			expect(fake.clicks).toEqual([]);
+		}
+	});
+
+	test("requires More to be a menu button inside the header surface", async () => {
+		const fake = fixture({ header: header.replace('aria-haspopup="menu"', '') });
+		await expect(fake.manage({ action: "pin" })).rejects.toThrow("conversation action control is unavailable");
+		expect(fake.clicks).toEqual([]);
+	});
+
+	test("retains the old header label", async () => {
+		const fake = fixture({ pinned: true, header: header.replace('aria-label="More"', 'aria-label="ChatGPT conversation actions"') });
+		expect(await fake.manage({ action: "pin" })).toMatchObject({ pinned: true });
+		expect(fake.clicks).toEqual(['[data-testid="app-shell-header-context-menu-surface"] button[aria-label="ChatGPT conversation actions"]']);
+	});
+
+	test("reads pin state only from the exact link's nearest group", () => {
+		expect(isConversationPinned(`<nav>${row(true)}</nav>`, "target")).toBe(true);
+		expect(isConversationPinned(`<nav>${row(false)}</nav>`, "target")).toBe(false);
+		expect(isConversationPinned(`<nav>${row(false)}${row(true, "other")}</nav>`, "target")).toBe(false);
+		expect(isConversationPinned(`<nav>${row(true, "target-extra")}</nav>`, "target")).toBe(false);
+		expect(isConversationPinned(`<div role="group"><button aria-label="Unpin chat"></button>${row(false)}</div>`, "target")).toBe(false);
+		const nestedOther = row(false).replace('<div></div>', `<div>${row(true, "other")}</div>`);
+		expect(isConversationPinned(nestedOther, "target")).toBe(false);
+		expect(isConversationPinned(row(true).replace("Unpin chat", "Unpin Target chat"), "target")).toBe(true);
+	});
+
+	test("retains legacy pinned labels and link-contained Unpin controls", () => {
+		expect(isConversationPinned('<a href="/c/target" aria-label="Pinned conversation: Target"></a>', "target")).toBe(true);
+		expect(isConversationPinned('<a href="/c/target"><button aria-label="Unpin Target"></button></a>', "target")).toBe(true);
+	});
+
+	test("renames through only the exact conversation's Chat actions button", async () => {
+		const fake = fixture();
+		expect(await fake.manage({ action: "rename", title: "Renamed chat" })).toMatchObject({ title: "Renamed chat" });
+		expect(fake.clicks).toEqual(['[role="group"]:has(a[href$="/c/target"]) button[aria-label="Chat actions"]', 'role=menuitem[name=Rename]']);
+	});
+
+	test("refuses duplicate exact rows even when one row has no action button", async () => {
+		for (const duplicate of [row(true), row(true).replace('aria-label="Chat actions"', 'aria-label="Other"')]) {
+			const fake = fixture({ rows: row(false) + duplicate });
+			await expect(fake.manage({ action: "rename", title: "Renamed chat" })).rejects.toThrow("duplicate controls for the exact conversation");
+			expect(fake.clicks).toEqual([]);
+		}
+	});
+
+	test("refuses duplicate Chat actions buttons within the exact row", async () => {
+		const fake = fixture({ rows: row(false).replace('<div></div>', '<div><button aria-label="Chat actions"></button></div>') });
+		await expect(fake.manage({ action: "rename", title: "Renamed chat" })).rejects.toThrow("duplicate controls for the exact conversation");
+		expect(fake.clicks).toEqual([]);
+	});
+
+	for (const action of ["pin", "unpin"] as const) {
+		for (const sidebarReadback of [false, true]) {
+			test(`${action} opens More, clicks the action, and verifies ${sidebarReadback ? "sidebar" : "menu"} read-back`, async () => {
+				const fake = fixture({ pinned: action === "unpin", sidebarReadback });
+				expect(await fake.manage({ action })).toMatchObject({ pinned: action === "pin" });
+				expect(fake.clicks).toEqual([
+					'[data-testid="app-shell-header-context-menu-surface"] button[aria-label="More"][aria-haspopup="menu"]',
+					`role=menuitem[name=${action === "pin" ? "Pin" : "Unpin"}]`,
+					'[data-testid="app-shell-header-context-menu-surface"] button[aria-label="More"][aria-haspopup="menu"]',
+				]);
+			});
+		}
+		test(`${action} refuses unchanged sidebar read-back after an accepted click`, async () => {
+			const fake = fixture({ pinned: action === "unpin", sidebarReadback: true, ignorePin: true });
+			await expect(fake.manage({ action })).rejects.toThrow(`${action} read-back failed`);
+		});
+	}
 });
 
 describe("ChatGPT organization controls", () => {
