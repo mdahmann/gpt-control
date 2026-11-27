@@ -24,7 +24,9 @@ bun run build:mcp
 codex mcp add gpt-control -- node "$PWD/dist/gpt-control-mcp.js"
 ```
 
-Start a new Codex session and call `gpt_diagnose` to inspect the configuration without running the driver. To send messages, configure [Chrome Bridge with private RPC or another protocol-v2 driver](#browser-driver-protocol-v2) and sign in to ChatGPT in that environment. See [Install](#install) for Pi, OMP, other MCP clients, and the Codex plugin.
+Before starting a new Codex session, follow [Codex MCP settings](#codex-mcp-settings) to forward driver settings and allow long replies. Call `gpt_diagnose` to inspect the configuration without running the driver. To send messages, configure [Chrome Bridge with private RPC or another protocol-v2 driver](#browser-driver-protocol-v2) and sign in to ChatGPT in that environment.
+
+For Pi, OMP, and other MCP clients, see [Install](#install).
 
 The caller remains the orchestrator. GPT-Control does not merge code, widen
 repository authority, infer connected-tool access, launch a paid fallback, or
@@ -301,11 +303,24 @@ read `src/index.ts` from the `omp`/`pi` package metadata.
 node ./dist/gpt-control-mcp.js
 ```
 
-For Codex, the repository includes `.codex-plugin/plugin.json`, `.mcp.json`,
-and the committed Node bundle. The MCP server is started from the plugin root
-with a 3,700-second per-tool bound so a one-hour worker can return its terminal
-result. Plugin installation does not run a package manager or trust an
-unverified build step.
+### Codex MCP settings
+
+For manual registration, add these keys to the existing `[mcp_servers.gpt-control]`
+table in `~/.codex/config.toml`, keeping the `command` and `args` set by
+`codex mcp add`:
+
+```toml
+env_vars = ["GPT_CONTROL_BROWSER_DRIVER", "GPT_CONTROL_BRIDGE", "GPT_CONTROL_BRIDGE_PRIVATE_RPC"]
+tool_timeout_sec = 3700
+```
+
+Export the driver variables you use before launching Codex, and add any other
+[trusted settings](#trusted-configuration) you use to `env_vars`. Codex's default
+60-second tool timeout can cut off `gpt_chat`, which waits for the reply by default.
+
+The Codex plugin already supplies an allowlist and the 3,700-second timeout in
+[`.mcp.json`](.mcp.json). It starts the committed Node bundle from the plugin
+root without running a package manager or build step.
 
 ## Trusted configuration
 
