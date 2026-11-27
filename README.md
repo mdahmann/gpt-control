@@ -1,28 +1,30 @@
-# GPT-Control
+# GPT-Control: Durable ChatGPT Workers for Coding Agents
 
-`gpt_chat` and `gpt_consult` accept `connectors` and `connector_mode`, like
-GPT Workers. Include each literal `@Connector` mention in the prompt. With
-`connectors: ["Zenbox"]` and `connector_mode: "prefer"`, GPT-Control selects
-and verifies the Zenbox pill before sending the assignment. Repeat these fields
-for follow-ups that need the connector. A selected pill is not proof of access
-or completed edits; verify the destination state separately.
+Send a task from Codex, Pi, OMP, or another MCP client to your signed-in ChatGPT session, then collect the result without keeping the original request open.
 
-GPT-Control lets OMP, Pi, Codex, and other MCP-capable harnesses control the
-signed-in ChatGPT website through one secure browser-driver protocol. Version
-0.5.0-alpha.10 adds verified one-turn connector selection for routine Workers.
-Version 0.5.0-alpha.9 hardens the opt-in pool of separate signed macOS ChatGPT/Codex app
-processes for background workers. Each lane has a private profile, state root,
-and loopback CDP port; GPT-Control minimizes the worker window and restores the
-user's active app after launch. Chrome Bridge remains the default. Version 0.4.4
-added durable model and project catalogs so ordinary catalog reads do not
-open Chrome. Version 0.5.0-alpha.9 replaces automatic rate-limit recovery with
-a durable human-resume safety pause. Version 0.4.3 originally added shared rate-limit cooldown, ChatGPT
-project-conversation recovery, and bounded Codex callback retry. Version 0.4.2 added immediate-return single
-and batch Worker starts with verified Codex callback binding. Version 0.4.1 added project-aware Worker titles, durable caller detachment, and
-same-conversation required-connector preflight. Version 0.4.0 added live model
-and effort discovery, exact-conversation organization,
-crash-safe durable runs, and three clear orchestration routes: GPT Chat, GPT
-Worker, and GPT Sub-agent.
+An unofficial project built on [Wolfgang Schoenberger's GPT-Control](https://github.com/wolfiesch/gpt-control).
+
+## What this fork adds
+
+- **Durable workers and Codex sub-agents:** Start one background Worker or a batch and get handles back immediately, or let a native Codex child guide one conversation through a multi-step task.
+- **Exact conversation and turn ownership:** Bind work to the right ChatGPT conversation and assistant turn, rather than whatever browser tab is active.
+- **Crash-safe recovery and cancellation:** Recover a submitted turn without resending its prompt, preserve cancellation across restarts, and pause for human review on provider safety signals.
+- **Verified connector selection:** Check that ChatGPT selected the requested connector before sending. Selection does not prove access or that an edit happened.
+- **Opt-in macOS worker pool:** Run background workers in separate signed app processes with isolated profiles. Chrome Bridge remains the default.
+
+## Quickstart: Codex MCP
+
+With Node.js, Bun 1.4.0, and the Codex CLI available:
+
+```bash
+git clone https://github.com/mdahmann/gpt-control.git
+cd gpt-control
+bun install --frozen-lockfile
+bun run build:mcp
+codex mcp add gpt-control -- node "$PWD/dist/gpt-control-mcp.js"
+```
+
+Start a new Codex session and call `gpt_diagnose` to inspect the configuration without running the driver. To send messages, configure [Chrome Bridge with private RPC or another protocol-v2 driver](#browser-driver-protocol-v2) and sign in to ChatGPT in that environment. See [Install](#install) for Pi, OMP, other MCP clients, and the Codex plugin.
 
 The caller remains the orchestrator. GPT-Control does not merge code, widen
 repository authority, infer connected-tool access, launch a paid fallback, or
@@ -242,6 +244,10 @@ assignment must stop if required connector access fails. Use `require` only
 when a separate same-conversation health preflight is worth the extra turn.
 The caller must still verify important external facts independently.
 
+`gpt_chat` and `gpt_consult` also accept `connectors` and `connector_mode`.
+Include each literal `@Connector` mention in the prompt, and repeat the fields
+on follow-ups that need the connector.
+
 ## Conversations, runs, and receipts
 
 Each submission has a wrapper-owned `conversation_id` and a distinct `run_id`.
@@ -349,6 +355,8 @@ npm pack --dry-run --json
 Live browser validation must use disposable data and a disposable profile or
 session. Follow [docs/MANUAL_CHROME_VALIDATION.md](docs/MANUAL_CHROME_VALIDATION.md).
 
+See the [changelog](CHANGELOG.md) for release history.
+
 ## License
 
-MIT
+[MIT](LICENSE)
