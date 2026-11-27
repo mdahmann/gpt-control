@@ -311,7 +311,7 @@ unverified build step.
 | `GPT_CONTROL_OUTPUT_ROOT` | Generated artifact root |
 | `GPT_CONTROL_BROWSER_DRIVER` | External protocol-v2 command |
 | `GPT_CONTROL_BRIDGE` | Explicit Chrome Bridge launcher |
-| `GPT_CONTROL_BRIDGE_PRIVATE_RPC` | Explicit private-RPC helper command |
+| `GPT_CONTROL_BRIDGE_CLIENT_SCRIPT` | Path to Chrome Bridge's `test_client.py` for private request-file RPC |
 | `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` | Operator-selected simultaneous ChatGPT generation limit from 1–10; default 1 |
 | `GPT_CONTROL_MAX_WORKERS` | Legacy alias for `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` |
 | `GPT_CONTROL_MAX_PRO_WORKERS` | Older legacy alias for `GPT_CONTROL_MAX_ACTIVE_GENERATIONS` |

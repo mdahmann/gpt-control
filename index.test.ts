@@ -170,6 +170,7 @@ describe("MCP plugin contract", () => {
 		};
 		expect(pluginMcp.mcpServers.gpt_control.command).toBe("node");
 		expect(pluginMcp.mcpServers.gpt_control.args).toEqual(["./dist/gpt-control-mcp.js"]);
+		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_BRIDGE_CLIENT_SCRIPT");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_PROVIDER_ABANDON_TOKEN");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_MAX_ACTIVE_GENERATIONS");
 		expect(pluginMcp.mcpServers.gpt_control.env_vars).toContain("GPT_CONTROL_MAX_WORKERS");
